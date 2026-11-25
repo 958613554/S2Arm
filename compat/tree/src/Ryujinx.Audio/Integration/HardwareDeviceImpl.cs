@@ -119,6 +119,9 @@ namespace Ryujinx.Audio.Integration
         public static volatile int Frozen;
         public static long Seq;   // freezes so far (Interlocked)
 
+        /// <summary>S2Arm (11-25 iOS 回前台 520 ms): signalled when a freeze is lifted, so the Apple backend's watchdog restarts the output at once instead of on its next 250 ms tick.</summary>
+        public static readonly System.Threading.AutoResetEvent Thawed = new(false);
+
         public static void Set(bool frozen)
         {
             if (frozen)
@@ -126,7 +129,13 @@ namespace Ryujinx.Audio.Integration
                 System.Threading.Interlocked.Increment(ref Seq);
             }
 
+            bool was = Frozen != 0;
             Frozen = frozen ? 1 : 0;
+
+            if (was && !frozen)
+            {
+                Thawed.Set();
+            }
         }
     }
 }

@@ -41,6 +41,12 @@ namespace S2A.Services.Tests
             Step(true, 2, ref gs, ref tt, 15000, 1000, out _);
             g = Step(false, 2, ref gs, ref tt, 20000, 1000, out rb);
             Row("⑥ 再冻结再解冻", "宽限、刷新、解冻时刻 20000", $"宽限 {g}、刷新 {rb}、解冻时刻 {tt}", g && rb && tt == 20000);
+            // ⑦ 解冻唤醒（11-25 iOS 回前台 520 ms）：冻结 → 放开时 Thawed 置位一次（看门狗当场醒来重启器件）；没冻结时再放开、冻结本身都不置位
+            var f = Ryujinx.Audio.Integration.S2AGuestFreeze.Thawed; f.WaitOne(0);
+            Ryujinx.Audio.Integration.S2AGuestFreeze.Set(true); bool onFreeze = f.WaitOne(0);
+            Ryujinx.Audio.Integration.S2AGuestFreeze.Set(false); bool onThaw = f.WaitOne(0);
+            Ryujinx.Audio.Integration.S2AGuestFreeze.Set(false); bool again = f.WaitOne(0);
+            Row("⑦ 解冻唤醒看门狗", "冻结不唤醒、放开唤醒一次、没冻结再放开不唤醒", $"冻结 {onFreeze}、放开 {onThaw}、再放开 {again}", !onFreeze && onThaw && !again);
             return bad == 0 ? 0 : 1;
         }
     }

@@ -164,6 +164,8 @@ namespace Ryujinx.Audio.Backends.Apple
         private bool _testNoteEndDone;
         private static readonly int _testResetAtS = int.TryParse(Environment.GetEnvironmentVariable("S2A_AUDIO_TEST_RESET_AT"), out int r) ? r : 0;
         private bool _testNoteDone, _testResetDone;
+        // 模拟中断按整个进程只投一次（11-25 iOS 验收：两路输出会话各投一次，#1 在 #0 恢复途中又投了 began，第二段读数被搅混）：先到点的会话认领
+        private static int s_testNoteClaimed;
         // 测试钩子:S2A_AUDIO_TEST_ROUTE_AT=<秒> —— 开播后到点经 S2AAudioNotes.PostForTest 走真实 NSNotificationCenter
         //   投递一条路由切换通知(声明/解析风格对齐 S2A_AUDIO_TEST_NOTE_AT;路由通知只记不动作,真停摆由 200 ms 兜底接住)
         private static readonly int _testRouteAtS = int.TryParse(Environment.GetEnvironmentVariable("S2A_AUDIO_TEST_ROUTE_AT"), out int rt) ? rt : 0;
@@ -358,7 +360,8 @@ namespace Ryujinx.Audio.Backends.Apple
 
             while (true)
             {
-                Thread.Sleep(250);
+                // 每 250 ms 一轮；客机解冻（回前台 / 失焦放开）时立刻醒来，当场重启输出器件（S2ACheckStall 的 #1384 分支），不等下一轮
+                Ryujinx.Audio.Integration.S2AGuestFreeze.Thawed.WaitOne(250);
 
                 long now = Stopwatch.GetTimestamp();
                 int notes = S2AAudioNotes.TakePending();
@@ -454,6 +457,11 @@ namespace Ryujinx.Audio.Backends.Apple
             if (_testNote.AtS > 0 && !_testNoteDone && since >= (long)_testNote.AtS * Stopwatch.Frequency)
             {
                 _testNoteDone = true;
+                if (Interlocked.Exchange(ref s_testNoteClaimed, 1) != 0)
+                {
+                    _testNoteEndDone = true;   // 别的会话已经投过：这一路不再投 began / ended
+                    return;
+                }
                 Console.Error.WriteLine($"[声] 测试钩子：输出 #{_diag.Index} 开播后第 {_testNote.AtS} 秒模拟中断（投递 began → 停器件 → {(_testNote.Ms > 0 ? $"{_testNote.Ms} ms 后" : "")}投递 ended）");
                 S2AAudioNotes.PostForTest("AVAudioSessionInterruptionNotification", 1);
                 AudioUnitInterop.AudioOutputUnitStop(_unit);
@@ -569,18 +577,16 @@ namespace Ryujinx.Audio.Backends.Apple
                 return;
             }
 
-            // S2Arm (#1384): 客机冻结(失焦暂停)放开后,macOS 也重启一次输出器件(11-13 的前提「macOS 队列自己恢复」在部分外接输出上不成立)
+            // S2Arm (#1384): 客机冻结(失焦暂停 / 进后台)放开后当场重启一次输出器件。原先只 macOS 重启(11-13 的前提「macOS 队列自己恢复」在部分外接输出上不成立)、
+            //   iOS / tvOS 靠宽限等器件自己回来：11-25 iOS 验收回前台到首个回调 520 ms(判据 ≤200 ms),与 11-24 查的「iOS 解冻不当场重启」同一件事。
+            //   各平台一样当场重启(iOS / tvOS 的 S2ARecover 同时重新激活音频会话);宽限照旧挡住解冻后头几拍的慢回调误判卡死
             long freezeSeq = Interlocked.Read(ref Ryujinx.Audio.Integration.S2AGuestFreeze.Seq);
             if (freezeSeq != _thawSeq && Ryujinx.Audio.Integration.S2AGuestFreeze.Frozen == 0)
             {
                 _thawSeq = freezeSeq;
+                S2ARecover($"客机解冻（失焦暂停 / 进后台放开，第 {freezeSeq} 次）：重启输出器件", false, now, false);
 
-                if (OperatingSystem.IsMacOS())   // 平台例外：苹果后端内部，iOS / tvOS 解冻由宽限接住
-                {
-                    S2ARecover($"客机解冻（失焦暂停放开，第 {freezeSeq} 次）：重启输出器件", false, now, false);
-
-                    return;
-                }
+                return;
             }
 
             if (S2AVerifyRecover(now, freezeSeq))
