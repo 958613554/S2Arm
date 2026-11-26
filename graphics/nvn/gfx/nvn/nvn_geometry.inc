@@ -159,12 +159,37 @@ _Static_assert(VB_SLOT(12) == MXE_SLOT, "slot 28 of the vertex table is vertex s
 static int mtk_emu_on(void) {
     static int v = -1; if (v >= 0) return v;
     const char *e = getenv("S2A_MESH_EMU");
-    // By GPU family, every platform (#1542): below Apple9 there is no hardware mesh shading, the driver's software mesh stage hangs on task / mesh draws, and an indirect mesh draw
-    //   (drawMeshThreadgroupsWithIndirectBuffer) is Apple9 and later in Apple's feature set tables. It was macOS only: A14–A16 iPhones and M1 / M2 iPads took the driver's way
+    // By GPU family (#1542): on iOS below Apple9 there is no hardware mesh shading; on macOS Apple Silicon (Mac2+) native task/mesh with pass splitting (DM_NVN_MESH_PASS_SPLIT=2)
+    //   eliminates the 30s compute prebuild, halves render-target load/store traffic, and runs with zero GPU hangs, so macOS Mac2+/Apple9+ defaults to native while iOS < Apple9 stays emulated.
+#if TARGET_OS_IPHONE
     int dflt = ![g_dev supportsFamily:MTLGPUFamilyApple9];
+#else
+    int dflt = !([g_dev supportsFamily:MTLGPUFamilyApple9] || [g_dev supportsFamily:MTLGPUFamilyMac2]);
+#endif
     v = e && *e ? *e == '1' : dflt;
     MLOG("task / mesh draws: the task and mesh stages run %s (S2A_MESH_EMU %s)", v ? "on the host as compute kernels, drawn as an indexed draw of their vertex records (#770)" : "in the driver's object stage", e && *e ? e : "unset");
     return v;
+}
+// DM_NVN_MESH_PASS_SPLIT: on Apple GPUs before Apple9 (M1 / M2), mixing native task/mesh draws and ordinary draws in one render pass can hang the GPU.
+//   2 (default on < Apple9 when running natively): end render pass only where mesh and ordinary draws meet, so consecutive mesh draws share one pass;
+//   1: own render pass per mesh draw; 0 (default on Apple9+): share render passes.
+static int mtk_split_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_NVN_MESH_PASS_SPLIT");
+        v = e && *e ? atoi(e) : [g_dev supportsFamily:MTLGPUFamilyApple9] ? 0 : 2;
+        if (v < 0 || v > 2) v = 1;
+        MLOG("task / mesh native pass split: %s (DM_NVN_MESH_PASS_SPLIT=%d%s)",
+             v == 1 ? "own render pass per mesh draw" : v == 2 ? "separate runs from ordinary draws" : "share render passes",
+             v, e && *e ? "" : ", by GPU family");
+    }
+    return v;
+}
+static void mtk_pass_before_plain(void) {
+    if (!mtk_emu_on() && mtk_split_on() == 2 && g_enc && g_mtk_pass_mesh) rp_end();
+}
+static void mtk_pass_mark_plain(void) {
+    if (!mtk_emu_on() && mtk_split_on() == 2 && g_enc) g_mtk_pass_plain = 1;
 }
 static const char k_mxe_msl[] =
 "#include <metal_stdlib>\nusing namespace metal;\n"
@@ -785,7 +810,17 @@ static void mtk_encode(id en_) {
     }
     NSUInteger ot = ts ? ts->mesh_threads : 1, mt = ms->mesh_threads;
     if (g_mtk.ind && fault_enc_on()) { NSUInteger fo; id<MTLBuffer> fbuf; if (m3_buf_at(g_mtk.ind, &fbuf, &fo)) fault_ring_put(fbuf, fo, ts ? ts->key : NULL, ms->key, atomic_load_explicit(&g_cur_frame, memory_order_relaxed)); }
-    if (g_mtk.ind) enc_r_mesh_indirect(en, g_mtk.ind, ot, mt); else enc_r_mesh(en, g_mtk.count, ot, mt);
+    if (g_mtk.ind) enc_r_mesh_indirect(en, g_mtk.ind, ot, mt);
+    else if (!ts && g_mtk.count > 1024) {   // Metal mesh grid is capped at 1024 per dispatch; chunk direct taskless draws cleanly
+        uint32_t done = 0;
+        while (done < g_mtk.count) {
+            uint32_t n = MIN(g_mtk.count - done, 1024u), f0 = g_mtk.first + done;
+            id<MTLBuffer> fb; size_t fo = arena_alloc(16, &fb); memcpy((uint8_t *)fb.contents + fo, &f0, 4);
+            enc_r_vbuf(en, MESH_FIRST_SLOT, fb.gpuAddress + fo);
+            enc_r_mesh(en, n, ot, mt);
+            done += n;
+        }
+    } else enc_r_mesh(en, g_mtk.count, ot, mt);
 }
 static void mesh_tasks_draw(const p_draw *dw) {
     if (!dw->ind && dw->count <= 0) return;
@@ -824,6 +859,8 @@ static void mesh_tasks_draw(const p_draw *dw) {
                  ts ? ts->key : "-", ms->key, ts && ts->mesh_relay ? ", relayed payload" : "", (unsigned long)refused.count); }
         return;
     }
+    int split = !g_mtk.emu ? mtk_split_on() : 0;
+    if (split && g_enc && (split == 1 || (split == 2 && g_mtk_pass_plain))) rp_end();
     g_mtk.on = 1; g_mtk.miss = 0; g_mtk.ts = ts; g_mtk.ms = ms; g_mtk.first = (uint32_t)dw->first; g_mtk.count = (uint32_t)dw->count; g_mtk.ind = ind;
     g_geo_program = raster;
     p_draw triangle = {.prim = 4, .count = 3, .instances = 1};
@@ -832,6 +869,8 @@ static void mesh_tasks_draw(const p_draw *dw) {
     if (in_run) mesh_run_lane2(0);
     g_geo_program = nil; g_mtk.on = 0; g_mtk.ts = g_mtk.ms = nil; g_mtk.emu = 0; g_mtk.emu_fn = nil; args_dirty_all();
     if (g_mtk.miss) { g_mtk_wait++; return; }
+    if (split == 1 && g_enc) rp_end();
+    else if (split == 2 && g_enc) g_mtk_pass_mesh = 1;
     swrite_note(pr);   // the task / mesh stages' storage writes (draw() saw the pixel stage alone)
     if (!g_mtk_n++) MLOG("task / mesh: first draw (%s), task %s mesh %s fragment %s, %u workgroups from %u", ind ? "indirect" : "direct", ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-",
                          g_mtk.count, g_mtk.first);

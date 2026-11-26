@@ -333,6 +333,60 @@ int main(void) {
               VERIFY(h[8] == 64 && h[9] == 1 && h[10] == 1 && h[13] == 0 && h[14] == 1 && h[18] == 1000000 && h[19] == 0,
                      "⑬ 无任务网格间接 {1000, 1000, 1}、容量 64 → 组 {%u, %u, %u}、索引数 %u、实例 %u、原始 %u、任务 %u", h[8], h[9], h[10], h[13], h[14], h[18], h[19]);
           } }
+        // ⑭ DM_NVN_MESH_PASS_SPLIT=2（M1 / M2 等无原生剔除时按「网格」vs「普通」切换断点）+ 无任务原生网格 count > 1024 分块派发
+        {
+            NvShader *vs14 = [NvShader new]; vs14->stage = 0; strlcpy(vs14->key, "1414141414141414_b", sizeof vs14->key); vs14->ventry = @"main0"; vs14->rf.pos_attr = -1; vs14->load_depth_zero = 1;
+            { NSError *e = nil; id<MTLLibrary> l = [g_dev newLibraryWithSource:
+                @"#include <metal_stdlib>\nusing namespace metal;\n"
+                 "vertex float4 main0(uint vid [[vertex_id]]) { return float4(2.0 + float(vid), 2.0, 0.0, 1.0); }\n" options:nil error:&e];
+              REQUIRE(l); vs14->fn = [l newFunctionWithName:@"main0"]; REQUIRE(vs14->fn); }
+            NvProg *plain14 = [NvProg new]; plain14->sh[0] = vs14; plain14->sh[1] = fs;
+            static prog_t gp_plain14; memset(&gp_plain14, 0, sizeof gp_plain14); gp_plain14.magic = MAGIC('P', 'R', 'O', 'G'); gp_plain14.serial = nvn_new_serial(); serial_put(gp_plain14.serial, plain14);
+
+            int want_split = [g_dev supportsFamily:MTLGPUFamilyApple9] ? 0 : 2;
+            const char *se = getenv("DM_NVN_MESH_PASS_SPLIT");
+            if (!se || !*se) VERIFY(mtk_split_on() == want_split, "⑭ 缺省 DM_NVN_MESH_PASS_SPLIT=%d（期望 %d）", mtk_split_on(), want_split);
+
+            p_draw d14a = {.prim = DM_PRIM_MESH_TASKS, .first = 0, .count = 1, .instances = 1};
+            p_draw d14b = {.prim = DM_PRIM_MESH_TASKS, .first = 2, .count = 1, .instances = 1};
+            p_draw d14p = {.prim = 4, .count = 3, .instances = 1};
+            int w14 = 0;
+            if (!mtk_emu_on() && mtk_split_on() == 2) {
+                frame_begin(); uint64_t rp0 = g_stat_pass; S.prog = &gp[0];
+                mesh_draw(&d14a, &w14); mesh_draw(&d14b, &w14);
+                cols = frame_columns();
+                VERIFY(cols == 0x05 && g_stat_pass == rp0 + 1,
+                       "⑭ 连续两笔直跑网格绘制共用 1 遍：渲染遍 +%llu（期望 1），列掩码 %#x（期望 0x05）", (unsigned long long)(g_stat_pass - rp0), cols);
+
+                frame_begin(); rp0 = g_stat_pass; S.prog = &gp[0]; mesh_draw(&d14a, &w14);
+                S.prog = &gp_plain14; draw(&d14p, NULL);
+                S.prog = &gp[0]; mesh_draw(&d14b, &w14);
+                cols = frame_columns();
+                VERIFY(cols == 0x05 && g_stat_pass == rp0 + 3,
+                       "⑭ 网格 / 普通 / 网格交错在边界切遍：渲染遍 +%llu（期望 3），列掩码 %#x（期望 0x05）", (unsigned long long)(g_stat_pass - rp0), cols);
+
+                frame_begin(); rp0 = g_stat_pass; S.prog = &gp[0]; mesh_draw(&d14a, &w14);
+                R.has_sc = 1; R.sc = (p_scissor){7, 0, 1, 4};
+                clear_color_tri(&(p_clear_color){.index = 0, .mask = 15, .rgba = {0, 0, 0, 1}});
+                R.has_sc = 0;
+                S.prog = &gp[0]; mesh_draw(&d14b, &w14);
+                cols = frame_columns();
+                VERIFY(cols == 0x05 && g_stat_pass == rp0 + 3,
+                       "⑭ 网格后遍内三角清除（clear_color_tri）后接网格在边界切遍：渲染遍 +%llu（期望 3），列掩码 %#x（期望 0x05）", (unsigned long long)(g_stat_pass - rp0), cols);
+            }
+            // 无任务直跑网格 count > 1024（1028 拆成 1024 + 4 两段，起始号分别落在 buffer(29)）：列 0..7 全白，Zero GPU/Metal 校验错误
+            frame_begin(); S.prog = &gp[0];
+            p_draw d14big = {.prim = DM_PRIM_MESH_TASKS, .first = 0, .count = 1028, .instances = 1};
+            mesh_draw(&d14big, &w14);
+            cols = frame_columns();
+            VERIFY(cols == 0xff, "⑭ 无任务直跑网格 count=1028（>1024 分块派发）：列掩码 %#x（期望 0xff）", cols);
+
+            frame_begin(); S.prog = &gp[0];
+            p_draw d14hi = {.prim = DM_PRIM_MESH_TASKS, .first = 1024, .count = 4, .instances = 1};
+            mesh_draw(&d14hi, &w14);
+            cols = frame_columns();
+            VERIFY(cols == 0, "⑭ 无任务直跑网格 first=1024 count=4：提交无报错、列掩码 %#x（期望 0）", cols);
+        }
     }
     if (failures) { printf("✗ t_nvn_mesh：%u 项里 %u 项不符\n", checks, failures); return 1; }   // 原生门禁按「✓ t_ / ✗ t_」逐组判
     printf("✓ t_nvn_mesh：%u 项全过（任务 / 网格绘制：约定字段载入、上限报红、无顶点阶段的程序、直接 / 有任务 / GPU 写参数的间接 / 零工作量画出的列与手算一致、缺网格着色器报红、映射表阶段名 task / mesh 载入、无网格管线的 GPU 跳过报红）\n", checks); return 0;
