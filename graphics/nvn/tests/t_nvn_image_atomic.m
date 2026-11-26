@@ -249,7 +249,7 @@ int main(int argc,char **argv) {
             run_case(1,0,native_buffer,0);
         }
         nvn_be_drain();
-        printf("%s t_nvn_image_atomic: %u checks %u failures; %s, no gameplay proof\n",failures?"FAIL":"PASS",checks,failures,argv[2]);
+        printf("%s t_nvn_image_atomic: %u checks %u failures; %s, no gameplay proof\n",failures?"✗":"✓",checks,failures,argv[2]);
         return failures!=0;
     }
 }
