@@ -625,6 +625,433 @@ static int mtk_emu_run(const p_draw *dw, NvShader *ts, NvShader *ms, uint64_t in
     static uint64_t nr; if (ms->mesh_relay && !nr++) MLOG("task / mesh host stages: first draw with a relayed payload (task %s mesh %s, %s), stage memory %u words a mesh workgroup in the exchange", ts ? ts->key : "-", ms->key, ind ? "indirect" : "direct", ms->mesh_relay_sw);
     return 1;
 }
+// ---------- Device stage scratch + direct byte stores + varying packing for native task/mesh draws ----------
+enum {
+    MTK_SCRATCH_SLOT = 28,          // VB_SLOT(12), unused by native [[mesh]] draws (only S2A_MESH_EMU uses MXE_SLOT=28)
+    MTK_SCRATCH_FORCED = 3,
+    MTK_SCRATCH_FLAGS = 4,
+    MTK_SCRATCH_SLOTS_OFF = 8192,
+    MTK_SCRATCH_SLOT_WORDS = 4096,
+    MTK_SCRATCH_MIN_WORDS = 1024,   // > 4 KiB stage memory moves to device scratch
+    MTK_SCRATCH_SPIN = 65536
+};
+static os_unfair_lock g_mtk_scratch_lock = OS_UNFAIR_LOCK_INIT;
+static id<MTLBuffer> g_mtk_scratch;
+static uint64_t g_mtk_scratch_gpu;
+static unsigned g_mtk_scratch_slots;
+static _Atomic uint64_t g_mtk_scratch_gpu_atomic;
+
+static uint64_t mtk_scratch_gpu(void) {
+    uint64_t cached = atomic_load_explicit(&g_mtk_scratch_gpu_atomic, memory_order_acquire);
+    if (cached) return cached;
+    os_unfair_lock_lock(&g_mtk_scratch_lock);
+    if (!g_mtk_scratch) {
+        unsigned slots = TARGET_OS_IPHONE ? 1024 : 4096;
+        const char *e = getenv("DM_NVN_MESH_SCRATCH_SLOTS");
+        if (e && atoi(e) > 0) slots = (unsigned)atoi(e);
+        if ((slots & (slots - 1)) || MTK_SCRATCH_FLAGS + slots > MTK_SCRATCH_SLOTS_OFF) {
+            os_unfair_lock_unlock(&g_mtk_scratch_lock);
+            MDIE("mesh stage scratch: invalid slot count %u", slots);
+        }
+        size_t bytes = ((size_t)MTK_SCRATCH_SLOTS_OFF + (size_t)slots * MTK_SCRATCH_SLOT_WORDS) * 4;
+        id<MTLBuffer> buf = [g_dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        if (!buf) {
+            os_unfair_lock_unlock(&g_mtk_scratch_lock);
+            MDIE("mesh stage scratch: cannot allocate %zu bytes", bytes);
+        }
+        uint32_t *h = (uint32_t *)buf.contents;
+        memset(h, 0, (size_t)MTK_SCRATCH_SLOTS_OFF * 4);
+        h[1] = slots - 1;
+        h[2] = MTK_SCRATCH_SLOT_WORDS;
+        g_mtk_scratch_slots = slots;
+        buf.label = @"S2Arm mesh stage scratch";
+        res_add(buf);
+        res_commit();
+        g_mtk_scratch = buf;
+        g_mtk_scratch_gpu = buf.gpuAddress;
+        atomic_store_explicit(&g_mtk_scratch_gpu_atomic, g_mtk_scratch_gpu, memory_order_release);
+        MLOG("task / mesh device stage memory: %u slots of %u KiB (%zu MiB)", slots, MTK_SCRATCH_SLOT_WORDS * 4 / 1024, bytes >> 20);
+    }
+    uint64_t r = g_mtk_scratch_gpu;
+    os_unfair_lock_unlock(&g_mtk_scratch_lock);
+    return r;
+}
+static void mtk_scratch_reset(void) {
+    os_unfair_lock_lock(&g_mtk_scratch_lock);
+    if (g_mtk_scratch) { res_remove(g_mtk_scratch); g_mtk_scratch = nil; }
+    g_mtk_scratch_gpu = 0; g_mtk_scratch_slots = 0;
+    atomic_store_explicit(&g_mtk_scratch_gpu_atomic, 0, memory_order_release);
+    os_unfair_lock_unlock(&g_mtk_scratch_lock);
+}
+static int mtk_opt_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_NVN_MESH_OPT");
+        v = e && *e ? atoi(e) != 0 : !TARGET_OS_IPHONE;
+        MLOG("task / mesh shader opts: %s (DM_NVN_MESH_OPT=%s)", v ? "on (device stage scratch + direct byte stores + packed varyings)" : "off", e && *e ? e : "default");
+    }
+    return v;
+}
+static NSString *mtk_opt_mesh_src(NSString *src, int *out_dev, int *out_bstore) {
+    *out_dev = 0; *out_bstore = 0;
+    if (!src.length) return nil;
+    NSMutableString *cur = [src mutableCopy];
+    NSRange main0 = [cur rangeOfString:@"[[mesh]] void main0("];
+    if (main0.location != NSNotFound && ![cur containsString:@"dm_relay"] && ![cur containsString:@"[[buffer(28)]]"]) {
+        NSRange emu = [cur rangeOfString:@"\n#ifdef S2A_MESH_EMU\n" options:NSBackwardsSearch];
+        if (emu.location != NSNotFound && emu.location > main0.location) {
+            [cur deleteCharactersInRange:NSMakeRange(emu.location, cur.length - emu.location)];
+        }
+        static NSRegularExpression *rxArr, *rxInit, *rxOp, *rxTgTok;
+        static dispatch_once_t onceA;
+        dispatch_once(&onceA, ^{
+            rxArr = [NSRegularExpression regularExpressionWithPattern:@"    threadgroup spvUnsafeArray<uint, (\\d+)> (\\w+);\n" options:0 error:nil];
+            rxInit = [NSRegularExpression regularExpressionWithPattern:@"    for \\(uint i = ([^;]+); i < (\\d+)u; i \\+= (\\d+)u\\) (\\w+)\\[i\\] = 0u;\n" options:0 error:nil];
+            rxOp = [NSRegularExpression regularExpressionWithPattern:@"^.*\\boperator\\s*\\[\\].*$" options:NSRegularExpressionAnchorsMatchLines error:nil];
+            rxTgTok = [NSRegularExpression regularExpressionWithPattern:@"\\bthreadgroup\\b" options:0 error:nil];
+        });
+        NSTextCheckingResult *ma = [rxArr firstMatchInString:cur options:0 range:NSMakeRange(main0.location, cur.length - main0.location)];
+        if (ma) {
+            int words = [[cur substringWithRange:[ma rangeAtIndex:1]] intValue];
+            NSString *mem = [cur substringWithRange:[ma rangeAtIndex:2]];
+            NSRange searchFrom = NSMakeRange(NSMaxRange(ma.range), cur.length - NSMaxRange(ma.range));
+            NSTextCheckingResult *mi = [rxInit firstMatchInString:cur options:0 range:searchFrom];
+            if (words > MTK_SCRATCH_MIN_WORDS && words <= MTK_SCRATCH_SLOT_WORDS && mi &&
+                [[cur substringWithRange:[mi rangeAtIndex:2]] intValue] == words &&
+                [[cur substringWithRange:[mi rangeAtIndex:4]] isEqualToString:mem]) {
+                NSString *lid = [cur substringWithRange:[mi rangeAtIndex:1]];
+                NSMutableString *prefix = [[cur substringToIndex:main0.location] mutableCopy];
+                NSString *arrRef = [NSString stringWithFormat:@"threadgroup spvUnsafeArray<uint, %d>&", words];
+                NSString *devRef = [NSString stringWithFormat:@"device spvUnsafeArray<uint, %d>&", words];
+                [prefix replaceOccurrencesOfString:arrRef withString:devRef options:0 range:NSMakeRange(0, prefix.length)];
+                [prefix replaceOccurrencesOfString:@"(threadgroup atomic_uint*)" withString:@"(device atomic_uint*)" options:0 range:NSMakeRange(0, prefix.length)];
+                [prefix replaceOccurrencesOfString:@"mem_flags::mem_threadgroup" withString:@"mem_flags::mem_device | mem_flags::mem_threadgroup" options:0 range:NSMakeRange(0, prefix.length)];
+                NSMutableString *probe = [prefix mutableCopy];
+                [probe replaceOccurrencesOfString:@"threadgroup_barrier(" withString:@"dm_bar(" options:0 range:NSMakeRange(0, probe.length)];
+                [rxOp replaceMatchesInString:probe options:0 range:NSMakeRange(0, probe.length) withTemplate:@""];
+                if (![rxTgTok firstMatchInString:probe options:0 range:NSMakeRange(0, probe.length)]) {
+                    NSRange insPt = [prefix rangeOfString:@"struct dm_payload_t" options:NSBackwardsSearch];
+                    if (insPt.location == NSNotFound) insPt = [prefix rangeOfString:@"struct dm_vertex_t" options:NSBackwardsSearch];
+                    if (insPt.location != NSNotFound) {
+                        NSString *relHelper = @"static inline __attribute__((always_inline)) void dm_release_slot(device uint* dm_scratch, uint slot, uint lid) { threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup); if (lid == 0u) atomic_store_explicit((device atomic_uint*)(dm_scratch + 4u + slot), 0u, memory_order_relaxed); }\n";
+                        [prefix insertString:relHelper atIndex:insPt.location];
+                        NSMutableString *tail = [[cur substringFromIndex:main0.location] mutableCopy];
+                        [tail replaceOccurrencesOfString:@"mem_flags::mem_threadgroup" withString:@"mem_flags::mem_device | mem_flags::mem_threadgroup" options:0 range:NSMakeRange(0, tail.length)];
+                        NSString *declOld = [NSString stringWithFormat:@"    threadgroup spvUnsafeArray<uint, %d> %@;\n", words, mem];
+                        NSString *declNew = [NSString stringWithFormat:
+                            @"    threadgroup uint dm_slot_tg;\n"
+                             "    if (%@ == 0u) { uint s, tries = 0u; for (;;) { s = atomic_fetch_add_explicit((device atomic_uint*)dm_scratch, 1u, memory_order_relaxed) & dm_scratch[1]; if (atomic_exchange_explicit((device atomic_uint*)(dm_scratch + %du + s), 1u, memory_order_relaxed) == 0u) break; if (++tries == %du) { atomic_fetch_add_explicit((device atomic_uint*)(dm_scratch + %du), 1u, memory_order_relaxed); break; } } dm_slot_tg = s; }\n"
+                             "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+                             "    %@ %@ = *reinterpret_cast<device spvUnsafeArray<uint, %d>*>(dm_scratch + %du + (ulong)dm_slot_tg * dm_scratch[2]);\n",
+                            lid, MTK_SCRATCH_FLAGS, MTK_SCRATCH_SPIN, MTK_SCRATCH_FORCED, devRef, mem, words, MTK_SCRATCH_SLOTS_OFF];
+                        NSString *relCall = [NSString stringWithFormat:@"    dm_release_slot(dm_scratch, dm_slot_tg, %@);\n}\n", lid];
+                        BOOL ok = YES;
+                        for (NSString *sigPrefix in @[@"[[mesh]] void main0(", @"[[mesh]] void main0_z("]) {
+                            NSRange sr = [tail rangeOfString:sigPrefix];
+                            if (sr.location == NSNotFound) { if ([sigPrefix containsString:@"main0("]) { ok = NO; break; } continue; }
+                            NSRange sigEnd = [tail rangeOfString:@")\n{\n" options:0 range:NSMakeRange(sr.location, tail.length - sr.location)];
+                            if (sigEnd.location == NSNotFound) { ok = NO; break; }
+                            [tail insertString:@", device uint* dm_scratch [[buffer(28)]]" atIndex:sigEnd.location];
+                            NSRange bodyStart = NSMakeRange(sigEnd.location + @", device uint* dm_scratch [[buffer(28)]])\n{\n".length, tail.length - (sigEnd.location + @", device uint* dm_scratch [[buffer(28)]])\n{\n".length));
+                            NSRange bodyClose = [tail rangeOfString:@"\n}\n" options:0 range:bodyStart];
+                            if (bodyClose.location == NSNotFound) {
+                                if ([tail hasSuffix:@"\n}"]) bodyClose = NSMakeRange(tail.length - 2, 2);
+                                else { ok = NO; break; }
+                            }
+                            [tail replaceCharactersInRange:NSMakeRange(bodyClose.location + 1, bodyClose.length - 1) withString:relCall];
+                            NSRange declR = [tail rangeOfString:declOld options:0 range:NSMakeRange(bodyStart.location, bodyClose.location - bodyStart.location)];
+                            if (declR.location == NSNotFound) { ok = NO; break; }
+                            [tail replaceCharactersInRange:declR withString:declNew];
+                        }
+                        if (ok) { cur = [NSMutableString stringWithFormat:@"%@%@", prefix, tail]; *out_dev = 1; }
+                    }
+                }
+            }
+        }
+    }
+    static NSRegularExpression *rxBstore;
+    static dispatch_once_t onceB;
+    dispatch_once(&onceB, ^{
+        rxBstore = [NSRegularExpression regularExpressionWithPattern:
+            @"^void (_\\d+)\\(thread const int& (_\\d+), thread const int& (_\\d+), (threadgroup|device) spvUnsafeArray<uint, (\\d+)>& (_\\d+)\\)\\n\\{\\n(.*?)\\n\\}\\n"
+            options:NSRegularExpressionDotMatchesLineSeparators | NSRegularExpressionAnchorsMatchLines error:nil];
+    });
+    NSArray<NSTextCheckingResult *> *bms = [rxBstore matchesInString:cur options:0 range:NSMakeRange(0, cur.length)];
+    for (NSTextCheckingResult *r in bms.reverseObjectEnumerator) {
+        NSString *body = [cur substringWithRange:[r rangeAtIndex:7]];
+        if (![body containsString:@"insert_bits("] || ![body containsString:@", 8u)"] ||
+            ![body containsString:@"atomic_compare_exchange_weak_explicit"] || ![body containsString:@">> uint(2)"] ||
+            ![body containsString:@"& 3"] || ![body containsString:@"<< 3"]) continue;
+        NSString *rep = [NSString stringWithFormat:
+            @"void %@(thread const int& %@, thread const int& %@, %@ spvUnsafeArray<uint, %@>& %@)\n{\n"
+             "    reinterpret_cast<%@ uchar*>(&%@[0])[uint(%@)] = uchar(uint(%@));\n}\n",
+            [cur substringWithRange:[r rangeAtIndex:1]], [cur substringWithRange:[r rangeAtIndex:2]],
+            [cur substringWithRange:[r rangeAtIndex:3]], [cur substringWithRange:[r rangeAtIndex:4]],
+            [cur substringWithRange:[r rangeAtIndex:5]], [cur substringWithRange:[r rangeAtIndex:6]],
+            [cur substringWithRange:[r rangeAtIndex:4]], [cur substringWithRange:[r rangeAtIndex:6]],
+            [cur substringWithRange:[r rangeAtIndex:2]], [cur substringWithRange:[r rangeAtIndex:3]]];
+        [cur replaceCharactersInRange:r.range withString:rep];
+        (*out_bstore)++;
+    }
+    return (*out_dev || *out_bstore) ? cur : nil;
+}
+
+typedef struct { int loc; NSString *type, *name, *quals; } mpk_member;
+typedef struct { int loc, lane; NSString *expr; } mpk_lane;
+static BOOL mpk_members(NSString *src, NSString *structName, BOOL allowPosition, NSMutableArray<NSValue *> *out, NSRange *block) {
+    NSRegularExpression *decl = [NSRegularExpression regularExpressionWithPattern:[NSString stringWithFormat:@"\\bstruct %@\\s*\\{", structName] options:0 error:nil];
+    NSTextCheckingResult *m = [decl firstMatchInString:src options:0 range:NSMakeRange(0, src.length)];
+    if (!m) return NO;
+    NSRange end = [src rangeOfString:@"};" options:0 range:NSMakeRange(m.range.location, src.length - m.range.location)];
+    if (end.location == NSNotFound) return NO;
+    NSRange body = NSMakeRange(NSMaxRange(m.range), end.location - NSMaxRange(m.range));
+    NSString *bodyStr = [src substringWithRange:body];
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"^(\\w+)\\s+(\\w+)\\s*\\[\\[user\\(locn(\\d+)\\)((?:,\\s*\\w+)*)\\]\\]$" options:0 error:nil];
+    for (NSString *raw in [bodyStr componentsSeparatedByString:@";"]) {
+        NSString *t = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (!t.length) continue;
+        if (allowPosition && [t containsString:@"[[position"] && [t hasPrefix:@"float4 "]) continue;
+        NSTextCheckingResult *r = [re firstMatchInString:t options:0 range:NSMakeRange(0, t.length)];
+        if (!r) return NO;
+        mpk_member *pm = calloc(1, sizeof *pm);
+        pm->type = [t substringWithRange:[r rangeAtIndex:1]]; pm->name = [t substringWithRange:[r rangeAtIndex:2]];
+        pm->loc = [[t substringWithRange:[r rangeAtIndex:3]] intValue]; pm->quals = [t substringWithRange:[r rangeAtIndex:4]];
+        [out addObject:[NSValue valueWithPointer:pm]];
+    }
+    *block = NSMakeRange(m.range.location, NSMaxRange(end) - m.range.location);
+    return YES;
+}
+static void mpk_members_free(NSMutableArray<NSValue *> *a) { for (NSValue *v in a) free(v.pointerValue); }
+static NSArray<NSString *> *mpk_split4(NSString *s) {
+    NSMutableArray<NSString *> *out = [NSMutableArray arrayWithCapacity:4];
+    int depth = 0; NSUInteger start = 0;
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (c == '(' || c == '[' || c == '<') depth++;
+        else if (c == ')' || c == ']' || c == '>') depth--;
+        else if (c == ',' && depth == 0) {
+            [out addObject:[[s substringWithRange:NSMakeRange(start, i - start)] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet]];
+            start = i + 1;
+        }
+    }
+    [out addObject:[[s substringFromIndex:start] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet]];
+    return depth == 0 && out.count == 4 ? out : nil;
+}
+static NSDictionary<NSNumber *, NSArray<NSString *> *> *mpk_exports(NSString *src, NSMutableDictionary<NSNumber *, NSString *> *lineText) {
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"^\\s*v\\.a(\\d+)\\s*=\\s*float4\\(([^\\n]*)\\);$" options:NSRegularExpressionAnchorsMatchLines error:nil];
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    for (NSTextCheckingResult *r in [re matchesInString:src options:0 range:NSMakeRange(0, src.length)]) {
+        NSNumber *loc = @([[src substringWithRange:[r rangeAtIndex:1]] intValue]);
+        if (d[loc]) continue;
+        NSArray<NSString *> *args = mpk_split4([src substringWithRange:[r rangeAtIndex:2]]);
+        if (!args) return nil;
+        d[loc] = args; lineText[loc] = [src substringWithRange:r.range];
+    }
+    return d;
+}
+static BOOL mpk_is_const(NSString *e) { return [e isEqualToString:@"0.0"] || [e isEqualToString:@"1.0"]; }
+static int mtk_pack_pair_src(NSString *msrc, NSString *fsrc, NSString **out_msrc, NSString **out_fsrc, NSString **out_layout, unsigned *out_orig, unsigned *out_new) {
+    if (!msrc.length || !fsrc.length) return 0;
+    if ([fsrc componentsSeparatedByString:@"main0_in"].count != 3) return 0;
+    NSString *setV = [msrc containsString:@"dm_out.set_vertex(n, v);"] ? @"dm_out.set_vertex(n, v);" : @"dm_out.set_vertex(n,v);";
+    if ([msrc componentsSeparatedByString:setV].count < 2) return 0;
+    NSMutableArray<NSValue *> *fin = [NSMutableArray array], *mout = [NSMutableArray array]; NSRange fblock = {0, 0}, mblock = {0, 0};
+    BOOL fok = mpk_members(fsrc, @"main0_in", NO, fin, &fblock), mok = mpk_members(msrc, @"dm_vertex_t", YES, mout, &mblock);
+    NSMutableDictionary<NSNumber *, NSString *> *exportText = [NSMutableDictionary dictionary];
+    NSDictionary<NSNumber *, NSArray<NSString *> *> *exports = mpk_exports(msrc, exportText);
+    if (!fok || !mok || !exports || !fin.count) { mpk_members_free(fin); mpk_members_free(mout); return 0; }
+    NSMutableSet<NSNumber *> *kept = [NSMutableSet set]; NSMutableArray<NSString *> *groupOrder = [NSMutableArray array];
+    { NSMutableArray<NSValue *> *prim = [NSMutableArray array]; NSRange pblock = {0, 0};
+      if (mpk_members(msrc, @"dm_prim_t", NO, prim, &pblock)) for (NSValue *v in prim) { mpk_member *pm = v.pointerValue; [kept addObject:@(pm->loc)]; }
+      mpk_members_free(prim); }
+    NSMutableDictionary<NSString *, NSMutableArray<NSValue *> *> *groups = [NSMutableDictionary dictionary];
+    unsigned originalSlots = 0;
+    for (NSValue *v in fin) {
+        mpk_member *pm = v.pointerValue; NSNumber *loc = @(pm->loc);
+        originalSlots++;
+        if (![pm->type isEqualToString:@"float4"] || [kept containsObject:loc]) { [kept addObject:loc]; continue; }
+        NSArray *e = exports[loc]; if (!e) continue;
+        if (!groups[pm->quals]) { groups[pm->quals] = [NSMutableArray array]; [groupOrder addObject:pm->quals]; }
+        for (int lane = 0; lane < 4; lane++) if (!mpk_is_const(e[lane])) {
+            mpk_lane *pl = calloc(1, sizeof *pl); pl->loc = pm->loc; pl->lane = lane; pl->expr = e[lane];
+            [groups[pm->quals] addObject:[NSValue valueWithPointer:pl]];
+        }
+    }
+    NSMutableArray<NSArray<NSValue *> *> *slots = [NSMutableArray array]; NSMutableArray<NSString *> *slotQuals = [NSMutableArray array];
+    for (NSString *q in groupOrder) {
+        NSArray *lanes = groups[q];
+        for (NSUInteger i = 0; i < lanes.count; i += 4) { [slots addObject:[lanes subarrayWithRange:NSMakeRange(i, MIN((NSUInteger)4, lanes.count - i))]]; [slotQuals addObject:q]; }
+    }
+    unsigned newSlots = (unsigned)(kept.count + slots.count);
+    void (^freeAll)(void) = ^{ mpk_members_free(fin); mpk_members_free(mout); for (NSString *q in groups) for (NSValue *v in groups[q]) free(v.pointerValue); };
+    if (!slots.count || newSlots >= originalSlots) { freeAll(); return 0; }
+    NSMutableArray<NSNumber *> *slotLoc = [NSMutableArray array];
+    for (int l = 0, s = 0; (unsigned)s < slots.count && l < 64; l++) if (![kept containsObject:@(l)]) { [slotLoc addObject:@(l)]; s++; }
+    if (slotLoc.count != slots.count) { freeAll(); return 0; }
+    NSMutableString *layout = [NSMutableString string];
+    for (NSUInteger s = 0; s < slots.count; s++) {
+        [layout appendFormat:@"%@%@[", slotLoc[s], [slotQuals[s] stringByReplacingOccurrencesOfString:@" " withString:@""]];
+        for (NSValue *v in slots[s]) { mpk_lane *pl = v.pointerValue; [layout appendFormat:@"%d.%d,", pl->loc, pl->lane]; }
+        [layout appendString:@"]"];
+    }
+    for (NSValue *v in fin) { mpk_member *pm = v.pointerValue; if (!exports[@(pm->loc)] && ![kept containsObject:@(pm->loc)]) [layout appendFormat:@"z%d", pm->loc]; }
+    NSMutableString *mstruct = [NSMutableString stringWithString:@"struct dm_vertex_t {"];
+    { NSString *block = [msrc substringWithRange:mblock];
+      NSRegularExpression *pos = [NSRegularExpression regularExpressionWithPattern:@"float4\\s+position\\s*\\[\\[[^\\]]*\\]\\]\\s*;" options:0 error:nil];
+      NSTextCheckingResult *p = [pos firstMatchInString:block options:0 range:NSMakeRange(0, block.length)];
+      if (!p) { freeAll(); return 0; }
+      [mstruct appendFormat:@" %@\n", [block substringWithRange:p.range]]; }
+    NSMutableString *msource = [NSMutableString stringWithString:msrc];
+    for (NSValue *v in mout) { mpk_member *pm = v.pointerValue;
+        if ([kept containsObject:@(pm->loc)]) [mstruct appendFormat:@"    %@ %@ [[user(locn%d)]];\n", pm->type, pm->name, pm->loc];
+        else if (exportText[@(pm->loc)]) [msource replaceOccurrencesOfString:[exportText[@(pm->loc)] stringByAppendingString:@"\n"] withString:@"" options:0 range:NSMakeRange(0, msource.length)]; }
+    NSMutableString *slotWrites = [NSMutableString string];
+    for (NSUInteger s = 0; s < slots.count; s++) {
+        [mstruct appendFormat:@"    float4 dm_p%lu [[user(locn%@)]];\n", (unsigned long)s, slotLoc[s]];
+        NSMutableArray *e = [NSMutableArray array]; for (NSValue *v in slots[s]) { mpk_lane *pl = v.pointerValue; [e addObject:pl->expr]; }
+        while (e.count < 4) [e addObject:@"0.0"];
+        [slotWrites appendFormat:@"        v.dm_p%lu = float4(%@);\n", (unsigned long)s, [e componentsJoinedByString:@", "]];
+    }
+    [mstruct appendString:@"};"];
+    [msource replaceCharactersInRange:[msource rangeOfString:[msrc substringWithRange:mblock]] withString:mstruct];
+    [msource replaceOccurrencesOfString:setV withString:[slotWrites stringByAppendingString:setV] options:0 range:NSMakeRange(0, msource.length)];
+    NSRegularExpression *sig = [NSRegularExpression regularExpressionWithPattern:@"fragment\\s+\\w+\\s+main0\\(main0_in\\s+(\\w+)\\s*\\[\\[stage_in\\]\\]" options:0 error:nil];
+    NSTextCheckingResult *sm = [sig firstMatchInString:fsrc options:0 range:NSMakeRange(0, fsrc.length)];
+    if (!sm) { freeAll(); return 0; }
+    NSString *inName = [fsrc substringWithRange:[sm rangeAtIndex:1]];
+    NSRange open = [fsrc rangeOfString:@"\n{\n" options:0 range:NSMakeRange(NSMaxRange(sm.range), fsrc.length - NSMaxRange(sm.range))];
+    if (open.location == NSNotFound) { freeAll(); return 0; }
+    NSMutableString *fstruct = [NSMutableString stringWithString:@"struct main0_in\n{\n"], *locals = [NSMutableString string];
+    NSMutableDictionary<NSNumber *, NSMutableArray<NSString *> *> *rebuilt = [NSMutableDictionary dictionary];
+    for (NSValue *v in fin) { mpk_member *pm = v.pointerValue; NSArray *e = exports[@(pm->loc)];
+        if ([kept containsObject:@(pm->loc)]) continue;
+        NSMutableArray *lanes = [NSMutableArray arrayWithCapacity:4];
+        for (int lane = 0; lane < 4; lane++) [lanes addObject:e ? (mpk_is_const(e[lane]) ? e[lane] : @"?") : @"0.0"];
+        rebuilt[@(pm->loc)] = lanes; }
+    static const char *swz = "xyzw";
+    for (NSUInteger s = 0; s < slots.count; s++) { NSUInteger i = 0;
+        for (NSValue *v in slots[s]) { mpk_lane *pl = v.pointerValue; rebuilt[@(pl->loc)][pl->lane] = [NSString stringWithFormat:@"%@.dm_p%lu.%c", inName, (unsigned long)s, swz[i++]]; } }
+    NSMutableString *fbody = [NSMutableString stringWithString:fsrc];
+    for (NSValue *v in fin) { mpk_member *pm = v.pointerValue;
+        if ([kept containsObject:@(pm->loc)]) { [fstruct appendFormat:@"    %@ %@ [[user(locn%d)%@]];\n", pm->type, pm->name, pm->loc, pm->quals]; continue; }
+        NSArray *lanes = rebuilt[@(pm->loc)]; if ([lanes containsObject:@"?"]) { freeAll(); return 0; }
+        [locals appendFormat:@"    float4 dm_%@ = float4(%@);\n", pm->name, [lanes componentsJoinedByString:@", "]];
+        NSRegularExpression *use = [NSRegularExpression regularExpressionWithPattern:[NSString stringWithFormat:@"\\b%@\\.%@\\b", inName, pm->name] options:0 error:nil];
+        [use replaceMatchesInString:fbody options:0 range:NSMakeRange(0, fbody.length) withTemplate:[@"dm_" stringByAppendingString:pm->name]]; }
+    for (NSUInteger s = 0; s < slots.count; s++) [fstruct appendFormat:@"    float4 dm_p%lu [[user(locn%@)%@]];\n", (unsigned long)s, slotLoc[s], slotQuals[s]];
+    [fstruct appendString:@"};"];
+    NSRange fblock2 = [fbody rangeOfString:[fsrc substringWithRange:fblock]];
+    if (fblock2.location == NSNotFound) { freeAll(); return 0; }
+    [fbody replaceCharactersInRange:fblock2 withString:fstruct];
+    NSTextCheckingResult *sm2 = [sig firstMatchInString:fbody options:0 range:NSMakeRange(0, fbody.length)];
+    NSRange openB = sm2 ? [fbody rangeOfString:@"\n{\n" options:0 range:NSMakeRange(NSMaxRange(sm2.range), fbody.length - NSMaxRange(sm2.range))] : NSMakeRange(NSNotFound, 0);
+    if (openB.location == NSNotFound) { freeAll(); return 0; }
+    [fbody replaceCharactersInRange:openB withString:[@"\n{\n" stringByAppendingString:locals]];
+    freeAll();
+    *out_msrc = msource; *out_fsrc = fbody; *out_layout = layout;
+    if (out_orig) *out_orig = originalSlots;
+    if (out_new) *out_new = newSlots;
+    return 1;
+}
+
+static os_unfair_lock g_mopt_lock = OS_UNFAIR_LOCK_INIT;
+static NSMutableDictionary *g_mopt_libs, *g_mopt_meta;
+static id<MTLLibrary> mtk_opt_compile(NSString *cacheKey, NSString *src) {
+    if (!cacheKey.length || !src.length) return nil;
+    os_unfair_lock_lock(&g_mopt_lock);
+    if (!g_mopt_libs) g_mopt_libs = [NSMutableDictionary dictionary];
+    id existing = g_mopt_libs[cacheKey];
+    if (!existing) {
+        dispatch_group_t grp = dispatch_group_create(); dispatch_group_enter(grp); g_mopt_libs[cacheKey] = grp;
+        os_unfair_lock_unlock(&g_mopt_lock);
+        NSError *e = nil;
+        id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:dm_msl_opts() error:&e];
+        if (!lib && e) MLOG("【黄】 [mesh-opt] %s compile skipped: %s", cacheKey.UTF8String, e.localizedDescription.UTF8String);
+        os_unfair_lock_lock(&g_mopt_lock);
+        g_mopt_libs[cacheKey] = lib ?: (id)NSNull.null;
+        os_unfair_lock_unlock(&g_mopt_lock);
+        dispatch_group_leave(grp);
+        return lib;
+    }
+    os_unfair_lock_unlock(&g_mopt_lock);
+    if (![existing conformsToProtocol:@protocol(MTLLibrary)] && existing != NSNull.null) {
+        dispatch_group_wait((dispatch_group_t)existing, DISPATCH_TIME_FOREVER);
+        os_unfair_lock_lock(&g_mopt_lock);
+        existing = g_mopt_libs[cacheKey];
+        os_unfair_lock_unlock(&g_mopt_lock);
+    }
+    return existing == NSNull.null ? nil : existing;
+}
+static NSString *mtk_base_src(NvShader *sh, int st) {
+    if (!sh || !sh->key[0] || !getenv("DM_MSL_FALLBACK")) return nil;
+    uint8_t md[8] = {0};
+    for (int i = 0; i < 8; i++) { unsigned b = 0; if (sscanf(sh->key + 2 * i, "%2x", &b) != 1) return nil; md[i] = (uint8_t)b; }
+    char path[1200];
+    if (dm_shader_base_cached(md, st, path, sizeof path)) return nil;
+    return [NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:nil];
+}
+static NSString *mtk_opt_apply(MTLMeshRenderPipelineDescriptor *m, const pso_key *pk, NvShader *ms, NvShader *fs, uint32_t pad, int merged, int has_fsfn) {
+    if (!mtk_opt_on() || !ms || !pk || pad || merged || has_fsfn) return nil;
+    if (m.meshFunction != ms->fn || (fs && m.fragmentFunction != fs->fn)) return nil;
+    if (pk->fc || pk->at || pk->msoff) return nil;
+    if (fs && (pso_fout_need(pk, fs, merged) || pso_pb_eff(pk, fs, merged, 0))) return nil;
+    NSString *msBase = mtk_base_src(ms, 5);
+    if (!msBase.length) return nil;
+    int dev = 0, bstore = 0;
+    NSString *msOpt = mtk_opt_mesh_src(msBase, &dev, &bstore);
+    NSString *msIn = msOpt ?: msBase;
+    NSString *msPacked = nil, *fsPacked = nil, *layout = nil; unsigned origSlots = 0, newSlots = 0;
+    if (fs) {
+        NSString *fsBase = mtk_base_src(fs, 1);
+        if (fsBase.length) mtk_pack_pair_src(msIn, fsBase, &msPacked, &fsPacked, &layout, &origSlots, &newSlots);
+    }
+    if (!msOpt && !msPacked) return nil;
+    if (dev) (void)mtk_scratch_gpu();
+    NSString *meshEntry = [ms->fn.name hasSuffix:@"_z"] ? @"main0_z" : @"main0";
+    if (msPacked && fsPacked) {
+        NSString *pairTag = [NSString stringWithFormat:@"%s|%s|d%db%dp|%@", ms->key, fs->key, dev, bstore, layout];
+        id<MTLLibrary> mlib = mtk_opt_compile([@"pm|" stringByAppendingString:pairTag], msPacked);
+        id<MTLLibrary> flib = mlib ? mtk_opt_compile([@"pf|" stringByAppendingString:pairTag], fsPacked) : nil;
+        id<MTLFunction> mf = mlib ? lib_entry(mlib, meshEntry) : nil;
+        id<MTLFunction> ff = flib ? lib_entry(flib, @"main0") : nil;
+        if (mf && ff) {
+            m.meshFunction = mf; m.fragmentFunction = ff;
+            os_unfair_lock_lock(&g_mopt_lock);
+            if (!g_mopt_meta) g_mopt_meta = [NSMutableDictionary dictionary];
+            NSString *logKey = [NSString stringWithFormat:@"%s/%s", ms->key, fs->key];
+            if (!g_mopt_meta[logKey]) { g_mopt_meta[logKey] = @YES; MLOG("[mesh-opt] mesh %s fs %s: dev=%d bstore=%d slots %u->%u", ms->key, fs->key, dev, bstore, origSlots, newSlots); }
+            os_unfair_lock_unlock(&g_mopt_lock);
+            return pairTag;
+        }
+    }
+    if (!msOpt) return nil;
+    NSString *meshTag = [NSString stringWithFormat:@"%s|d%db%d", ms->key, dev, bstore];
+    id<MTLLibrary> mlib = mtk_opt_compile([@"bm|" stringByAppendingString:meshTag], msOpt);
+    id<MTLFunction> mf = mlib ? lib_entry(mlib, meshEntry) : nil;
+    if (!mf) return nil;
+    m.meshFunction = mf;
+    os_unfair_lock_lock(&g_mopt_lock);
+    if (!g_mopt_meta) g_mopt_meta = [NSMutableDictionary dictionary];
+    NSString *logKey = @(ms->key);
+    if (!g_mopt_meta[logKey]) { g_mopt_meta[logKey] = @YES; MLOG("[mesh-opt] mesh %s: dev=%d bstore=%d", ms->key, dev, bstore); }
+    os_unfair_lock_unlock(&g_mopt_lock);
+    return meshTag;
+}
+static id<MTLRenderPipelineState> mtk_build_with_opt(MTLMeshRenderPipelineDescriptor *m, const pso_key *pk, NvShader *ts, NvShader *ms, NvShader *fs, uint32_t pad, int merged, int has_fsfn, NSError **error) {
+    id<MTLFunction> origMfn = m.meshFunction, origFfn = m.fragmentFunction;
+    NSString *opt_tag = mtk_opt_apply(m, pk, ms, fs, pad, merged, has_fsfn);
+    NSString *akey = par_mkey(pk, ts, ms, fs, pad, merged, has_fsfn ? (id)NSNull.null : nil, opt_tag);
+    id<MTLRenderPipelineState> p = par_mesh(m, akey, error);
+    if (!p && opt_tag) {
+        MLOG("【黄】 [mesh-opt] pipeline with opt refused (%s), falling back: %s", ms->key, error && *error ? (*error).localizedDescription.UTF8String : "-");
+        m.meshFunction = origMfn; m.fragmentFunction = origFfn;
+        if (error) *error = nil;
+        akey = par_mkey(pk, ts, ms, fs, pad, merged, has_fsfn ? (id)NSNull.null : nil, nil);
+        p = par_mesh(m, akey, error);
+    }
+    return p;
+}
+
 // The pipeline descriptor of a task / mesh draw: the fragment function variant and the attachments as a vertex draw's (pso_desc, no vertex stage); pf: the padded mesh variant (#674) or nil.
 //   Shared by the draw (mtk_pso) and the prewarm (mtk_warm), so a pipeline the prewarm built is the one the draw would build
 static MTLMeshRenderPipelineDescriptor *mtk_desc(pso_key *k, NvShader *ts, NvShader *ms, NvShader *fs, id<MTLFunction> pf, int merged, id<MTLFunction> fsfn) {
@@ -659,9 +1086,8 @@ static id mtk_warm(const pso_skey *sk, NSString *mkey, NSString *fkey, NSString 
     mtk_key mk; mtk_warm_key(sk, ts, ms, fs, pad, &mk);
     if (mk.k.fc && fs && !se_warm(fs, mk.k.fc)) return nil;   // a sampler-emulation variant this device has not made yet (as R rows)
     MTLMeshRenderPipelineDescriptor *m = mtk_desc(&mk.k, ts, ms, fs, pf, 0, nil);
-    NSString *akey = par_mkey(&mk.k, ts, ms, fs, pad, 0, nil);
     NSError *e = nil; uint64_t t0 = bp_now();
-    id<MTLRenderPipelineState> p = par_mesh(m, akey, &e);
+    id<MTLRenderPipelineState> p = mtk_build_with_opt(m, &mk.k, ts, ms, fs, pad, 0, NO, &e);
     if (!p) { MLOG("【红】 prewarm: task / mesh pipeline refused (task %s mesh %s fragment %s): %s", ts ? ts->key : "-", ms->key, fs ? fs->key : "-", e.localizedDescription.UTF8String); return nil; }
     NSString *names = [NSString stringWithFormat:@"task %s mesh %s%s fragment %s", ts ? ts->key : "-", ms->key, pf ? " (padded)" : "", fs ? fs->key : "-"];
     os_unfair_lock_lock(&g_pso_mtk_lock); if (!g_mtk_names) g_mtk_names = [NSMapTable strongToStrongObjectsMapTable]; [g_mtk_names setObject:names forKey:p]; os_unfair_lock_unlock(&g_pso_mtk_lock);
@@ -678,14 +1104,14 @@ static void mtk_warm_claim(NSData *key, id ps) {   // submit thread (warm_claim)
 //   could not wait behind every other pipeline queued before it)
 static int mtk_width(void) { static int w; if (!w) { const char *e = getenv("DM_NVN_MESH_PAR"); int n = (int)NSProcessInfo.processInfo.activeProcessorCount; w = e && atoi(e) > 0 ? atoi(e) : n > 4 ? n - 2 : 2; MLOG("task / mesh pipelines: built in the background %d at a time (DM_NVN_MESH_PAR)", w); } return w; }
 static dispatch_semaphore_t g_mtk_sem;
-static void mtk_kick(id m, NSString *akey, NSString *names, const mtk_key *key) {   // m: a mesh pipeline descriptor, or (#770 host stages) an ordinary one
-    mtk_key kk = *key;
+static void mtk_kick(id m, const pso_key *pk, NvShader *ts, NvShader *ms, NvShader *fs, int merged, int has_fsfn, NSString *names, const mtk_key *key) {   // m: a mesh pipeline descriptor, or (#770 host stages) an ordinary one
+    mtk_key kk = *key; pso_key pk_copy = *pk;
     atomic_fetch_add(&g_mtk_inflight, 1);
     if (!g_mtk_q) { g_mtk_q = dispatch_queue_create("dm.nvn.mesh", s2a_qos_queue_attr(DISPATCH_QUEUE_CONCURRENT, S2A_QOS_SHADER_VARIANT)); g_mtk_group = dispatch_group_create(); g_mtk_sem = dispatch_semaphore_create(mtk_width()); }
     dispatch_group_async(g_mtk_group, g_mtk_q, ^{ @autoreleasepool {
         dispatch_semaphore_wait(g_mtk_sem, DISPATCH_TIME_FOREVER);
         NSError *e = nil; uint64_t t0 = bp_now();
-        id<MTLRenderPipelineState> p = [m isKindOfClass:[MTLMeshRenderPipelineDescriptor class]] ? par_mesh((MTLMeshRenderPipelineDescriptor *)m, akey, &e)
+        id<MTLRenderPipelineState> p = [m isKindOfClass:[MTLMeshRenderPipelineDescriptor class]] ? mtk_build_with_opt((MTLMeshRenderPipelineDescriptor *)m, &pk_copy, ts, ms, fs, kk.pad, merged, has_fsfn, &e)
                                                                                                  : [g_dev newRenderPipelineStateWithDescriptor:m error:&e];
         dispatch_semaphore_signal(g_mtk_sem);
         int left = atomic_fetch_sub(&g_mtk_inflight, 1) - 1;
@@ -779,8 +1205,7 @@ static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
         if (mk.emu) { MTLRenderPipelineDescriptor *d = pso_desc(k, nil, fs, g_pso_fsfn, merged); d.vertexFunction = g_mtk.emu_fn; d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle; m = d; }
         else m = mtk_desc(k, ts, ms, fs, pf, merged, g_pso_fsfn);
         NSString *names = [NSString stringWithFormat:@"task %s mesh %s%s fragment %s", ts ? ts->key : "-", ms->key, mk.emu ? " (host stages)" : pf ? " (padded)" : "", fs ? fs->key : "-"];
-        NSString *akey = mk.emu ? nil : par_mkey(k, ts, ms, fs, mk.pad, merged, g_pso_fsfn);
-        mtk_kick(m, akey, names, &mk);
+        mtk_kick(m, k, ts, ms, fs, merged, g_pso_fsfn != nil, names, &mk);
         if (!mk.emu) mtk_record(&mk, ts, ms, fs, merged);   // 请求编译时就记：只在一小段画面里用到、又编得慢的管线（0400486024DEC000 一段事件里那条 2 秒的），等它编好那笔已不再画，「第一次画出」时记就永远进不了种子
     }
     if (!why) return nil;   // building in the background, and this draw may wait for it
@@ -802,6 +1227,8 @@ static void mtk_encode(id en_) {
     enc_r_table(en, g_vt, MTLRenderStageMesh);
     if (ts) { enc_r_table(en, g_ot, MTLRenderStageObject); g_args_object = 1; encode_args(en, ts, 3, 0); g_args_object = 0; enc_o_args(first, MESH_FIRST_SLOT); }
     encode_args(en, ms, 4, 1); enc_r_vbuf(en, MESH_FIRST_SLOT, first);
+    uint64_t scratch = atomic_load_explicit(&g_mtk_scratch_gpu_atomic, memory_order_acquire);
+    if (scratch) enc_r_vbuf(en, MTK_SCRATCH_SLOT, scratch);
     // Payload relay (S2A.Dsh MeshStage.Relay: a payload past Metal's 16 KB): one buffer, head {mesh slice start (words), task workgroups, slices per task workgroup}, then one payload per
     //   task workgroup, then one mesh stage-memory slice per (task workgroup, mesh workgroup < the task's thread count, which the task clamps its grid to). Bound at the relay slot of the
     //   object table and of the mesh stage (vertex stream 11's slot, through enc_r_vbuf)
@@ -844,7 +1271,7 @@ static void mesh_tasks_draw(const p_draw *dw) {
         const ixc_ent *ix = ixc_find(dw, NULL);
         // Not converted yet: the pass ends and inline updates land before the conversion takes its write epoch (ixc_run), else landing them at its compute encoder moved the epoch on and
         //   the conversion was never found again
-        if (!ix) { rp_end(); ubd_land(); ixc_run(dw, NULL); ix = ixc_find(dw, NULL); }
+        if (!ix) { if (g_enc) { g_ixc_splits++; rp_end(); } ubd_land(); ixc_run(dw, NULL); ix = ixc_find(dw, NULL); }
         if (!ix || !ix->args) { g_mtk_skip++; RED_ONCE(148, "indirect task / mesh draw skipped: argument address %#llx is in no memory pool, or the conversion pipeline was not created", (unsigned long long)dw->ind); return; }
         ind = ix->args;
     }

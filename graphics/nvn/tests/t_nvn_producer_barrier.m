@@ -172,6 +172,12 @@ int main(int argc,char **argv) {
             g_game_barrier=1;
             color(target,data);
             CHECK(g_bar_full==full0+1 && g_bar_skip==skip0,"game NVN barrier forces full consumer barrier");
+            CHECK(g_last_end_relaxed,"relaxed draw pass end still tracks same-CB chaining");
+            main_barrier_reset();
+            CHECK(!g_last_end_relaxed,"main_barrier_reset clears relaxed end across CB/submission boundaries");
+            full0=g_bar_full; skip0=g_bar_skip;
+            color(target,data);
+            CHECK(g_bar_full==full0+1 && g_bar_skip==skip0,"first draw after main_barrier_reset keeps full consumer barrier");
             finish();
         }
 

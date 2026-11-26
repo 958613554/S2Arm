@@ -1969,7 +1969,7 @@ static void sub_cut_begin(void);   // the segment draw count starts with the sub
 static void dsnap_stale(void);   // #387 (with fb_prepare)
 static void up_pool_trim(void);   // upload staging pool (with up_flush)
 static void pool_age(void);   // below (with gmem_scan)
-static int g_dsp_game_bar;
+static int g_dsp_game_bar, g_game_barrier;   // g_game_barrier: the game issued nvnCommandBufferBarrier since the last draw pass began
 void nvn_be_sub_begin(void) {
     adhoc_drop();   // 上一次提交里地址兜底登记的池（addr_adhoc）
     dsnap_stale();   // #387: depth may change between submissions (CPU writes, other queues)
@@ -1985,7 +1985,7 @@ void nvn_be_sub_begin(void) {
     g_sub_thread = pthread_self(); atomic_store(&g_sub_thread_set, 1);
     atomic_store(&g_last_commit_error, 0); g_handle_read_failed = 0;
     g_sub_pool = objc_autoreleasePoolPush();
-    main_barrier_reset(); g_cb = rec_cb_new();
+    main_barrier_reset(); g_game_barrier = 0; g_cb = rec_cb_new();
     gstex_sync_all();   // GPU 写的稀疏贴图跟上上次提交以来本池的映射（nvn_stex.inc 胶水）
     // Do not wait for the GPU mid-frame (hot real device: with a fixed rotation of 3, when the GPU cannot keep up every frame blocks here, and the submit thread runs at low frequency after waking, instruction count −18% but CPU time +49%):
     // pick an allocator the GPU has finished with; if all are in use create a new one; only at the cap wait for the oldest one. How far ahead it runs is bounded by the wait where the game acquires the swapchain texture, same as the old interface.
@@ -2028,7 +2028,7 @@ static void ser_gate(void) {
 static int g_pass_swrite;   // the open draw pass has shader writes (swrite_note)
 static void img_wr_upgrade(void); static int g_imwr_npend;   // textures bound to an image slot without the shader-write usage (img_wr_note), upgraded before the next pass or dispatch
 static void img_fit_upgrade(void); static int g_imfit_npend;   // textures an image slot needs a format view of (img_fit), upgraded before the next draw pass opens
-static int g_last_end_relaxed, g_game_barrier;   // the last encoder ended was a draw pass with the relaxed end barrier (nothing else since); the game issued nvnCommandBufferBarrier since the last draw pass began
+static int g_last_end_relaxed;   // the last encoder ended was a draw pass with the relaxed end barrier (nothing else since)
 static uint64_t g_bar_skip, g_bar_full;            // draw entries without / with consumer (relaxed mode or proven full producer coverage)
 static void gp_end(id e);
 // Metal 3 (#278): the old encoders have no queue barriers. Every encoder of g_q3 waits for g_fence3 when it begins (m3_wait) and updates it when it ends (m4_end), so each one runs after
@@ -2073,7 +2073,7 @@ static int producer_cover_on(void) {
     if (on < 0) { const char *e = getenv("DM_NVN_PRODUCER_COVER"); on = e && *e ? !strcmp(e, "1") : !TARGET_OS_IPHONE; }
     return on;
 }
-static void main_barrier_reset(void) { g_bar_main_cb = g_bar_main_encoder = nil; g_bar_main_full = 0; }
+static void main_barrier_reset(void) { g_bar_main_cb = g_bar_main_encoder = nil; g_bar_main_full = 0; g_last_end_relaxed = 0; }
 static int main_barrier_begin(id e, int relaxed) {
     int covered = 0;
     if (producer_cover_on()) {
@@ -7725,6 +7725,7 @@ static void wd_pclr_apply(const tex_t *t) {   // no pass is open (wd_widen_rts):
         p_clear_tex c = g_wd_pclr[i].c; g_wd_pclr[i].ser = 0; clear_tex(&c);
     }
 }
+static void ixc_prefetch(void);
 static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
     if (g_enc) return g_enc;
     // Clears still waiting (lc_push) land before any pass opens: they are older than whatever this pass writes. Only a draw used to collect them (lc_take), so a pass opened
@@ -7736,6 +7737,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
     if (!R.has_rt) { RED_ONCE(3, "no render target set before the draw"); return nil; }
     for (int i = 0; i < R.rt.n; i++) rt_seen_mark(R.rt.color[i]);   // S2Arm first-use skip: which targets are drawn every frame, and which start fresh in this pass (first_skip_ok)
     rt_seen_mark(R.rt.depth);
+    if (!clear_only && !g_enc) ixc_prefetch();
     if (g_imfit_npend) img_fit_upgrade();   // no pass is open here: the upgrade's copy may run (img_fit)
     if (g_imwr_npend) img_wr_upgrade();     // the same for image textures made without shader writes (img_wr_note)
     wd_widen_rts();   // S2Arm widen: this pass's targets the widen core widens get widened storage before they are attached (same reason: the copy may run here)
@@ -8440,14 +8442,19 @@ static NSString *par_rkey(const pso_key *k, NvShader *vs, NvShader *fs, int merg
     if (fsfn || merged) return nil;
     pso_skey sk; pso_skey_from(k, vs, fs, 0, NULL, &sk); return par_hash(&sk, sizeof sk);
 }
-static NSString *par_mkey(const pso_key *k, NvShader *ts, NvShader *ms, NvShader *fs, uint32_t pad, int merged, id fsfn) {
+static NSString *par_mkey(const pso_key *k, NvShader *ts, NvShader *ms, NvShader *fs, uint32_t pad, int merged, id fsfn, NSString *opt_tag) {
     if (fsfn || merged || !ms) return nil;
-    struct { pso_skey sk; char tkey[24]; uint32_t pad; uint16_t mthr, tthr, tpay; uint8_t trelay; } b;
+    struct { pso_skey sk; char tkey[24]; uint32_t pad; uint16_t mthr, tthr, tpay; uint8_t trelay; uint64_t opt_hash; } b;
     memset(&b, 0, sizeof b);
     pso_skey_from(k, ms, fs, 0, NULL, &b.sk);
     if (ts && ts->key[0]) memcpy(b.tkey, ts->key, strnlen(ts->key, sizeof b.tkey));
     b.pad = pad; b.mthr = ms->mesh_threads;
     if (ts) { b.tthr = ts->mesh_threads; b.tpay = ts->mesh_payload; b.trelay = ts->mesh_relay; }
+    if (opt_tag.length) {
+        uint64_t h = 14695981039346656037ull;
+        for (const unsigned char *p = (const unsigned char *)opt_tag.UTF8String; *p; p++) h = (h ^ *p) * 1099511628211ull;
+        b.opt_hash = h ? h : 1;
+    }
     return [@"m" stringByAppendingString:par_hash(&b, sizeof b)];
 }
 static NSString *par_ckey(NvShader *cs, int fc) {   // fc: the pipeline is of the sampler-emulation variant with these SE_* bits (dispatch, se_want): another archive entry from main0's
@@ -10650,7 +10657,7 @@ static void prog_resolve(void) {
 }
 static void state_reset(void) {
     memset(&S, 0, sizeof S);
-    g_dsp_game_bar = 0;
+    g_dsp_game_bar = 0; g_game_barrier = 0; main_barrier_reset();
     g_pso_dirty = g_dss_dirty = 1;
     for (int i = 0; i < 8; i++) S.blend[i] = (blend_st){i, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_EQUATION_ADD, NVN_BLEND_EQUATION_ADD};
     S.color = (color_st){0, NVN_LOGIC_OP_COPY, NVN_ALPHA_FUNC_ALWAYS}; S.chmask.mask = 0xffffffffu;
@@ -16971,11 +16978,30 @@ static void ixc_run(const p_draw *dw, const p_draw_idx *di) {
     if (g_exec_next && g_ret_n <= 8) {   // Later draws in replay order (current list → callers → the rest of this submission), up to the next buffer write
         fz_cursor cur = fz_cursor_from_exec();
         const uint8_t *q; op_hdr h; const void *a;
+        uint64_t ulo[64], uhi[64]; int nu = 0; int ubd = ubd_on();
         for (int guard = 0; guard < 200000 && g_ixc_n < IXC_MAX && fz_next(&cur, &q, &h, &a); guard++) {
-            if (h.op == OP_DISPATCH || h.op == OP_COPY_B2B || h.op == OP_UPDATE_UB || h.op == OP_CLEAR_BUF || h.op == OP_COPY_T2B) break;
+            if (h.op == OP_DISPATCH || h.op == OP_COPY_B2B || h.op == OP_CLEAR_BUF || h.op == OP_COPY_T2B) break;
+            if (h.op == OP_UPDATE_UB) {
+                if (!ubd || nu >= 64) break;
+                uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
+                int hit = 0;
+                for (int k = n0; k < g_ixc_n && !hit; k++) {
+                    uint64_t isz = g_ixc[k].prim == DM_PRIM_MESH_TASKS ? 8 : g_ixc[k].itype < 0 ? 16 : 20;
+                    if (d < g_ixc[k].ind + isz && g_ixc[k].ind < d + n) hit = 1;
+                }
+                if (hit) break;
+                ulo[nu] = d; uhi[nu] = d + n; nu++;
+                continue;
+            }
             p_draw dt; p_draw_idx it; const p_draw *d = h.op == OP_DRAW ? draw_rec(a, h.size, &dt) : NULL; const p_draw_idx *x = h.op == OP_DRAW_IDX ? draw_idx_rec(a, h.size, &it) : NULL;
-            if (d && ixc_wanted(d, NULL)) ixc_take(d, NULL);
-            else if (x && ixc_wanted(NULL, x)) ixc_take(NULL, x);
+            if ((d && ixc_wanted(d, NULL)) || (x && ixc_wanted(NULL, x))) {
+                uint64_t ind = d ? d->ind : x->ind;
+                uint64_t isz = d ? (d->prim == DM_PRIM_MESH_TASKS ? 8 : 16) : 20;
+                int hit = 0;
+                for (int k = 0; k < nu && !hit; k++) if (ulo[k] < ind + isz && ind < uhi[k]) hit = 1;
+                if (hit) break;
+                ixc_take(d, x);
+            }
         }
     }
     if (g_enc) { g_ixc_splits++; PD("M %llu indirect draw conversion: render pass split here", g_stat_pass); rp_end(); }
@@ -17018,6 +17044,37 @@ static void ixc_run(const p_draw *dw, const p_draw_idx *di) {
         const uint32_t *src = (const uint32_t *)(uintptr_t)e->ind, *arg = (const uint32_t *)((const uint8_t *)ab.contents + ao + 32 * (size_t)i);
         int prim = e->prim, it = e->itype; unsigned long long fr = (unsigned long long)atomic_load(&g_cur_frame), pass = g_stat_pass, splits = g_ixc_splits; id<MTLBuffer> keep = ab;
         [g_commit_blocks addObject:^{ (void)keep; MLOG("indirect draw conversion frame %llu pass %llu: primitive %d index type %d record %u,%u,%u,%u → arguments %u,%u,%u,%d,%u (splits so far %llu)", fr, pass, prim, it, src[0], src[1], src[2], src[3], arg[0], arg[1], arg[2], (int)arg[3], arg[4], splits); }]; }
+}
+// Before a render pass opens (rp_begin_ex_), look ahead within the same target set for the first uncovered indirect draw needing ixc_run so it batch-converts up front and
+//   avoids splitting the render pass mid-way. Same OP_UPDATE_UB overlap guard as ixc_run.
+static void ixc_prefetch(void) {
+    if (!g_exec_next || g_ret_n > 8 || g_hoist_n || g_defer_nact || g_fz.active) return;
+    fz_cursor cur = fz_cursor_from_exec();
+    const uint8_t *q; op_hdr h; const void *a;
+    uint64_t ulo[64], uhi[64]; int nu = 0; int ubd = ubd_on();
+    for (int guard = 0; guard < 4096 && fz_next(&cur, &q, &h, &a); guard++) {
+        if (h.op == OP_DISPATCH || h.op == OP_COPY_B2B || h.op == OP_CLEAR_BUF || h.op == OP_COPY_T2B || h.op == OP_BARRIER || h.op == OP_WAIT_SYNC || h.op == OP_FENCE_SYNC) break;
+        if (h.op == OP_SET_RT) {
+            p_set_rt rb; const p_set_rt *r = set_rt_rec(a, h.size, &rb);
+            if (!r || !rt_same(&R.rt, r)) break;
+            continue;
+        }
+        if (h.op == OP_UPDATE_UB) {
+            if (!ubd || nu >= 64) break;
+            uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
+            ulo[nu] = d; uhi[nu] = d + n; nu++;
+            continue;
+        }
+        p_draw dt; p_draw_idx it; const p_draw *d = h.op == OP_DRAW ? draw_rec(a, h.size, &dt) : NULL; const p_draw_idx *x = h.op == OP_DRAW_IDX ? draw_idx_rec(a, h.size, &it) : NULL;
+        if ((d && ixc_wanted(d, NULL) && !ixc_find(d, NULL)) || (x && ixc_wanted(NULL, x) && !ixc_find(NULL, x))) {
+            uint64_t ind = d ? d->ind : x->ind;
+            uint64_t isz = d ? (d->prim == DM_PRIM_MESH_TASKS ? 8 : 16) : 20;
+            for (int k = 0; k < nu; k++) if (ulo[k] < ind + isz && ind < uhi[k]) return;
+            ubd_land();
+            ixc_run(d, x);
+            return;
+        }
+    }
 }
 // ---------- 8-bit indices written by the GPU earlier in the submission ----------
 // Metal has no 8-bit index type, so draw widens 8-bit indices to 16-bit on the CPU at replay. When a buffer write encoded earlier in this submission (copy / update / fill,
