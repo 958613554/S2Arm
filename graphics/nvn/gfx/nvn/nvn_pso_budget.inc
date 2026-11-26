@@ -161,10 +161,12 @@ static void pb_tick(void) {
 //   进程物理占用、Metal 已分配量。驱动报的「AGX: exceeded compiled variants footprint limit」字面是占用量，没有公开接口直接读，
 //   这两个是能拿到的最接近的量：撞线那行之前最后一行的读数，看跨款是条数稳定还是占用稳定，定额度按哪个口径
 static void pb_footprint_line(uint64_t built, uint64_t hit, uint64_t compiled) {
-    uint64_t live = (uint64_t)atomic_load(&g_pb_live_pub) + atomic_load(&g_pb_unclaimed) + pb_bases_since_pub();
-    MLOG("pipeline footprint: %llu built (%llu from the archive, %llu compiled), %llu resident, budget %u, process footprint %llu MB, Metal allocated %llu MB",
-         (unsigned long long)built, (unsigned long long)hit, (unsigned long long)compiled, (unsigned long long)live, pb_budget(), (unsigned long long)bg_fp_mb(),
-         (unsigned long long)(g_dev.currentAllocatedSize >> 20));
+    // 分项打：表里（提交线程每帧发布）、预热已建未领（预热计数现算；g_pb_unclaimed 只在预热线程判线时才更新，首帧后会过时）、发布后新放的拉取基础管线
+    uint64_t tab = atomic_load(&g_pb_live_pub), warm = atomic_load(&g_warm_rps) + atomic_load(&g_warm_cps), claimed = g_warm_claim_rps + g_warm_claim_cps;
+    uint64_t unclaimed = warm > claimed ? warm - claimed : 0, bases = pb_bases_since_pub();
+    MLOG("pipeline footprint: %llu built (%llu from the archive, %llu compiled), %llu resident (tables %llu + prewarm unclaimed %llu + new pull bases %llu), budget %u, process footprint %llu MB, Metal allocated %llu MB",
+         (unsigned long long)built, (unsigned long long)hit, (unsigned long long)compiled, (unsigned long long)(tab + unclaimed + bases), (unsigned long long)tab, (unsigned long long)unclaimed,
+         (unsigned long long)bases, pb_budget(), (unsigned long long)bg_fp_mb(), (unsigned long long)(g_dev.currentAllocatedSize >> 20));
 }
 // 预热线程：再建一条会不会超过预热线（常驻 + 预热已建还没被领走的）
 static int pb_at_warm_line(uint64_t built_unclaimed, uint32_t *budget, uint64_t *est) {
