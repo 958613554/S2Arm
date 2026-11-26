@@ -1474,6 +1474,39 @@ static struct s2a_libpack *libpack_for_locked(const char *root) {
     }
     return lp;
 }
+// 库件结果备忘（g_lp_mu 下读写）：图形程序（vs / vs+fs）的合成结果只取决于整组阶段键、阶段位和本局常量
+//   （direct_abi、profile_hash、翻译器闭包；s2a_libpack_program_v1 的其余输入只在几何程序里用到）。身份另含状态档案与源，
+//   同一套着色器换状态就是新身份：11-26 一款大型开放世界游戏室外一局库命中 28580 次，不同整组键只有 475 个（「库键不同」读数），
+//   每次都重读库件、整份核 JSON、把 SPIR-V 转 base64 再合成，是回放线程第一大项。改为按键备忘合成好的字节，命中拷一份
+//   （调用方照旧 free）。本局常量逐字比对，不一致按没备忘走原路并替换；库句柄换了整表清空。总量封顶 LP_MEMO_CAP，
+//   满了不再新记（照走原路，结果不变）。只记命中：没有 / 坏照旧每次如实取。几何程序（0x7）按输入图元挑变体，不进备忘。
+enum { LP_MEMO_KLEN = 52, LP_MEMO_CAP = 64u << 20 };
+struct lp_memo { uint8_t *json; size_t n; uint32_t abi; char *profile_hash, *closure; };
+static nvn_hmap g_lp_memo; static int g_lp_memo_init; static const struct s2a_libpack *g_lp_memo_lp; static size_t g_lp_memo_bytes;
+static _Atomic uint64_t g_n_lp_memo_hit, g_n_lp_memo_full;
+static void lp_memo_free(void *v) { struct lp_memo *m = v; free(m->json); free(m->profile_hash); free(m->closure); free(m); }
+static int lp_streq(const char *a, const char *b) { return !strcmp(a ? a : "", b ? b : ""); }
+static void lp_memo_key(uint8_t k[LP_MEMO_KLEN], const uint8_t keys[6][8], uint32_t stages) { memcpy(k, keys, 48); memcpy(k + 48, &stages, 4); }
+static struct lp_memo *lp_memo_get_locked(const struct s2a_libpack *lp, const uint8_t k[LP_MEMO_KLEN], const struct s2a_direct_compile_context *pc) {
+    if (!g_lp_memo_init) { nvn_hm_init(&g_lp_memo, LP_MEMO_KLEN); g_lp_memo_init = 1; }
+    if (g_lp_memo_lp != lp) { nvn_hm_clear(&g_lp_memo, lp_memo_free); g_lp_memo_bytes = 0; g_lp_memo_lp = lp; }
+    struct lp_memo *m = nvn_hm_get(&g_lp_memo, k);
+    if (m && (m->abi != (uint32_t)pc->direct_abi || !lp_streq(m->profile_hash, pc->profile_hash) || !lp_streq(m->closure, pc->translator_closure))) return NULL;
+    return m;
+}
+static void lp_memo_put_locked(const uint8_t k[LP_MEMO_KLEN], const struct s2a_direct_compile_context *pc, const uint8_t *json, size_t n) {
+    struct lp_memo *old = nvn_hm_get(&g_lp_memo, k);
+    if (g_lp_memo_bytes + n - (old ? old->n : 0) > LP_MEMO_CAP) { atomic_fetch_add_explicit(&g_n_lp_memo_full, 1, memory_order_relaxed); return; }
+    struct lp_memo *m = calloc(1, sizeof *m);
+    if (!m) return;
+    m->json = malloc(n ? n : 1); m->n = n; m->abi = (uint32_t)pc->direct_abi;
+    m->profile_hash = pc->profile_hash ? strdup(pc->profile_hash) : NULL; m->closure = pc->translator_closure ? strdup(pc->translator_closure) : NULL;
+    if (!m->json || (pc->profile_hash && !m->profile_hash) || (pc->translator_closure && !m->closure)) { lp_memo_free(m); return; }
+    memcpy(m->json, json, n);
+    old = nvn_hm_put(&g_lp_memo, k, m);
+    if (old) { g_lp_memo_bytes -= old->n; lp_memo_free(old); }
+    g_lp_memo_bytes += n;
+}
 // 取一份（图形：stages 是只有 vs 0x1、vs+fs 0x3 或 vs+fs+gs 0x7，keys 按 NVN 位序紧排 vs / fs / gs；计算：ckey 非空）。1 = 取到（*bytes 归调用方 free）
 //   topology：本笔绘制的输入图元名（fill_facts 的 topology()，快照里已算好——工作线程不碰 rp_S）；几何程序按它挑离线库里同图元那份，
 //   没有来源（NULL）几何程序 miss。本局 profile 的 geometryShader 没开时 libpack 照旧 miss（与现编同一字段）
@@ -1531,8 +1564,17 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
         else {
             uint8_t keys[6][8]; memset(keys, 0, sizeof keys);
             for (int st = 0; st < (stages == 0x7u ? 3 : stages == 0x3u ? 2 : 1); st++) memcpy(keys[st], gkeys[st], 8);
-            const struct s2a_libpack_gfx g = { topology, pc->profile_json, pc->profile_bytes };
-            lrc = s2a_libpack_program_v1(lp, keys, stages, &g, (uint32_t)pc->direct_abi, pc->profile_hash, pc->translator_closure, bytes, len, lw, sizeof lw);
+            const int memo_ok = stages != 0x7u;   // 几何程序按输入图元挑变体，不进备忘
+            uint8_t mk[LP_MEMO_KLEN]; lp_memo_key(mk, (const uint8_t (*)[8])keys, stages);
+            const struct lp_memo *m = memo_ok ? lp_memo_get_locked(lp, mk, pc) : NULL;
+            if (m && (*bytes = malloc(m->n ? m->n : 1))) {
+                memcpy(*bytes, m->json, m->n); *len = m->n; lrc = S2A_LIBPACK_HIT;
+                atomic_fetch_add_explicit(&g_n_lp_memo_hit, 1, memory_order_relaxed);
+            } else {
+                const struct s2a_libpack_gfx g = { topology, pc->profile_json, pc->profile_bytes };
+                lrc = s2a_libpack_program_v1(lp, keys, stages, &g, (uint32_t)pc->direct_abi, pc->profile_hash, pc->translator_closure, bytes, len, lw, sizeof lw);
+                if (lrc == S2A_LIBPACK_HIT && memo_ok) lp_memo_put_locked(mk, pc, *bytes, *len);
+            }
             if (lrc == S2A_LIBPACK_HIT) lp_note_keys((const uint8_t (*)[8])keys, stages == 0x7u ? 3 : stages == 0x3u ? 2 : 1, stages);
         }
     }
@@ -1724,7 +1766,10 @@ static void prog_tally_text(char *b, size_t bn) {
         uint32_t nks = 0, nsk = 0;
         pthread_mutex_lock(&g_lp_mu); nks = g_lp_keysets.n; nsk = g_lp_stagekeys.n; pthread_mutex_unlock(&g_lp_mu);
         const size_t u0 = strnlen(b, bn);
-        if (u0 + 1 < bn) snprintf(b + u0, bn - u0, "、库键不同 整组 %u / 单阶段 %u", (unsigned)nks, (unsigned)nsk);
+        size_t mb = 0;
+        pthread_mutex_lock(&g_lp_mu); mb = g_lp_memo_bytes; pthread_mutex_unlock(&g_lp_mu);
+        if (u0 + 1 < bn) snprintf(b + u0, bn - u0, "、库键不同 整组 %u / 单阶段 %u、库件备忘 命中 %llu / 记满未记 %llu（%zu KB）", (unsigned)nks, (unsigned)nsk,
+                                  (unsigned long long)atomic_load(&g_n_lp_memo_hit), (unsigned long long)atomic_load(&g_n_lp_memo_full), mb >> 10);
     }
 }
 // 状态闸读数一行（与「程序累计」同一节拍）：哪几条闸把程序挡在出包预编库之外。

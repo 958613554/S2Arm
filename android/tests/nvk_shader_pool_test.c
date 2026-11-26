@@ -2238,6 +2238,25 @@ static int gs_libpack_test(int diagnose_refusals, int numeric) {
         CHECK(gs_loads[NVN_GPU_SH_VS] == 1 && gs_loads[NVN_GPU_SH_FS] == 0 && gs_loads[NVN_GPU_SH_GS] == 0, "libpack VS-only: only the vertex stage loads");
         CHECK(compiler_calls == 0, "libpack VS-only: hit from the library, compiler not called (calls=%d)", compiler_calls);
         CHECK(gs_blob_bytes[NVN_GPU_SH_VS] == sizeof spv0 && gs_blob_bytes[NVN_GPU_SH_FS] == 0, "libpack VS-only: the vertex stage is the library's");
+        // 库件结果备忘（nvk_shader.c lp_memo_*）：程序表清空后同一组阶段键再取（真机上是换了状态的新身份），
+        //   不再读库件、不再合成——库自己的命中计数不动，结果仍是库里那份，编译器仍不调
+        {
+            extern void nvk_shader_test_tally_line(char *out, size_t n);
+            char tl[640]; nvk_shader_test_tally_line(tl, sizeof tl);
+            const char *mh = strstr(tl, "库件备忘 命中 "); unsigned long long memo0 = mh ? strtoull(mh + strlen("库件备忘 命中 "), NULL, 10) : ~0ull;
+            CHECK(mh != NULL, "libpack memo: tally prints the memo counter: %s", tl);
+            const uint64_t lib_hits = s2a_libpack_hits();
+            rp_shader_reset(); compiler_calls = 0; memset(gs_loads, 0, sizeof gs_loads); memset(gs_blob_bytes, 0, sizeof gs_blob_bytes);
+            const struct rp_prog *p2 = NULL;
+            CHECK(rp_shader_resolve(&q, &p2) == 0 && p2, "libpack memo: program resolves again after the program table is cleared");
+            CHECK(s2a_libpack_hits() == lib_hits, "libpack memo: the same stage keys are served from the memo, library not re-read (hits %llu -> %llu)",
+                  (unsigned long long)lib_hits, (unsigned long long)s2a_libpack_hits());
+            CHECK(compiler_calls == 0 && gs_loads[NVN_GPU_SH_VS] == 1 && gs_blob_bytes[NVN_GPU_SH_VS] == sizeof spv0,
+                  "libpack memo: memo result is the library's vertex stage, compiler not called (calls=%d)", compiler_calls);
+            nvk_shader_test_tally_line(tl, sizeof tl);
+            mh = strstr(tl, "库件备忘 命中 ");
+            CHECK(mh && strtoull(mh + strlen("库件备忘 命中 "), NULL, 10) == memo0 + 1, "libpack memo: tally counts exactly one more memo hit: %s", tl);
+        }
         rp_S.bser[1] = fs_serial; rp_S.bser[2] = gs_serial;
     }
     {
