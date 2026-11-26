@@ -187,7 +187,11 @@ dyn _S2A_SnapSessionReset
 dyn _s2a_autoplay_on
 dyn _s2a_av1_close
 dyn _s2a_av1_decode
+dyn _s2a_av1_flush
 dyn _s2a_av1_open
+dyn _s2a_av1_open_mt
+dyn _s2a_av1_reset
+dyn _s2a_av1_send
 dyn _s2a_gl_xlate
 dyn _s2a_gl_xlate_tag
 dyn _s2a_prov_app_json_self
