@@ -685,6 +685,26 @@ int main(void) {
 
             nvn_be_pool_del(pool17);
         }
+        // ⑱ mtk_opt_mesh_src 含早退 return 时拒绝 dev=1 改写，避免提前 return 漏还 dm_scratch 槽
+        {
+            NSString *retSrc18 =
+                @"#include <metal_stdlib>\nusing namespace metal;\n"
+                 "struct dm_vertex_t { float4 position [[position]]; };\n"
+                 "using M18 = mesh<dm_vertex_t, void, 4, 2, topology::triangle>;\n"
+                 "[[mesh]] void main0(M18 dm_out, uint dm_lid [[thread_index_in_threadgroup]])\n"
+                 "{\n"
+                 "    threadgroup spvUnsafeArray<uint, 2048> _99;\n"
+                 "    for (uint i = dm_lid; i < 2048u; i += 32u) _99[i] = 0u;\n"
+                 "    if (dm_lid > 100u) return;\n"
+                 "    dm_out.set_primitive_count(0u);\n"
+                 "}\n";
+            int dev18 = 0, bstore18 = 0;
+            NSString *opt18 = mtk_opt_mesh_src(retSrc18, &dev18, &bstore18);
+            VERIFY(!dev18 && !opt18, "⑱ 含早期 return 的网格着色器拒绝 dev=1 暂存改写（dev=%d opt=%d）", dev18, opt18 != nil);
+        }
+        s2a_pso_archive_exit();
+        pthread_mutex_lock(&g_par_wmu);
+        pthread_mutex_unlock(&g_par_wmu);
         [NSFileManager.defaultManager removeItemAtPath:@(pdir) error:nil];
     }
     if (failures) { printf("✗ t_nvn_mesh：%u 项里 %u 项不符\n", checks, failures); return 1; }   // 原生门禁按「✓ t_ / ✗ t_」逐组判

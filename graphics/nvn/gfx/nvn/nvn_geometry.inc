@@ -768,6 +768,9 @@ static NSString *mtk_opt_mesh_src(NSString *src, int *out_dev, int *out_bstore) 
                                 if ([tail hasSuffix:@"\n}"]) bodyClose = NSMakeRange(tail.length - 2, 2);
                                 else { ok = NO; break; }
                             }
+                            static NSRegularExpression *rxRet; static dispatch_once_t onceRet;
+                            dispatch_once(&onceRet, ^{ rxRet = [NSRegularExpression regularExpressionWithPattern:@"\\breturn\\b" options:0 error:nil]; });
+                            if ([rxRet firstMatchInString:tail options:0 range:NSMakeRange(bodyStart.location, bodyClose.location - bodyStart.location)]) { ok = NO; break; }
                             [tail replaceCharactersInRange:NSMakeRange(bodyClose.location + 1, bodyClose.length - 1) withString:relCall];
                             NSRange declR = [tail rangeOfString:declOld options:0 range:NSMakeRange(bodyStart.location, bodyClose.location - bodyStart.location)];
                             if (declR.location == NSNotFound) { ok = NO; break; }

@@ -180,6 +180,10 @@ int main(int argc,char **argv) {
             g_game_barrier=NVN_BARRIER_ORDER_PRIMITIVES_BIT;
             color(target,data);
             CHECK(g_bar_full==full0+1 && g_bar_skip==skip0,"primitive NVN barrier forces full consumer barrier");
+            skip0=g_bar_skip; full0=g_bar_full;
+            g_game_barrier=NVN_BARRIER_INVALIDATE_SHADER_BIT;
+            color(target,data);
+            CHECK(g_bar_full==full0+1 && g_bar_skip==skip0,"shader invalidate NVN barrier forces full consumer barrier");
             CHECK(g_last_end_relaxed,"relaxed draw pass end still tracks same-CB chaining");
             main_barrier_reset();
             CHECK(!g_last_end_relaxed,"main_barrier_reset clears relaxed end across CB/submission boundaries");

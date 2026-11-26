@@ -2245,7 +2245,7 @@ static inline void m3_bind_draw(id e) { m3_table_apply(e, 0, g_m3_tab[0]); m3_ta
 static inline void m3_bind_dispatch(id e) { m3_table_apply(e, 2, g_m3_tab[2]); }
 static inline void m3_bind_mesh(id e) { m3_table_apply(e, 1, g_m3_tab[1]); m3_table_apply(e, 3, g_m3_tab[3]); m3_table_apply(e, 4, g_m3_tab[4]); }   // a task / mesh draw: fragment, object, mesh (no vertex stage)
 #define BAR_FRAG_ONLY_BITS ((uint32_t)(NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT | NVN_BARRIER_INVALIDATE_TEXTURE_BIT | \
-    NVN_BARRIER_INVALIDATE_SHADER_BIT | NVN_BARRIER_INVALIDATE_TEXTURE_DESCRIPTOR_BIT | NVN_BARRIER_INVALIDATE_ZCULL_BIT))
+    NVN_BARRIER_INVALIDATE_TEXTURE_DESCRIPTOR_BIT | NVN_BARRIER_INVALIDATE_ZCULL_BIT))
 static int bar_frag_skip_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("DM_NVN_BAR_FRAG_SKIP"); v = !(e && !strcmp(e, "0")); }
@@ -8740,6 +8740,9 @@ static int shlib_dropped(const char *name) {
     });
     return on && strlen(name) >= 16 && ![keep containsObject:[[NSString alloc] initWithBytes:name length:16 encoding:NSASCIIStringEncoding].lowercaseString];
 }
+static inline int shader_fragz_from_json(NSDictionary *j, int fragc) {
+    return j[@"frag_z"] ? [j[@"frag_z"] boolValue] : fragc;   // packages predating FragZ omit frag_z and fall back to frag_coord
+}
 static NvShader *shader_build(NSString *pc, int stage, int layer, int depth_zero) {
     NSError *e = nil; NSString *mnote = nil, *msrc = nil;   // #065090 msl_note
     // S2Arm: a key missing from the library is looked up in DM_MSL_FALLBACK (the on-device fallback translation writes <key>_b.metal + .json there; iOS cannot store a metallib built at runtime)
@@ -8846,7 +8849,7 @@ static NvShader *shader_build(NSString *pc, int stage, int layer, int depth_zero
     }
     o->push = [j[@"s2a_push"] boolValue];   // S2Arm widen (see NvShader.push)
     o->fragc = [j[@"frag_coord"] boolValue];   // S2Arm widen (see NvShader.fragc)
-    o->fragz = [j[@"frag_z"] boolValue];   // see NvShader.fragz
+    o->fragz = shader_fragz_from_json(j, o->fragc);   // see NvShader.fragz
     if ([j[@"cbuf_use"] isKindOfClass:[NSString class]]) o->cbu = j[@"cbuf_use"];   // S2Arm widen (see NvShader.cbu)
     if ([j[@"pos_slice"] isKindOfClass:[NSString class]]) { o->posb = j[@"pos_slice"]; if ([j[@"pos_ubo"] isKindOfClass:[NSArray class]]) o->posu = j[@"pos_ubo"]; }   // S2Arm widen geometry (see NvShader.posb)
     o->exact = j[@"scale_exact"] ? (int8_t)[j[@"scale_exact"] boolValue] : -1;   // S2Arm widen (see NvShader.ts)
@@ -9345,7 +9348,7 @@ static void treg_drop_views(treg_t *r) {   // every view the ID caches (view, al
 // registrations ended in a new Metal texture view, 45% of the replay's time. A hit is checked against the current base texture (re-uploads and format-view upgrades replace it).
 // Only live textures are cached; entries go when the texture is finalized (nvn_be_tex_release) or its pool is (treg_drop_pool_views), and all of them past VC_MAX textures. Under g_rmu
 typedef struct { uint32_t pf, l0, nl, s0, ns; uint8_t tt, sw[4], pad[3]; } vc_key;
-enum { VC_WAYS = 4, VC_MAX = 16384 };
+enum { VC_WAYS = 16, VC_MAX = 16384 };
 typedef struct { const void *pool; unsigned next; vc_key k[VC_WAYS]; void *view[VC_WAYS];   // view: retained
                  void *rows, *rows_of; uint64_t rows_rid, rows_n; int rows_exact; } vc_set;   // rows: a texture buffer as 2D rows (tbuf_as_2d; retained, resident), rows_of / rows_n: the buffer texture it was made from and its element count; rows_exact: the exact layout (f1d 2)
 static nvn_hmap g_vc = {.klen = 8};   // texture serial → vc_set
@@ -9379,7 +9382,9 @@ static vc_set *vc_set_for(uint64_t ser, const void *pool) {   // the texture's e
 }
 static void vc_put(uint64_t ser, const void *pool, const vc_key *k, id<MTLTexture> v) {
     vc_set *s = vc_set_for(ser, pool); if (!s) return;
-    unsigned i = s->next++ % VC_WAYS;
+    unsigned i = VC_WAYS;
+    for (unsigned j = 0; j < VC_WAYS; j++) if (!s->view[j]) { i = j; break; }
+    if (i == VC_WAYS) i = s->next++ % VC_WAYS;
     if (s->view[i]) { defer_obj_unref((__bridge id)s->view[i]); CFRelease(s->view[i]); }
     s->k[i] = *k; s->view[i] = (void *)CFBridgingRetain(v); g_vc_new++;
 }
@@ -17164,7 +17169,7 @@ static void fb_prepare(NvProg *pr) {
 // indexed ones are expanded into a 32-bit list of at most IXC_CAP indices. The compute pass cannot run inside a render pass. When the first such draw is met, ixc_run converts it and every
 // such draw after it up to the next buffer write outside a render pass (copy, update / fill, texture → buffer, dispatch: they bump g_wr_epoch), so each record is read after its last writer
 // and the later draws find their conversion. Only a draw met inside an open render pass with no conversion yet splits that pass.
-#define IXC_MAX 128
+#define IXC_MAX 512
 #define IXC_CAP (3 * 16384)
 typedef struct { uint64_t ind, ibuf; int32_t prim, itype; uint64_t args, ixb; uint32_t ixlen; } ixc_ent;   // args 0: the record could not be converted
 static ixc_ent g_ixc[IXC_MAX]; static int g_ixc_n; static uint64_t g_ixc_epoch, g_ixc_sub, g_ixc_runs, g_ixc_splits;
@@ -17219,11 +17224,11 @@ static void ixc_run(const p_draw *dw, const p_draw_idx *di) {
     if (g_exec_next && g_ret_n <= 8) {   // Later draws in replay order (current list → callers → the rest of this submission), up to the next buffer write
         fz_cursor cur = fz_cursor_from_exec();
         const uint8_t *q; op_hdr h; const void *a;
-        uint64_t ulo[64], uhi[64]; int nu = 0; int ubd = ubd_on();
+        uint64_t ulo[256], uhi[256]; int nu = 0; int ubd = ubd_on();
         for (int guard = 0; guard < 200000 && g_ixc_n < IXC_MAX && fz_next(&cur, &q, &h, &a); guard++) {
             if (h.op == OP_DISPATCH || h.op == OP_COPY_B2B || h.op == OP_CLEAR_BUF || h.op == OP_COPY_T2B) break;
             if (h.op == OP_UPDATE_UB) {
-                if (!ubd || nu >= 64) break;
+                if (!ubd || nu >= 256) break;
                 uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
                 int hit = 0;
                 for (int k = n0; k < g_ixc_n && !hit; k++) {
@@ -17292,8 +17297,8 @@ static void ixc_prefetch(void) {
     if (!g_exec_next || g_ret_n > 8 || g_hoist_n || g_defer_nact || g_fz.active) return;
     fz_cursor cur = fz_cursor_from_exec();
     const uint8_t *q; op_hdr h; const void *a;
-    uint64_t ulo[64], uhi[64]; int nu = 0; int ubd = ubd_on();
-    for (int guard = 0; guard < 4096 && fz_next(&cur, &q, &h, &a); guard++) {
+    uint64_t ulo[256], uhi[256]; int nu = 0; int ubd = ubd_on();
+    for (int guard = 0; guard < 16384 && fz_next(&cur, &q, &h, &a); guard++) {
         if (h.op == OP_DISPATCH || h.op == OP_COPY_B2B || h.op == OP_CLEAR_BUF || h.op == OP_COPY_T2B || h.op == OP_WAIT_SYNC || h.op == OP_FENCE_SYNC) break;
         if (h.op == OP_SET_RT) {
             p_set_rt rb; const p_set_rt *r = set_rt_rec(a, h.size, &rb);
@@ -17301,7 +17306,7 @@ static void ixc_prefetch(void) {
             continue;
         }
         if (h.op == OP_UPDATE_UB) {
-            if (!ubd || nu >= 64) break;
+            if (!ubd || nu >= 256) break;
             uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
             ulo[nu] = d; uhi[nu] = d + n; nu++;
             continue;
@@ -18047,11 +18052,30 @@ static float fragz_bias_units(int fragz, int dt, int dw, int df, int has_depth, 
 }
 // Does this draw's fragment shader have a depth-format texture bound (DEPTH16 .. DEPTH32F_STENCIL8; fmt_depth also counts STENCIL8)? For fragz_bias_units
 static int fs_samples_depth(const NvShader *fs) {
-    for (int i = 0; i < fs->rf.nb; i++) { const nvn_rbind *b = &fs->rf.b[i]; if (b->kind != NVN_RB_TEX || b->reg >= NTEX) continue;
-        int tid = (int)(tex_slot_h(S.tex[1], S.img[1], b->reg) & 0xfffff);
-        os_unfair_lock_lock(&g_rmu); int f = tid < g_ntreg && g_treg[tid].ok ? (int)g_treg[tid].t.d.format : 0; os_unfair_lock_unlock(&g_rmu);
-        if (f >= NVN_FORMAT_DEPTH16 && f <= NVN_FORMAT_DEPTH32F_STENCIL8) return 1; }
-    return 0;
+    int tids[64]; int nt = 0;
+    for (int i = 0; i < fs->rf.nb && nt < 64; i++) {
+        const nvn_rbind *b = &fs->rf.b[i];
+        if (b->kind == NVN_RB_TEX) {
+            if (b->reg < NTEX) tids[nt++] = (int)(tex_slot_h(S.tex[1], S.img[1], b->reg) & 0xfffff);
+        } else if (b->kind == NVN_RB_TEXU) {
+            int n = b->n ? b->n : 1;
+            for (int k = 0; k < n && nt < 64; k++) {
+                uint32_t h = b->n ? ubo_handle(1, b->reg, 8 * k) : ubo_packed(1, b);
+                if (g_handle_read_failed) break;
+                tids[nt++] = ubo_tex_id(h);
+            }
+        }
+    }
+    if (!nt) return 0;
+    int hit = 0;
+    os_unfair_lock_lock(&g_rmu);
+    for (int i = 0; i < nt; i++) {
+        int tid = tids[i];
+        int f = tid >= 0 && tid < g_ntreg && g_treg[tid].ok ? (int)g_treg[tid].t.d.format : 0;
+        if (f >= NVN_FORMAT_DEPTH16 && f <= NVN_FORMAT_DEPTH32F_STENCIL8) { hit = 1; break; }
+    }
+    os_unfair_lock_unlock(&g_rmu);
+    return hit;
 }
 static int draw_pass_state(id en, NvShader *fs) {   // en: the render encoder (typed id: enc_r_dss and friends take the Metal 4 type; naming it here would add an unguarded Metal 4 symbol, tools/avail_count.sh)
     static id<MTLDepthStencilState> cur_ds; static uint64_t cur_ds_pass;
@@ -18994,6 +19018,33 @@ static void img_wr_prescan(NvShader *sh, int nvn_stage) {
         if (need_pfv) img_fit_note(tid); }
     os_unfair_lock_unlock(&g_rmu);
 }
+static void dsnap_stale_dispatch(NvShader *cs) {
+    if (!g_dsnap.valid) return;
+    if (!cs || cs->tensor == 1 || cs->builtin) { dsnap_stale(); return; }
+    if (!cs->has_img) { int any = 0; for (int i = 0; i < cs->rf.nb; i++) { int k = cs->rf.b[i].kind; any |= k == NVN_RB_IMGU || k == NVN_RB_IMGA || (k == NVN_RB_IMG && cs->rf.b[i].reg < 32); } cs->has_img = any ? 2 : 1; }
+    if (cs->has_img != 2) return;
+    int tids[64]; int nt = 0;
+    for (int i = 0; i < cs->rf.nb; i++) {
+        const nvn_rbind *b = &cs->rf.b[i];
+        if (b->kind != NVN_RB_IMGU && b->kind != NVN_RB_IMGA && (b->kind != NVN_RB_IMG || b->reg >= 32)) continue;
+        if (b->kind == NVN_RB_IMGU && b->n) { dsnap_stale(); return; }
+        if (nt >= 64) { dsnap_stale(); return; }
+        int tid = b->kind == NVN_RB_IMGA ? (b->reg < 32 ? (int)(S.img[5][b->reg] & 0xfffff) : -1) : img_tid(b, 5);
+        if (g_handle_read_failed || tid < 0) { dsnap_stale(); return; }
+        tids[nt++] = tid;
+    }
+    if (!nt) return;
+    tex_t ts[64]; int miss = 0;
+    os_unfair_lock_lock(&g_rmu);
+    for (int i = 0; i < nt; i++) {
+        int tid = tids[i];
+        if (tid >= g_ntreg || !g_treg[tid].ok) { miss = 1; break; }
+        ts[i] = g_treg[tid].t;
+    }
+    os_unfair_lock_unlock(&g_rmu);
+    if (miss) { dsnap_stale(); return; }
+    for (int i = 0; i < nt && g_dsnap.valid; i++) dsnap_stale_tex(&ts[i]);
+}
 static void tensor_standin(NvShader *cs);   // nvn_tensor.inc
 static uint64_t g_tensor_native_runs;
 static void dispatch(const p_dispatch *dp) {
@@ -19007,6 +19058,7 @@ static void dispatch(const p_dispatch *dp) {
     if (dp->ind) { static int once; if (!once++) MLOG("indirect dispatch: first time (the GPU reads the threadgroup counts from %#llx)", (unsigned long long)dp->ind); }
     NvShader *cs = prog_get(S.cprog)->sh[5];
     if (cs) qf_note_cs(cs);   // GPU error attribution (qf_put)
+    dsnap_stale_dispatch(cs);
     if (!cs) { RED_ONCE(28, "the dispatched program has no compute shader (or it is not mapped)"); return; }
     rs_pre_images(cs);   // internal resolution: scaled textures in this dispatch's image slots go back to 1 before the atomic upgrade and the tensor stand-in below (nvn_rscale_ops.inc)
     // internal resolution above 1: the stand-in picks its input by storage size (output ÷ input within 1–4) and feeds MetalFX storage sizes: enlarged textures it reads go back to 1 first, as for a real dispatch
@@ -19077,6 +19129,7 @@ static void dispatch(const p_dispatch *dp) {
     if (dp->ind || (dp->x && dp->y && dp->z)) for (int i = 0; i < cs->rf.nfirst; i++) {
         const p_bind_buf *u = &S.ssbo[5][cs->rf.first[i].reg]; uint64_t at = 4ull * cs->rf.first[i].word; void *fb; uint64_t fo;
         if (!u->addr || (u->size && at + 4 > u->size) || !nvn_be_addr(u->addr + at, 4, &fb, &fo)) { RED_ONCE(171, "first-invocation store of shader %s to storage slot %d word %u skipped: the slot is unbound, too small or in no pool", cs->key, cs->rf.first[i].reg, cs->rf.first[i].word); continue; }
+        dsnap_stale_addr(u->addr + at, 4);
         mtl_sub_fill(u->addr + at, 4, cs->rf.first[i].value);
     }
     if (g_nubd && ubd_conflict_cs(cs, dp->ind)) { g_ubd_conflicts++; ubd_land(); }   // see ubd_conflict_cs
@@ -20392,8 +20445,7 @@ void nvn_be_exec(const uint8_t *p) {
             case OP_DLSS: dsnap_stale(); dlss_eval(a, h.size); break;   // NVN2 EvaluateDlss → MetalFX temporal upscale (nvn_dlss.inc)；写出贴图可能与深度同存储，按改过算（同 OP_DISPATCH）
             case OP_PUSH_CONST: case OP_PUSH_CONST_PTR: state_op(h.op, a, h.size); break;
             case OP_CLEAR_TEX: dsnap_stale_tex(((const p_clear_tex *)a)->tex); clear_tex(a); break;   // it may clear the depth texture the copy was taken from (audit P2-247)
-            case OP_DISPATCH: dsnap_stale(); dispatch(a); break;   // 计算着色器可经别名视图写深度的存储（深度格式本身不可写，同存储的颜色格式视图可以），写了哪些图像这里不逐个核：按改过算。
-                                                                  //   原先派发后游戏重设渲染目标时一律作废、兜住了这种写法；精确失效后 OP_SET_RT 只核颜色目标，这里补上
+            case OP_DISPATCH: dispatch(a); break;   // 精确失效：由 dispatch -> dsnap_stale_dispatch 按写图像与首次写入地址判是否重叠 g_dsnap
             case OP_BARRIER: { int32_t bits; memcpy(&bits, a, 4);   // ordered at the next draw pass (barrier_game); inside a pass with shader writes, the pass ends first (swrite_note)
                 int split = g_enc && g_pass_swrite && (bits & (NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT));
                 PD("I %llu barrier bits %#x%s", g_stat_pass, bits, split ? ": ends the pass (shader writes)" : g_enc ? " (render pass open)" : "");
