@@ -75,6 +75,7 @@ int s2a_snap_saving(void); int s2a_snap_restoring(void); int s2a_snap_mode(void)
 // 这一局关掉即时存档（snapsw.c）与原因码：S2A_SNAP_OFF_ADDRESS = 这台设备地址空间放不下标准布局、窗口外也放不下命令记录区（vawin.c）
 #define S2A_SNAP_OFF_ADDRESS 1
 #define S2A_SNAP_OFF_LOGCAP 2   // 服务请求日志超过上限（services SnapLog.LogCapBytes）：这一局放弃即时存档，日志有界（维护者 11-19）
+int s2a_snap_save_gate(void);   // snapsw.c：0 能存、-3 本局请求日志超限已放弃（S2A_SNAP_OFF_LOGCAP）、-1 其他不能存；s2a_snap_request_save 同样回 -3
 void s2a_snap_disable(int why); int s2a_snap_off_reason(void); int s2a_snap_reenable(int why);   // snapsw.c：构造期因 why 关的快照、选定游戏后放得下时重新打开（vawin.c s2a_window_snap_late）
 void s2a_window_snap_late(int no_far);   // vawin.c：布局定了、收尾前调，这一款没有远端段时在收尾还回去的那段里补放快照区
 int s2a_snap_late_fits(uint64_t released, uint64_t a, uint64_t host_min);   // vawin.c：纯函数

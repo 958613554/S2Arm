@@ -626,6 +626,7 @@
 "vpad.snap.saving" = "Guardando este momento…";
 "vpad.snap.saved" = "Momento guardado";
 "vpad.snap.notSaved" = "No se pudo guardar esta vez. Inténtalo de nuevo en un momento";
+"vpad.snap.notSavedLogCap" = "El registro de esta sesión es demasiado largo: por ahora no se puede guardar un momento (el juego sigue; el momento ya guardado sigue disponible)";
 "vpad.snap.busy" = "Aún se está guardando el anterior";
 "vpad.snap.restoreFailed" = "No se pudo volver: %@";
 "vpad.snap.useLibrary.title" = "No se puede volver desde el juego";

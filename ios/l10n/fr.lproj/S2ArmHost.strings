@@ -626,6 +626,7 @@
 "vpad.snap.saving" = "Sauvegarde de cet instant…";
 "vpad.snap.saved" = "Instant sauvegardé";
 "vpad.snap.notSaved" = "Sauvegarde impossible cette fois. Réessayez dans un instant";
+"vpad.snap.notSavedLogCap" = "Le journal de cette session est devenu trop long : impossible de sauvegarder un instant pour l’instant (le jeu continue ; l’instant déjà sauvegardé reste disponible)";
 "vpad.snap.busy" = "La sauvegarde précédente est en cours";
 "vpad.snap.restoreFailed" = "Retour impossible : %@";
 "vpad.snap.useLibrary.title" = "Retour impossible depuis le jeu";

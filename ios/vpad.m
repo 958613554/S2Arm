@@ -827,7 +827,7 @@ static void snap_done(int ok, const char *dir) { (void)dir; dispatch_async(dispa
     if (!s2a_snap_request_save) return;
     g_snap_view = self; if (s2a_snap_on_done) s2a_snap_on_done(snap_done);
     int rc = s2a_snap_request_save(dir.fileSystemRepresentation);
-    [self snapToast:rc == 0 ? S2AL(@"vpad.snap.saving") : rc == -2 ? S2AL(@"vpad.snap.busy") : S2AL(@"vpad.snap.notSaved")];
+    [self snapToast:rc == 0 ? S2AL(@"vpad.snap.saving") : rc == -2 ? S2AL(@"vpad.snap.busy") : rc == -3 ? S2AL(@"vpad.snap.notSavedLogCap") : S2AL(@"vpad.snap.notSaved")];   // -3：这一局请求日志超限已放弃即时存档（snapsw.c s2a_snap_save_gate）
 }
 static void snap_restart_result(int result, const char *detail, void *context) {
     (void)context; if (!result) return;

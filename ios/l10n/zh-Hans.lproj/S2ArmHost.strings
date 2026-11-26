@@ -632,6 +632,7 @@
 "vpad.snap.saving" = "正在存下这一刻…";
 "vpad.snap.saved" = "已存下这一刻";
 "vpad.snap.notSaved" = "这次没存成，稍后再试一次";
+"vpad.snap.notSavedLogCap" = "这一局记录太长，暂时不能即时存档（游戏照常玩，已存下的那一刻还能回）";
 "vpad.snap.busy" = "还在存上一次，稍等";
 "vpad.snap.restoreFailed" = "这次回不去：%@";
 "vpad.snap.useLibrary.title" = "游戏里回不到这一刻";

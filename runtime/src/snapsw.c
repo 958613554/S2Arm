@@ -56,6 +56,9 @@ int s2a_snap_saving(void) { return snap_sw() & 1; }
 int s2a_snap_restoring(void) { const char *r = getenv("S2A_SNAP_RESTORE"); return r && *r; }
 int s2a_snap_mode(void) { return snap_sw() != 0 || s2a_snap_restoring(); }
 int s2a_snap_logging(void) { int v = atomic_load(&g_snap_live); if (v < 0) { v = snap_sw() == 1; atomic_store(&g_snap_live, v); } return v; }
+// 玩家点「存下这一刻」前的判定（snapshot.c s2a_snap_request_save 用）：0 能存；-3 这一局请求日志超过上限、已放弃即时存档（原因码 2 = S2A_SNAP_OFF_LOGCAP），
+//   界面要明确说「这一局记录太长，暂时不能即时存档」，不能报成「稍后再试」让玩家以为再点就能存；-1 其他不能存（没开 / 恢复中）
+int s2a_snap_save_gate(void) { if (g_snap_off == 2) return -3; return s2a_snap_logging() ? 0 : -1; }
 void s2a_snap_live_set(int on) { atomic_store(&g_snap_live, on ? 1 : 0); }
 #if !defined(__APPLE__)
 // 安卓：快照引擎（thread.c / snapshot.c 的苹果段）不编，开关恒关，服务层 C#（SnapLog.cs）不会真调下面三个；
