@@ -55,6 +55,7 @@
 // 弱链接[nvntest,host,ios]：s2a_av1_open_mt（同上；帧并行接口）
 // 弱链接[nvntest,host,ios]：s2a_av1_send（同上）
 // 弱链接[nvntest,host,ios]：s2a_av1_flush（同上）
+// 弱链接[nvntest,host,ios]：s2a_av1_reset（同上）
 void *s2a_vp9_open(int threads) __attribute__((weak));
 int s2a_vp9_decode(void *h, const uint8_t *data, uint32_t len, uint8_t **planes, int32_t *strides, int32_t *info) __attribute__((weak));
 void s2a_vp9_close(void *h) __attribute__((weak));
@@ -79,6 +80,7 @@ typedef int (*s2a_av1_out_fn)(void *ctx, uint8_t **planes, int32_t *strides, int
 void *s2a_av1_open_mt(int threads, int frame_delay) __attribute__((weak));
 int s2a_av1_send(void *h, const uint8_t *data, uint32_t len, int64_t ts, s2a_av1_out_fn out, void *ctx) __attribute__((weak));
 int s2a_av1_flush(void *h, s2a_av1_out_fn out, void *ctx) __attribute__((weak));
+void s2a_av1_reset(void *h) __attribute__((weak));   // 换代（游戏 Flush）时丢掉 dav1d 里还在解的帧
 
 // SDK 的「环空 / 还没有帧」结果
 #define CV_NOT_READY 0x1c286fu
@@ -676,7 +678,7 @@ typedef struct cvdec {
     struct cv_ahead { uint8_t *p; size_t cap, size; uint16_t fw, fh; int64_t pts; int eos, gen, has; } ah[32]; int ah_h, ah_n, ah_cap, ah_epoch; size_t ah_frame; pthread_t eth;
     uint64_t ah_peak, ah_low;   // 队列最深 / 出帧线程取到时队列已空（解码跟不上）的次数
     uint64_t props_wait_n, props_wait_ns;   // 游戏取帧属性时那一格还没帧、等了的次数 / 合计
-    int av1_mt;   // dav1d 走帧并行接口（s2a_av1_send / s2a_av1_flush）
+    int av1_mt, av1_gen;   // dav1d 走帧并行接口（s2a_av1_send / s2a_av1_flush）；av1_gen：dav1d 里的帧属于哪一代
     // 追帧：游戏开头那几秒画得慢（还在加载，24–44 帧/秒），每次重绘只取一格、不按时间戳跳帧，影片就一路落后（声音照真实时间放、跑到前面；实测落后 4 s 后一直保持）。
     //   出帧线程按「锚点 + 片源时间差」算每帧该交的时刻，队列里下一帧也已经到时就把过时的这一帧丢掉。锚点 = 游戏 Start 那一刻（游戏的声音时间轴从这里起；
     //   不从首帧交出算：解码起步 + 游戏前几帧慢，首帧本身就晚），S2A_VIDEO_OFFSET_MS 再加减（正 = 画面提前）。单次等待超过 1 s（游戏暂停、不来取）把锚点往后挪，不算落后
@@ -1134,7 +1136,9 @@ static void cv_decode(cvdec *d, const cv_in *in, int gen) {
             if (!cv_vt_emit(d, pts, gen)) return;
         }
         if (d->av1 && d->av1_mt) {
-            // 帧并行：出来的帧可能是前几包的，时间戳跟着帧走；流结束时把还在解的帧取完再出带结束标记的那一帧
+            // 帧并行：出来的帧可能是前几包的，时间戳跟着帧走；流结束时把还在解的帧取完再出带结束标记的那一帧。
+            //   换代（游戏 Flush / 跳转）后先清掉 dav1d 里上一代还在解的帧，不然头几次送包会把旧片段的帧当这一代交出去
+            if (d->av1_gen != gen) { if (s2a_av1_reset) s2a_av1_reset(d->av1); d->av1_gen = gen; }
             av1_out_ctx c = { d, gen }; uint64_t t0 = now_ns();
             int r = s2a_av1_send(d->av1, in->p, (uint32_t)in->n, pts, av1_out, &c);
             dec_time(d, t0);

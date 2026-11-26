@@ -105,6 +105,7 @@ typedef int (*s2a_av1_out_fn)(void *ctx, uint8_t **planes, int32_t *strides, int
 void *s2a_av1_open_mt(int threads, int frame_delay) __attribute__((weak));
 int s2a_av1_send(void *h, const uint8_t *data, uint32_t len, int64_t ts, s2a_av1_out_fn out, void *ctx) __attribute__((weak));
 int s2a_av1_flush(void *h, s2a_av1_out_fn out, void *ctx) __attribute__((weak));
+void s2a_av1_reset(void *h) __attribute__((weak));
 // 帧并行接口的出帧记录：每帧的 MD5 和时间戳（按出帧次序）
 static void md5_420(uint8_t **pl, const int32_t *st, int w, int h, int bps, char out[33]);
 typedef struct { int n; char md[8][33]; int64_t ts[8]; } av1_mt_rec;
@@ -817,6 +818,21 @@ int main(int argc, char **argv) {
             same = 0; for (int i = 0; i < 6 && i < rec.n; i++) same += !strcmp(rec.md[i], want8[i]) && rec.ts[i] == 1000 * (i + 1);
             printf("dav1d 帧并行（%s）：送完 6 包时出了 %d 帧、flush 后共 %d 帧，MD5 与时间戳都对上 %d 帧\n", k ? "延迟 4、8 线程" : "延迟自动、6 线程", before, rec.n, same);
             CHECK(ok && rec.n == 6 && same == 6);
+        }
+        // 换代（游戏 Flush / 跳转）：帧并行（延迟 4、8 线程）先送 3 包，再清（s2a_av1_reset），再从头送 6 包（时间戳换成 100000 起）。
+        //   期望：清之后只出新送的 6 帧，MD5 同 want8、时间戳都是新的，没有一帧带着清之前的时间戳（不清时 dav1d 里压着的旧帧会先出来）
+        if (s2a_av1_open_mt && s2a_av1_reset) {
+            void *m = s2a_av1_open_mt(8, 4); CHECK(m);
+            av1_mt_rec old = { 0 }, rec = { 0 }; int ok = 1;
+            for (int i = 0; i < 3; i++) ok &= s2a_av1_send(m, ts_av1[i], (uint32_t)ts_av1_n[i], 1000 * (i + 1), av1_mt_take, &old) == 0;
+            s2a_av1_reset(m);
+            for (int i = 0; i < 6; i++) ok &= s2a_av1_send(m, ts_av1[i], (uint32_t)ts_av1_n[i], 100000 * (i + 1), av1_mt_take, &rec) == 0;
+            ok &= s2a_av1_flush(m, av1_mt_take, &rec) == 0;
+            s2a_av1_close(m);
+            int stale = 0; same = 0;
+            for (int i = 0; i < 6 && i < rec.n; i++) { stale += rec.ts[i] < 100000; same += !strcmp(rec.md[i], want8[i]) && rec.ts[i] == 100000 * (i + 1); }
+            printf("dav1d 帧并行换代：清之前交出 %d 帧，清之后出 %d 帧、带旧时间戳 %d 帧、MD5 与新时间戳对上 %d 帧\n", old.n, rec.n, stale, same);
+            CHECK(ok && rec.n == 6 && stale == 0 && same == 6);
         }
         // 「显示已有帧」小包：帧并行与一帧接一帧逐帧 MD5 相同、一帧不少（旧送包逻辑帧并行时这条流少 2 帧）
         if (s2a_av1_open_mt) {

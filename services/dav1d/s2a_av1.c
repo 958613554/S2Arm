@@ -236,6 +236,20 @@ int s2a_av1_send(void *hv, const uint8_t *data, uint32_t len, int64_t ts, s2a_av
     return g == DAV1D_ERR(EAGAIN) ? 0 : -1;
 }
 
+// 跳转 / 换代（游戏 Flush）：丢掉还在解、还没取走的帧与已送进的数据（dav1d_flush），下一包从关键帧接着解。
+//   帧并行时 dav1d 里压着前几包的帧，不清的话换代后头几次送包会把旧片段的帧交出去
+void s2a_av1_reset(void *hv)
+{
+    s2a_av1 *h = hv;
+
+    if (h->has_pic)
+    {
+        dav1d_picture_unref(&h->pic);
+        h->has_pic = 0;
+    }
+    dav1d_flush(h->c);
+}
+
 // 流结束：把还在解的帧全部取出交给 out。返回同 s2a_av1_send
 int s2a_av1_flush(void *hv, s2a_av1_out_fn out, void *ctx)
 {
