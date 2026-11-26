@@ -15,6 +15,11 @@ cc="${CC:-cc}"
   -I "$repo/graphics/nvn/replay" -I "$repo/graphics/nvn/gfx/nvn" -I "$repo/graphics/nvn/gfx/nvn/include" -I "$repo/graphics/nvn/gfx/tex" \
   -o "$tmp/t_prog" "$android/tests/nvn_vk_prog_warm_test.c" "$android/native/nvn/nvn_vk_prog_warm.c" "$android/native/direct/sha256.c"
 "$tmp/t_prog"
+# 程序清单的身份索引（find_locked / ix_*，11-26）：与参照模型逐步对拍 2 万次 note、600 万次 contains
+"$cc" -std=gnu11 -O1 -Wall -Wextra -Werror -pthread -D_GNU_SOURCE \
+  -I "$android/native" -I "$android/native/nvn" -I "$android/native/direct" -I "$repo/graphics/nvn/replay" \
+  -o "$tmp/t_prog_ix" "$android/tests/nvn_prog_warm_index_test.c" "$android/native/nvn/nvn_vk_prog_warm.c" "$android/native/direct/sha256.c"
+"$tmp/t_prog_ix"
 # 负对照（程序清单按闭包分文件、先比闭包，offline-shader-miss 修法）：各撤一处，t_prog 必须红在对应断言（编译失败不算红）
 python3 - "$android/native/nvn/nvn_vk_prog_warm.c" "$tmp" <<'PY'
 import pathlib, subprocess, sys
