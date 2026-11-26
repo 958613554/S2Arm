@@ -14130,7 +14130,7 @@ static inline uint64_t cb_want(NvShader *sh, int reg) {
 enum { CBP_CACHE = 32 };
 typedef struct {
     uint64_t key, copy, want, gen, gpu;
-    int npend; uint32_t pend_gen, sbw_gen; uint8_t is_wd;
+    int npend; uint32_t pend_gen, sbw_gen; uint8_t is_wd, gpu_src;
     __unsafe_unretained id<MTLBuffer> buf; size_t off;
 } cb_pad_ent;
 static cb_pad_ent g_cb_pad[CBP_CACHE];
@@ -14144,7 +14144,7 @@ static int cbuf_pad_alloc(uint64_t key, uint8_t is_wd, const void *src_cpu, id<M
         cb_pad_ent *e = &g_cb_pad[i];
         if (e->gen == g_arena_gen && e->key == key && e->is_wd == is_wd && e->copy == copy && e->want >= want &&
             e->pend_gen == g_pend_gen && e->sbw_gen == g_sbw_gen && e->npend == g_npend &&
-            (is_wd || !gw_live(key, key + copy))) {
+            (is_wd || e->gpu_src || (!gpu_src && !gw_live(key, key + copy)))) {
             *mb = (__bridge void *)e->buf; *mo = e->off; *gpu = e->gpu; *pav = e->want;
             return 1;
         }
@@ -14167,7 +14167,7 @@ static int cbuf_pad_alloc(uint64_t key, uint8_t is_wd, const void *src_cpu, id<M
     uint64_t agpu = ab.gpuAddress + ao;
     g_cb_pad[g_cb_pad_i++ % CBP_CACHE] = (cb_pad_ent){
         .key = key, .copy = copy, .want = want, .gen = g_arena_gen, .gpu = agpu,
-        .npend = g_npend, .pend_gen = g_pend_gen, .sbw_gen = g_sbw_gen, .is_wd = is_wd,
+        .npend = g_npend, .pend_gen = g_pend_gen, .sbw_gen = g_sbw_gen, .is_wd = is_wd, .gpu_src = (uint8_t)(gpu_src != 0),
         .buf = ab, .off = ao,
     };
     *mb = (__bridge void *)ab; *mo = ao; *gpu = agpu; *pav = want;
@@ -18657,7 +18657,8 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (cur_pull && !g_mtk.on) { pull_bind(en, pr->sh[0]); g_hy_draws++; }   // 拉取管线自己按布局块读顶点流：不做 CPU 转换（它按格式解码）
     else if (pr->sh[0]) vconv_bind(en, pr->sh[0], 0, dw, di);   // integer inputs fed float-type formats or 8 / 16-bit integers of the other sign (see vconv_ncomp, vconv_int)
     g_kd_force = kd_draw(pr, dw, di);
-    if (pr->sh[0]) encode_args(en, pr->sh[0], 0, 1);
+    if (g_mtk.on && !g_mtk.emu) mtk_bind(en);
+    else if (pr->sh[0]) encode_args(en, pr->sh[0], 0, 1);
     if (g_enc == en && pr->sh[1]) encode_args(en, pr->sh[1], 1, 0);
     if (g_enc == en && fc) se_bind(en, pr->sh[1], 1);   // the variant reads its table at RED_SLOT, filled for this draw (the argument block above is reused across draws, the table is not)
     // Binding ended the pass: a texture view that needs a format-view usage upgrades its texture (tex_upgrade), whose copy goes through blit() and rp_end. en is then an ended encoder and the

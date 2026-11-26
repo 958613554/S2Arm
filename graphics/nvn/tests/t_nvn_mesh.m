@@ -596,6 +596,95 @@ int main(void) {
             if (shdr) for (uint32_t s = 0; s < g_mtk_scratch_slots; s++) if (shdr[MTK_SCRATCH_FLAGS + s]) busySlots16++;
             VERIFY(shdr && forced16 == 0 && busySlots16 == 0, "⑯ 设备暂存槽全数正常归还且无强制占用（forced=%u busy=%u）", forced16, busySlots16);
         }
+        // ⑰ 间接任务/网格绘制开着渲染遍，且绑定阶段因短 UBO GPU 写触发 cbuf_pad_alloc(gpu_src=1) -> blit() -> rp_end()：
+        //   必须在 g_enc != en 重试检查前绑定任务/网格参数（否则往已被关掉的渲染编码器发 RO_R_MESH_IND 崩在 dm-encode），
+        //   且 g_cb_pad 对已由 GPU 拷入暂存的条目跳过 !gw_live 拒缓存（否则重试遍再次 blit()->rp_end() 命中 RED_ONCE(136)）
+        if (!mtk_emu_on()) {
+            NSString *mSrc17 =
+                @"#include <metal_stdlib>\n"
+                 "using namespace metal;\n"
+                 "struct Ubo17 { float4 v[16]; };\n"
+                 "struct Args17 { constant Ubo17 *c0 [[id(0)]]; };\n"
+                 "struct V17 { float4 p [[position]]; };\n"
+                 "using M17 = mesh<V17, void, 4, 2, topology::triangle>;\n"
+                 "[[mesh]] void main0(M17 dm_out, uint dm_lid [[thread_index_in_threadgroup]], uint dm_gid [[threadgroup_position_in_grid]], constant uint *dm_first [[buffer(29)]], constant Args17 &args [[buffer(0)]]) {\n"
+                 "    float ok0 = (*args.c0).v[0].x;\n"
+                 "    float oob = (*args.c0).v[4].x;\n"
+                 "    bool good = (fabs(ok0 - 1.0f) < 0.01f) && (fabs(oob) < 0.01f);\n"
+                 "    if (dm_lid == 0u) dm_out.set_primitive_count(good ? 2u : 0u);\n"
+                 "    if (good && dm_lid < 4u) {\n"
+                 "        uint col = dm_first[0] + dm_gid;\n"
+                 "        V17 v;\n"
+                 "        float x = float(col + (dm_lid & 1u)) / 4.0f - 1.0f;\n"
+                 "        v.p = float4(x, (dm_lid & 2u) ? 1.0f : -1.0f, 0.0f, 1.0f);\n"
+                 "        dm_out.set_vertex(dm_lid, v);\n"
+                 "    }\n"
+                 "    const uchar ix[6] = {0, 1, 2, 2, 1, 3};\n"
+                 "    if (good && dm_lid < 6u) dm_out.set_index(dm_lid, ix[dm_lid]);\n"
+                 "}\n";
+            NSError *e17 = nil;
+            id<MTLLibrary> mLib17 = [g_dev newLibraryWithSource:mSrc17 options:dm_msl_opts() error:&e17]; REQUIRE(mLib17);
+            NvShader *m17 = [NvShader new]; m17->stage = 4; m17->mesh_kind = 2; m17->mesh_threads = 32; m17->mesh_maxv = 4; m17->mesh_maxp = 2; m17->load_depth_zero = 1;
+            strlcpy(m17->key, "1717171717171717_b", sizeof m17->key); m17->ventry = @"main0";
+            m17->fn = lib_entry(mLib17, @"main0"); REQUIRE(m17->fn);
+            m17->rf.nb = 1; m17->rf.b = calloc(1, sizeof *m17->rf.b); REQUIRE(m17->rf.b);
+            m17->rf.b[0] = (nvn_rbind){.kind = NVN_RB_CBUF, .reg = 0, .aid = 0};
+            m17->ae = [m17->fn newArgumentEncoderWithBufferIndex:0]; REQUIRE(m17->ae);
+            m17->arg_len = m17->ae.encodedLength;
+            m17->cb_ext[0] = 128;
+
+            NvProg *prog17 = [NvProg new]; prog17->sh[1] = fs; prog17->sh[4] = m17;
+            static prog_t gp17; memset(&gp17, 0, sizeof gp17); gp17.magic = MAGIC('P', 'R', 'O', 'G'); gp17.serial = nvn_new_serial(); serial_put(gp17.serial, prog17);
+
+            static uint32_t pool17[4096] __attribute__((aligned(16384)));
+            nvn_be_pool_add(pool17, sizeof pool17);
+            pool17[0] = 2; pool17[1] = 1;     // indirect mesh args: count=2, first=1 -> columns 1, 2 (0x06)
+            pool17[2] = 1; pool17[3] = 5;     // indirect mesh args: count=1, first=5 -> column 5 (0x20)
+            memset(&pool17[64], 0, 512);
+            pool17[64 + 16] = 0x3f800000u;    // +64B poison = 1.0f; padded short UBO must read 0.0f here
+
+            // Case 17a: same-submission GPU fill + open render pass before indirect mesh draw
+            frame_begin(); S.prog = &gp17;
+            mtl_sub_fill((uint64_t)(uintptr_t)&pool17[64], 16, 0x3f800000u);
+            S.ubo[4][0] = (p_bind_buf){.addr = (uint64_t)(uintptr_t)&pool17[64], .size = 16};
+            p_draw d17a = {.prim = DM_PRIM_MESH_TASKS, .instances = 1, .ind = (uint64_t)(uintptr_t)&pool17[0]};
+            o = capture(^{
+                int w17 = 0;
+                // Pre-warm pipeline outside pass, then re-open pass so draw reaches mtk_bind with g_enc != nil
+                mesh_draw(&d17a, &w17);
+            });
+            cols = frame_columns();
+
+            // Repeat cleanly with pipeline warm AND render pass explicitly open when draw starts
+            frame_begin(); S.prog = &gp17;
+            mtl_sub_fill((uint64_t)(uintptr_t)&pool17[64], 16, 0x3f800000u);
+            rp_begin(); REQUIRE(g_enc);
+            S.ubo[4][0] = (p_bind_buf){.addr = (uint64_t)(uintptr_t)&pool17[64], .size = 16};
+            o = capture(^{ int w17 = 0; mesh_draw(&d17a, &w17); });
+            int cols17a = frame_columns();
+            VERIFY(cols == 0x06 && cols17a == 0x06 && red_lines(o, nil) == 0 && !mtl_last_commit_error(),
+                   "⑰a 间接网格绘制在已开遍中因 GPU 填短 UBO 重开遍：不崩于编码线程且列 1、2 白（%#x / %#x；stderr：%s）",
+                   cols, cols17a, o.UTF8String);
+
+            // Case 17b: in-flight GPU write (gw_live != 0) from previous unwaited submission + open render pass -> second retry hits e->gpu_src cache cleanly
+            nvn_be_set_frame(++g_frame); nvn_be_sub_begin(); state_reset();
+            pool17[64 + 16] = 0x3f800000u;
+            mtl_sub_fill((uint64_t)(uintptr_t)&pool17[64], 16, 0x3f800000u);
+            (void)nvn_be_sub_commit();   // purposely do not wait so gw_live is active during next submission
+
+            frame_begin(); S.prog = &gp17;
+            S.ubo[4][0] = (p_bind_buf){.addr = (uint64_t)(uintptr_t)&pool17[64], .size = 16};
+            p_draw d17b = {.prim = DM_PRIM_MESH_TASKS, .instances = 1, .ind = (uint64_t)(uintptr_t)&pool17[2]};
+            uint64_t made0 = g_cb_pad_made;
+            rp_begin(); REQUIRE(g_enc);
+            o = capture(^{ int w17 = 0; mesh_draw(&d17b, &w17); });
+            int cols17b = frame_columns();
+            VERIFY(cols17b == 0x20 && g_cb_pad_made == made0 + 1 && red_lines(o, nil) == 0 && !mtl_last_commit_error(),
+                   "⑰b 在途 gw_live 触发 GPU 补零重试命中 g_cb_pad：无红行、只拷 1 次（+%llu）、列 5 白（%#x；stderr：%s）",
+                   (unsigned long long)(g_cb_pad_made - made0), cols17b, o.UTF8String);
+
+            nvn_be_pool_del(pool17);
+        }
         [NSFileManager.defaultManager removeItemAtPath:@(pdir) error:nil];
     }
     if (failures) { printf("✗ t_nvn_mesh：%u 项里 %u 项不符\n", checks, failures); return 1; }   // 原生门禁按「✓ t_ / ✗ t_」逐组判
