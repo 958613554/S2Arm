@@ -13365,7 +13365,6 @@ static uint64_t pool_gpu(int samp, int dtt, int dpf, int rw, int base, __unsafe_
             memcpy(ids, g_pdirty[s].list, m * sizeof *ids); pool_dset_clear(&g_pdirty[s]);
             uint64_t room0 = s ? 0 : pool_room(), spent0 = g_walk_spent;   // once a batch (headroom and device size are system calls); each texture then takes what the batch made so far off it
             for (uint32_t j = 0; j < m; j++) { g_pool_upd_dirty++; if (s) pool_samp_update((int)ids[j]); else { uint64_t used = g_walk_spent - spent0, room = room0 > used ? room0 - used : 0; int lr = pool_tex_update((int)ids[j], room); if (lr == 1) pool_dset_add(&g_pleft, (int)ids[j]); else if (lr == 2) pool_dset_add(&g_punwritten, (int)ids[j]); } }
-            free(ids);
         }
         pool_unwritten_scan();
         pool_seen_scan();
