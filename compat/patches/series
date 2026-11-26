@@ -701,3 +701,4 @@
 20261125-0142-audio-pull-single-transport.patch
 20261126-0316-audio-render-lock-split.patch
 20261125-0021-audio-thaw-restart-ios.patch
+20261125-1727-audio-commit-wave-slot-shared.patch

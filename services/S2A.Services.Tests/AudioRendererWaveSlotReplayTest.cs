@@ -317,46 +317,24 @@ namespace S2A.Services.Tests
 
                 log.Replay(dsHookStart, slotHookStart[0], 0);
 
+                List<ErrorInfo> replayErrors = new();   // 重演错误:与解析段暂存的同一条,丢弃(处方③)
+
                 for (int k = 0; k < SlotsPerVoice; k++)
                 {
-                    WaveBufferInternal input = inputs[k];
-
                     bool liveValid = (k == 0) ? !slot0Flipped : SnapshotIsValid[k];
 
-                    if (liveValid == SnapshotIsValid[k])
+                    // 生产落账同一份(AudioRenderSystem.S2ACommitWaveSlot):本测试只造输入与 oracle,不另拼落账流程
+                    S2AUpdateShadow.VoiceSlotRecord slot = new()
                     {
-                        // 未翻转:解析段结果整体落账
-                        live.WaveBuffers[k] = shadow.WaveBuffers[k];
-                    }
-                    else
-                    {
-                        // 翻转:处方①——基底 = 锁1 快照里的该槽(含旧地址与旧 IsSendToAudioProcessor),对该基底重跑
-                        // isValid 分支(用翻转后的活 isValid)与重发分支两者;重发挂接抑制 hook(处方②:重发的
-                        // Map 已在日志里待重放,重演再执行就双倍)
-                        WaveBuffer replayBase = snapshot.WaveBuffers[k];
-                        bool bufferUnmapped = bufferUnmappedIn[k];
-                        List<ErrorInfo> replayErrors = new();   // 与解析段暂存的同一条,丢弃(处方③)
+                        IsValid = SnapshotIsValid[k],
+                        BufferUnmappedIn = bufferUnmappedIn[k],
+                        SampleFormat = SampleFormat.Adpcm,
+                        Input = inputs[k],
+                        HookStart = slotHookStart[k],
+                    };
 
-                        commitMapper.S2ASuppressAttachHooks = true;
-
-                        VoiceInfo.S2AUpdateWaveBuffer(
-                            replayErrors,
-                            ref replayBase,
-                            ref input,
-                            SampleFormat.Adpcm,
-                            liveValid,
-                            commitMapper,
-                            ref behaviour,
-                            ref bufferUnmapped);
-
-                        commitMapper.S2ASuppressAttachHooks = false;
-
-                        // 整体替换:重演输出(重发分支输出 = 影子槽,isValid 分支只多 Unmap 钩与清址、被重发重挂覆盖)
-                        live.WaveBuffers[k] = replayBase;
-                    }
-
-                    // 该槽 hook 重放(处方②时序:翻转槽的 Unmap 已由重演先行执行,这里按原序重放解析段记的重发 Map)
-                    log.Replay(slotHookStart[k], slotHookEnd[k], 0);
+                    AudioRenderSystem.S2ACommitWaveSlot(liveValid, ref slot, ref live.WaveBuffers[k], ref shadow.WaveBuffers[k], snapshot.WaveBuffers[k],
+                        commitMapper, ref behaviour, replayErrors, log, slotHookEnd[k], 0);
                 }
 
                 // 错误段(处方③:暂存表恰一次原序入队——不是双份)
