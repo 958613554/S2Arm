@@ -4062,8 +4062,35 @@ static int pf_r32i(MTLPixelFormat pf) { return pf == MTLPixelFormatR32Uint || pf
 static void srgb_twin_mark(id<MTLTexture> v) { if (v) objc_setAssociatedObject(v, &g_twin_view_key, (__bridge id)kCFBooleanTrue, OBJC_ASSOCIATION_ASSIGN); }
 static int srgb_twin_view(id o) { return o && objc_getAssociatedObject(o, &g_twin_view_key) != nil; }
 static int stex_backed(id<MTLTexture> t);   // 放置式 / 稀疏贴图（nvn_stex.inc 胶水）
+// 同一贴图反复升级诊断（D-67FG / D-6A9G / D-XJNP：同一 serial 一局升「可写」3–5 万次，每次新建 + 整张拷贝）：按 serial 记上次升级出的那张，
+//   再升时判是哪条路把它丢了——序号表里还是它、调用方却拿着旧的（另一层缓存没跟上）；序号表里换成了别的贴图（重建 / 重传）；预排布贴图（NvPkg）重传换了一张。
+//   第 3 次起每个 serial 记一行红（全程至多 16 个 serial），之后不再记；表 64 格按 serial 取模覆盖，只存指针值作比较，不持有对象
+static struct { uint64_t ser, n; uintptr_t up; } g_tupd[64]; static pthread_mutex_t g_tupd_mu = PTHREAD_MUTEX_INITIALIZER; static int g_tupd_red;
+// 序号表里这个 serial 底下那张贴图（NvPkg 取它的 tex；视图取到底图，sRGB / 线性双生视图本身就是持有者）
+static uintptr_t upd_under(id h, int *pkg) {
+    *pkg = [h isKindOfClass:[NvPkg class]]; id<MTLTexture> x = *pkg ? ((NvPkg *)h)->tex : (id<MTLTexture>)h;
+    while (!*pkg && x.parentTexture && !srgb_twin_view(x)) x = x.parentTexture;
+    return (uintptr_t)(__bridge void *)x;
+}
+// pre：升级前序号表里底下那张；post：升级后序号表里底下那张
+static void tex_upgrade_diag(const tex_t *t, id holder, uintptr_t pre, int pkg, id<MTLTexture> asked, MTLTextureUsage add, uintptr_t post) {
+    pthread_mutex_lock(&g_tupd_mu);
+    unsigned i = (unsigned)(t->serial % 64); uintptr_t last = g_tupd[i].ser == t->serial ? g_tupd[i].up : 0;
+    if (g_tupd[i].ser != t->serial) { g_tupd[i].ser = t->serial; g_tupd[i].n = 0; }
+    uint64_t n = ++g_tupd[i].n; g_tupd[i].up = post;
+    int say = n == 3 && last && g_tupd_red < 16; if (say) g_tupd_red++;
+    pthread_mutex_unlock(&g_tupd_mu);
+    if (!say) return;
+    const char *why = !holder ? "序号表里已没有这个 serial（被删 / 淘汰后重建）"
+                    : pre == last ? "序号表里还是上次升级出的那张，调用方却拿着旧的（另一层缓存没跟上）"
+                    : pkg ? "预排布贴图（NvPkg）重传换了一张，没带上升级过的用途"
+                    : "序号表里换成了别的贴图（重建 / 别名表换了）";
+    MLOG("【红】同一贴图第 %llu 次升级 ser=%llu：%s；持有者 %s，调用方给的用途 %#lx、要加 %#lx，格式 %lu %ux%u 标志 %#x（D-67FG 一类）",
+         (unsigned long long)n, (unsigned long long)t->serial, why, pkg ? "NvPkg" : holder ? (((id<MTLTexture>)holder).parentTexture ? "视图" : "贴图") : "无",
+         (unsigned long)asked.usage, (unsigned long)add, (unsigned long)asked.pixelFormat, t->d.width, t->d.height, t->d.flags);
+}
 static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextureUsage add, MTLPixelFormat view_pf) {
-    id holder = tex_get(t->serial);
+    id holder = tex_get(t->serial); int upd_pkg; uintptr_t upd_pre = upd_under(holder, &upd_pkg);   // 反复升级诊断（tex_upgrade_diag）
     // The serial holds an sRGB / linear view of the asked texture, or the asked texture is that view (upstream reference implementation, MIT, 92f223a7): the parent is upgraded and the
     //   view made again on it, so the pair keeps sharing its bytes
     id<MTLTexture> view = srgb_twin_view(holder) && (holder == asked || ((id<MTLTexture>)holder).parentTexture == asked) ? holder : nil;
@@ -4129,6 +4156,7 @@ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextu
         defer_obj_release(base);
     }
     MLOG("texture upgraded to allow %s ser=%llu base format %lu → view format %lu (upgrades=%llu)", root ? "image atomics (R32 storage, an RGBA8 view of the same bytes in its place)" : add & MTLTextureUsageRenderTarget ? "render-target use" : add & MTLTextureUsageShaderWrite ? "shader writes" : "format views", t->serial, (unsigned long)base.pixelFormat, (unsigned long)view_pf, ++g_pfv_upgrades);
+    { int pk2; uintptr_t post = upd_under(tex_get(t->serial), &pk2); tex_upgrade_diag(t, holder, upd_pre, upd_pkg, asked, add, post); }
     return upgraded_view ? upgraded_view : upgraded;
 }
 static id<MTLTexture> tex_upgrade_pfv(const tex_t *t, id<MTLTexture> base, MTLPixelFormat view_pf) { return tex_upgrade(t, base, MTLTextureUsagePixelFormatView, view_pf); }
@@ -6490,11 +6518,20 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         MTLTextureDescriptor *d = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:(MTLPixelFormat)pf width:t->d.width resourceOptions:b.resourceOptions
                                                                                          usage:MTLTextureUsageShaderRead | (can_write ? MTLTextureUsageShaderWrite : 0)];
         size_t row = ((size_t)t->d.width * bpb + al - 1) / al * al;
+        // R32 整数的可写缓冲贴图建时就带原子与格式视图用途（同上：缓冲贴图没有无损压缩可丢，加用途不花成本）。原先只给读写，原生 texture_buffer 原子
+        //   （img_atomic_prepare）用到时 tex_upgrade 补；缓冲贴图会随序号淘汰 / 对象收尾后再解析重建，重建的又不带，于是每次重建都升级一次，每次升级
+        //   g_ser_gen++ 让所有贴图编号缓存重解析（11-26 Mac 霍格沃茨之遗 ser 5947 R32Uint 245760 元素 300 秒升 61 次；D-67FG / D-XJNP iPhone / Mac 一局 3–5 万次，
+        //   与卡顿、坏指针崩溃同现）。建不出就逐级退：去格式视图 → 去原子 → 只读
+        int r32i = pf == MTLPixelFormatR32Uint || pf == MTLPixelFormatR32Sint;
+        if (can_write && r32i) d.usage |= MTLTextureUsageShaderAtomic | MTLTextureUsagePixelFormatView;
         id<MTLTexture> mt = [b newTextureWithDescriptor:d offset:mo bytesPerRow:row];
+        if (!mt && (d.usage & MTLTextureUsagePixelFormatView)) { d.usage &= ~MTLTextureUsagePixelFormatView; mt = [b newTextureWithDescriptor:d offset:mo bytesPerRow:row]; }
+        if (!mt && (d.usage & MTLTextureUsageShaderAtomic)) { d.usage &= ~MTLTextureUsageShaderAtomic; mt = [b newTextureWithDescriptor:d offset:mo bytesPerRow:row]; }
         if (!mt && can_write) {
             d.usage = MTLTextureUsageShaderRead;
             mt = [b newTextureWithDescriptor:d offset:mo bytesPerRow:row];
         }
+        if (mt && (d.usage & MTLTextureUsageShaderAtomic)) tex_note_atomic(mt);   // 用途读回可能不带原子位（tex_atomic_usage 认登记）
         if (!mt) { RED_ONCE(39, "cannot create buffer texture ser=%llu: %u elements format %#x", (unsigned long long)t->serial, t->d.width, t->d.format); return nil; }
         pool_tview_note(b);   // pool_age leaves this pool resident
         res_add(mt);
