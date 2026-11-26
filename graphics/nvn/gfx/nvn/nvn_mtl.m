@@ -6518,11 +6518,20 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         MTLTextureDescriptor *d = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:(MTLPixelFormat)pf width:t->d.width resourceOptions:b.resourceOptions
                                                                                          usage:MTLTextureUsageShaderRead | (can_write ? MTLTextureUsageShaderWrite : 0)];
         size_t row = ((size_t)t->d.width * bpb + al - 1) / al * al;
+        // R32 整数的可写缓冲贴图建时就带原子与格式视图用途（同上：缓冲贴图没有无损压缩可丢，加用途不花成本）。原先只给读写，原生 texture_buffer 原子
+        //   （img_atomic_prepare）用到时 tex_upgrade 补；缓冲贴图会随序号淘汰 / 对象收尾后再解析重建，重建的又不带，于是每次重建都升级一次，每次升级
+        //   g_ser_gen++ 让所有贴图编号缓存重解析（11-26 Mac 霍格沃茨之遗 ser 5947 R32Uint 245760 元素 300 秒升 61 次；D-67FG / D-XJNP iPhone / Mac 一局 3–5 万次，
+        //   与卡顿、坏指针崩溃同现）。建不出就逐级退：去格式视图 → 去原子 → 只读
+        int r32i = pf == MTLPixelFormatR32Uint || pf == MTLPixelFormatR32Sint;
+        if (can_write && r32i) d.usage |= MTLTextureUsageShaderAtomic | MTLTextureUsagePixelFormatView;
         id<MTLTexture> mt = [b newTextureWithDescriptor:d offset:mo bytesPerRow:row];
+        if (!mt && (d.usage & MTLTextureUsagePixelFormatView)) { d.usage &= ~MTLTextureUsagePixelFormatView; mt = [b newTextureWithDescriptor:d offset:mo bytesPerRow:row]; }
+        if (!mt && (d.usage & MTLTextureUsageShaderAtomic)) { d.usage &= ~MTLTextureUsageShaderAtomic; mt = [b newTextureWithDescriptor:d offset:mo bytesPerRow:row]; }
         if (!mt && can_write) {
             d.usage = MTLTextureUsageShaderRead;
             mt = [b newTextureWithDescriptor:d offset:mo bytesPerRow:row];
         }
+        if (mt && (d.usage & MTLTextureUsageShaderAtomic)) tex_note_atomic(mt);   // 用途读回可能不带原子位（tex_atomic_usage 认登记）
         if (!mt) { RED_ONCE(39, "cannot create buffer texture ser=%llu: %u elements format %#x", (unsigned long long)t->serial, t->d.width, t->d.format); return nil; }
         pool_tview_note(b);   // pool_age leaves this pool resident
         res_add(mt);
