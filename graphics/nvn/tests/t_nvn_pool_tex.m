@@ -440,8 +440,35 @@ int main(void) { @autoreleasepool {
         VERIFY(rid_old != dum && b_new != b_old_keep && rid_old_after == rid_old && rid_new_after == dum,
                "⑯b 在途池表写时拷贝：旧表保留真图(%d) 新表换缓冲(%d) 新表为哑图(%d)",
                rid_old_after == rid_old, b_new != b_old_keep, rid_new_after == dum);
+        // ⑰ pool_seen_scan 快速重查：仅 guest 脏代号变化（dg != g_seen_dirty, sg == g_seen_ser）时跳过非 CPU 写入贴图（view_pkg == 0）；全局串口代号前进时照常全量重查
+        os_unfair_lock_lock(&g_rmu);
+        pool_seen_scan();   // 同步 g_seen_sub / g_seen_dirty / g_seen_ser
+        uint64_t dg_now = nvn_dirty_now();
+        int gpu_seen = 0, pkg_seen = 0, total_seen = 0;
+        // 找一个已读贴图，强制设一个为 view_pkg=0（GPU 独占），统计当前所有已读 ID 中会被 dg-only 重查的数量
+        int gpu_id = -1;
+        for (int i = 1; i < g_ntreg; i++) {
+            if (!g_treg[i].ok || !pool_seen(i) || (g_seen_todo[(unsigned)i >> 5] >> (i & 31) & 1)) continue;
+            if (gpu_id < 0 && g_treg[i].view && g_treg[i].view_ser == g_ser_gen) { gpu_id = i; g_treg[i].view_pkg = 0; }
+            total_seen++;
+            if (g_treg[i].view && g_treg[i].view_pkg) { g_treg[i].view_dirty = dg_now - 1; pkg_seen++; }
+            else gpu_seen++;
+        }
+        uint64_t u0 = g_pool_upd_seen;
+        g_pkg_epoch++; g_seen_dirty--;   // 模拟仅 guest 脏代号前进（新 epoch 下同提交内 !new_sub && recheck_dg）
+        pool_seen_scan();
+        uint64_t du_dg = g_pool_upd_seen - u0;
+        uint64_t u1 = g_pool_upd_seen;
+        ser_gen_bump_all();   // 模拟全局串口代号前进（sg_hit 对全量已读生效）
+        pool_seen_scan();
+        uint64_t du_sg = g_pool_upd_seen - u1;
+        uint32_t nw = g_seen_n;
+        os_unfair_lock_unlock(&g_rmu);
+        VERIFY(gpu_seen > 0 && nw > 0 && (int)du_dg == pkg_seen && (int)du_sg == total_seen,
+               "⑰ pool_seen_scan 紧凑重查：seen_n=%u，dg-only 重查 %llu（期望仅 view_pkg=%d，跳过 gpu_only=%d），sg 重查 %llu（期望全量=%d）",
+               nw, (unsigned long long)du_dg, pkg_seen, gpu_seen, (unsigned long long)du_sg, total_seen);
     }
-    // ⑰ pool_seen_scan 按串口分桶 + 永久空视图不空转：
+    // ⑱ pool_seen_scan 按串口分桶 + 永久空视图不空转：
     //   - GPU 专用已读贴图（!view_pkg）与视图持续为 NULL 的已读 ID 在脏页代数 / 无关串口桶变化时不触发 pool_seen_scan 重查；
     //   - 负对照 A：自身串口发生变更（serial_put 抬高它自己的 g_sgen_bucket）→ 触发重查（g_pool_upd_seen +1）；
     //   - 负对照 B：CPU 写过的（view_pkg）已读贴图在宿主脏页代数前进且 epoch 翻新后 → 触发重查（g_pool_upd_seen +1）
@@ -507,7 +534,7 @@ int main(void) { @autoreleasepool {
         uint64_t du_dirty = g_pool_upd_seen - dirty_upd0;
 
         VERIFY(du_other == 0 && du_dirty_same_ep == 0 && du_own == 1 && du_dirty >= 1,
-               "⑰ pool_seen_scan 串口分桶与永久 NULL 跳过：无关串口桶更新=%llu(应0) 同epoch脏页更新=%llu(应0) 自身串口桶更新=%llu(应1) 脏页+epoch触发pkg更新=%llu(应>=1)",
+               "⑱ pool_seen_scan 串口分桶与永久 NULL 跳过：无关串口桶更新=%llu(应0) 同epoch脏页更新=%llu(应0) 自身串口桶更新=%llu(应1) 脏页+epoch触发pkg更新=%llu(应>=1)",
                (unsigned long long)du_other, (unsigned long long)du_dirty_same_ep, (unsigned long long)du_own, (unsigned long long)du_dirty);
         serial_del(other_ser);
     }
