@@ -1145,7 +1145,7 @@ static int mesh_run_plain(const p_draw *dw, const p_draw_idx *di) {
     return 1;
 }
 static int mesh_run_lane2(int on) {
-    if (on) { if (!g_gr.active) return 0; geo_lane(2); if (!g_enc) { g_game_barrier = 1; main_barrier_reset(); } return 1; }   // the main pass opened in lane 2 waits for everything before it: the host stages in lane 1
+    if (on) { if (!g_gr.active) return 0; geo_lane(2); if (!g_enc) { g_game_barrier = 1; g_bar_bits = ~0u; main_barrier_reset(); } return 1; }   // the main pass opened in lane 2 waits for everything before it: the host stages in lane 1
     geo_lane(0); if (!g_gr.active) { static int said; if (!said++) MLOG("【红】 task / mesh draw: the geometry run ended inside its main-pass draw"); }
     return 0;
 }
@@ -1405,7 +1405,7 @@ static void geo_draw(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0) {
     }
     g_geo_program = raster; g_geo_indices = fast ? map : packed; g_geo_index_bytes = fast ? words * 4 : packed_size; g_geo_args = args;   // fast: the input primitives' capture indices (map) are the main pass's
     p_draw synthetic = {.prim = gs->geo_output == 1 ? 0 : gs->geo_output == 6 ? 1 : 4, .count = 3, .instances = 1, .base_instance = (int32_t)first_instance};
-    if (run) { geo_lane(2); if (!g_enc) { g_game_barrier = 1; main_barrier_reset(); } }   // the main pass opened in lane 2 waits for everything before it: the compactions in lane 1
+    if (run) { geo_lane(2); if (!g_enc) { g_game_barrier = 1; g_bar_bits = ~0u; main_barrier_reset(); } }   // the main pass opened in lane 2 waits for everything before it: the compactions in lane 1
     draw(&synthetic, NULL);
     if (run) { geo_lane(0); if (!g_gr.active) MDIE("geometry run ended inside its draw's main-pass draw"); }
     g_geo_program = nil; args_dirty_all();

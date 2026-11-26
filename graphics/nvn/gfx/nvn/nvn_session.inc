@@ -152,7 +152,15 @@ static int nvn_be_shutdown_session_body(void) {
     //   与写过报告的地址表、见过的事件地址
     g_adhoc_nk = 0; g_rc_nsubmitted = 0; free(g_rc_occ); g_rc_occ = NULL; g_rc_ocap = g_rc_on = 0; g_neva = 0;
     free(g_pidx); g_pidx = NULL; g_pidx_cap = g_pidx_ok = 0; g_plast = -1;
-    atomic_fetch_add(&g_pool_gen, 1); atomic_fetch_add(&g_reg_gen, 1); atomic_fetch_add(&g_ser_gen, 1);
+    for (int s = 0; s < GMEM_RECYCLE; s++) {
+        if (g_gmem_rec[s].buf) { res_remove(g_gmem_rec[s].buf); g_gmem_rec[s].buf = nil; }
+        g_gmem_rec[s].fence = 0; atomic_store(&g_gmem_rec[s].busy, 0);
+    }
+    if (g_gmem_buf && g_gmem_cur_slot < 0) res_remove(g_gmem_buf);
+    g_gmem_buf = nil; g_gmem_cpu = nil; g_gmem_gen = g_gmem_built_rgen = 0; g_gmem_cur_slot = -1; g_gmem_built_on = -1;
+    g_last_end_relaxed = 0; g_game_barrier = 0; g_bar_bits = 0;
+    g_ts_frame_id = ~0ull; g_ts_frame_val = 0;
+    atomic_fetch_add(&g_pool_gen, 1); atomic_fetch_add(&g_gmem_pgen, 1); atomic_fetch_add(&g_reg_gen, 1); atomic_fetch_add(&g_ser_gen, 1);
     // Keys for these caches include program/guest buffer identity. Reuse only
     // the compiled shader cache (its keys are content hashes).
     nvn_hm_clear(&g_pso, hm_rel); nvn_hm_clear(&g_cps, hm_rel);
