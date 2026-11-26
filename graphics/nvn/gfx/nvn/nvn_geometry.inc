@@ -676,12 +676,20 @@ static uint64_t mtk_scratch_gpu(void) {
     os_unfair_lock_unlock(&g_mtk_scratch_lock);
     return r;
 }
+static os_unfair_lock g_mopt_lock = OS_UNFAIR_LOCK_INIT;
+static NSMutableDictionary *g_mopt_libs, *g_mopt_meta;
+static NSMutableSet<NSData *> *g_mopt_upgrading;
 static void mtk_scratch_reset(void) {
     os_unfair_lock_lock(&g_mtk_scratch_lock);
     if (g_mtk_scratch) { res_remove(g_mtk_scratch); g_mtk_scratch = nil; }
     g_mtk_scratch_gpu = 0; g_mtk_scratch_slots = 0;
     atomic_store_explicit(&g_mtk_scratch_gpu_atomic, 0, memory_order_release);
     os_unfair_lock_unlock(&g_mtk_scratch_lock);
+    os_unfair_lock_lock(&g_mopt_lock);
+    [g_mopt_libs removeAllObjects];
+    [g_mopt_meta removeAllObjects];
+    [g_mopt_upgrading removeAllObjects];
+    os_unfair_lock_unlock(&g_mopt_lock);
 }
 static int mtk_opt_on(void) {
     static int v = -1;
@@ -697,11 +705,13 @@ static NSString *mtk_opt_mesh_src(NSString *src, int *out_dev, int *out_bstore) 
     if (!src.length) return nil;
     NSMutableString *cur = [src mutableCopy];
     NSRange main0 = [cur rangeOfString:@"[[mesh]] void main0("];
-    if (main0.location != NSNotFound && ![cur containsString:@"dm_relay"] && ![cur containsString:@"[[buffer(28)]]"]) {
+    if (main0.location != NSNotFound) {
         NSRange emu = [cur rangeOfString:@"\n#ifdef S2A_MESH_EMU\n" options:NSBackwardsSearch];
         if (emu.location != NSNotFound && emu.location > main0.location) {
             [cur deleteCharactersInRange:NSMakeRange(emu.location, cur.length - emu.location)];
         }
+    }
+    if (main0.location != NSNotFound && ![cur containsString:@"dm_relay"] && ![cur containsString:@"[[buffer(28)]]"]) {
         static NSRegularExpression *rxArr, *rxInit, *rxOp, *rxTgTok;
         static dispatch_once_t onceA;
         dispatch_once(&onceA, ^{
@@ -850,8 +860,20 @@ static NSDictionary<NSNumber *, NSArray<NSString *> *> *mpk_exports(NSString *sr
     return d;
 }
 static BOOL mpk_is_const(NSString *e) { return [e isEqualToString:@"0.0"] || [e isEqualToString:@"1.0"]; }
-static int mtk_pack_pair_src(NSString *msrc, NSString *fsrc, NSString **out_msrc, NSString **out_fsrc, NSString **out_layout, unsigned *out_orig, unsigned *out_new) {
+static int mtk_pack_pair_src(NSString *msrcIn, NSString *fsrcIn, NSString **out_msrc, NSString **out_fsrc, NSString **out_layout, unsigned *out_orig, unsigned *out_new) {
+    NSString *msrc = msrcIn, *fsrc = fsrcIn;
     if (!msrc.length || !fsrc.length) return 0;
+    {
+        NSRange mmain = [msrc rangeOfString:@"[[mesh]] void main0("];
+        NSRange emu = mmain.location != NSNotFound ? [msrc rangeOfString:@"\n#ifdef S2A_MESH_EMU\n" options:NSBackwardsSearch] : NSMakeRange(NSNotFound, 0);
+        if (emu.location != NSNotFound && emu.location > mmain.location) msrc = [msrc substringToIndex:emu.location];
+    }
+    {
+        static NSRegularExpression *rxMain0U; static dispatch_once_t onceU;
+        dispatch_once(&onceU, ^{ rxMain0U = [NSRegularExpression regularExpressionWithPattern:@"\\n(?:\\[\\[[^\\]]+\\]\\]\\s+)?fragment\\s+main0_out_u\\s+main0_u\\(" options:0 error:nil]; });
+        NSTextCheckingResult *mu = [rxMain0U firstMatchInString:fsrc options:0 range:NSMakeRange(0, fsrc.length)];
+        if (mu) fsrc = [fsrc substringToIndex:mu.range.location];
+    }
     if ([fsrc componentsSeparatedByString:@"main0_in"].count != 3) return 0;
     NSString *setV = [msrc containsString:@"dm_out.set_vertex(n, v);"] ? @"dm_out.set_vertex(n, v);" : @"dm_out.set_vertex(n,v);";
     if ([msrc componentsSeparatedByString:setV].count < 2) return 0;
@@ -954,8 +976,6 @@ static int mtk_pack_pair_src(NSString *msrc, NSString *fsrc, NSString **out_msrc
     return 1;
 }
 
-static os_unfair_lock g_mopt_lock = OS_UNFAIR_LOCK_INIT;
-static NSMutableDictionary *g_mopt_libs, *g_mopt_meta;
 static id<MTLLibrary> mtk_opt_compile(NSString *cacheKey, NSString *src) {
     if (!cacheKey.length || !src.length) return nil;
     os_unfair_lock_lock(&g_mopt_lock);
@@ -982,65 +1002,95 @@ static id<MTLLibrary> mtk_opt_compile(NSString *cacheKey, NSString *src) {
     }
     return existing == NSNull.null ? nil : existing;
 }
-static NSString *mtk_base_src(NvShader *sh, int st) {
-    if (!sh || !sh->key[0] || !getenv("DM_MSL_FALLBACK")) return nil;
+static NSString *mtk_base_src(NvShader *sh, int st, BOOL cached_only) {
+    const char *out = getenv("DM_MSL_FALLBACK");
+    if (!sh || !sh->key[0] || !out || !*out) return nil;
+    if (cached_only) {
+        char path[1200]; snprintf(path, sizeof path, "%s/%.16s_b.metal", out, sh->key);
+        if (access(path, R_OK)) return nil;
+        return [NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:nil];
+    }
     uint8_t md[8] = {0};
     for (int i = 0; i < 8; i++) { unsigned b = 0; if (sscanf(sh->key + 2 * i, "%2x", &b) != 1) return nil; md[i] = (uint8_t)b; }
     char path[1200];
     if (dm_shader_base_cached(md, st, path, sizeof path)) return nil;
     return [NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:nil];
 }
-static NSString *mtk_opt_apply(MTLMeshRenderPipelineDescriptor *m, const pso_key *pk, NvShader *ms, NvShader *fs, uint32_t pad, int merged, int has_fsfn) {
+static NSString *mtk_opt_plan(MTLMeshRenderPipelineDescriptor *m, const pso_key *pk, NvShader *ms, NvShader *fs, uint32_t pad, int merged, int has_fsfn, BOOL cached_only,
+                              NSString **out_ms, NSString **out_fs, int *out_dev, int *out_bstore, unsigned *out_orig, unsigned *out_new, BOOL *out_uncached) {
+    if (out_ms) *out_ms = nil; if (out_fs) *out_fs = nil; if (out_uncached) *out_uncached = NO;
     if (!mtk_opt_on() || !ms || !pk || pad || merged || has_fsfn) return nil;
     if (m.meshFunction != ms->fn || (fs && m.fragmentFunction != fs->fn)) return nil;
     if (pk->fc || pk->at || pk->msoff) return nil;
     if (fs && (pso_fout_need(pk, fs, merged) || pso_pb_eff(pk, fs, merged, 0))) return nil;
-    NSString *msBase = mtk_base_src(ms, 5);
-    if (!msBase.length) return nil;
+    NSString *msBase = mtk_base_src(ms, 5, cached_only);
+    if (!msBase.length) { if (cached_only && out_uncached) *out_uncached = YES; return nil; }
     int dev = 0, bstore = 0;
     NSString *msOpt = mtk_opt_mesh_src(msBase, &dev, &bstore);
     NSString *msIn = msOpt ?: msBase;
     NSString *msPacked = nil, *fsPacked = nil, *layout = nil; unsigned origSlots = 0, newSlots = 0;
     if (fs) {
-        NSString *fsBase = mtk_base_src(fs, 1);
-        if (fsBase.length) mtk_pack_pair_src(msIn, fsBase, &msPacked, &fsPacked, &layout, &origSlots, &newSlots);
-    }
-    if (!msOpt && !msPacked) return nil;
-    if (dev) (void)mtk_scratch_gpu();
-    NSString *meshEntry = [ms->fn.name hasSuffix:@"_z"] ? @"main0_z" : @"main0";
-    if (msPacked && fsPacked) {
-        NSString *pairTag = [NSString stringWithFormat:@"%s|%s|d%db%dp|%@", ms->key, fs->key, dev, bstore, layout];
-        id<MTLLibrary> mlib = mtk_opt_compile([@"pm|" stringByAppendingString:pairTag], msPacked);
-        id<MTLLibrary> flib = mlib ? mtk_opt_compile([@"pf|" stringByAppendingString:pairTag], fsPacked) : nil;
-        id<MTLFunction> mf = mlib ? lib_entry(mlib, meshEntry) : nil;
-        id<MTLFunction> ff = flib ? lib_entry(flib, @"main0") : nil;
-        if (mf && ff) {
-            m.meshFunction = mf; m.fragmentFunction = ff;
-            os_unfair_lock_lock(&g_mopt_lock);
-            if (!g_mopt_meta) g_mopt_meta = [NSMutableDictionary dictionary];
-            NSString *logKey = [NSString stringWithFormat:@"%s/%s", ms->key, fs->key];
-            if (!g_mopt_meta[logKey]) { g_mopt_meta[logKey] = @YES; MLOG("[mesh-opt] mesh %s fs %s: dev=%d bstore=%d slots %u->%u", ms->key, fs->key, dev, bstore, origSlots, newSlots); }
-            os_unfair_lock_unlock(&g_mopt_lock);
-            return pairTag;
+        NSString *fsBase = mtk_base_src(fs, 1, cached_only);
+        if (!fsBase.length) {
+            if (cached_only) { if (out_uncached) *out_uncached = YES; return nil; }
+        } else {
+            mtk_pack_pair_src(msIn, fsBase, &msPacked, &fsPacked, &layout, &origSlots, &newSlots);
         }
     }
+    if (!msOpt && !msPacked) return nil;
+    if (out_dev) *out_dev = dev; if (out_bstore) *out_bstore = bstore;
+    if (out_orig) *out_orig = origSlots; if (out_new) *out_new = newSlots;
+    if (msPacked && fsPacked) {
+        if (out_ms) *out_ms = msPacked; if (out_fs) *out_fs = fsPacked;
+        return [NSString stringWithFormat:@"%s|%s|d%db%dp|%@", ms->key, fs->key, dev, bstore, layout];
+    }
     if (!msOpt) return nil;
-    NSString *meshTag = [NSString stringWithFormat:@"%s|d%db%d", ms->key, dev, bstore];
-    id<MTLLibrary> mlib = mtk_opt_compile([@"bm|" stringByAppendingString:meshTag], msOpt);
-    id<MTLFunction> mf = mlib ? lib_entry(mlib, meshEntry) : nil;
-    if (!mf) return nil;
-    m.meshFunction = mf;
-    os_unfair_lock_lock(&g_mopt_lock);
-    if (!g_mopt_meta) g_mopt_meta = [NSMutableDictionary dictionary];
-    NSString *logKey = @(ms->key);
-    if (!g_mopt_meta[logKey]) { g_mopt_meta[logKey] = @YES; MLOG("[mesh-opt] mesh %s: dev=%d bstore=%d", ms->key, dev, bstore); }
-    os_unfair_lock_unlock(&g_mopt_lock);
-    return meshTag;
+    if (out_ms) *out_ms = msOpt;
+    return [NSString stringWithFormat:@"%s|d%db%d", ms->key, dev, bstore];
 }
-static id<MTLRenderPipelineState> mtk_build_with_opt(MTLMeshRenderPipelineDescriptor *m, const pso_key *pk, NvShader *ts, NvShader *ms, NvShader *fs, uint32_t pad, int merged, int has_fsfn, NSError **error) {
+static id<MTLRenderPipelineState> mtk_build_with_opt(MTLMeshRenderPipelineDescriptor *m, const pso_key *pk, NvShader *ts, NvShader *ms, NvShader *fs, uint32_t pad, int merged, int has_fsfn, int urgent, BOOL *out_need_upgrade, NSError **error) {
+    if (out_need_upgrade) *out_need_upgrade = NO;
+    NSString *msSrc = nil, *fsSrc = nil; int dev = 0, bstore = 0; unsigned origSlots = 0, newSlots = 0; BOOL uncached = NO;
+    NSString *opt_tag = mtk_opt_plan(m, pk, ms, fs, pad, merged, has_fsfn, urgent != 0, &msSrc, &fsSrc, &dev, &bstore, &origSlots, &newSlots, &uncached);
+    if (urgent && uncached) {
+        if (out_need_upgrade) *out_need_upgrade = YES;
+        NSString *baseKey = par_mkey(pk, ts, ms, fs, pad, merged, has_fsfn ? (id)NSNull.null : nil, nil);
+        return par_mesh(m, baseKey, error);
+    }
+    NSString *optKey = opt_tag ? par_mkey(pk, ts, ms, fs, pad, merged, has_fsfn ? (id)NSNull.null : nil, opt_tag) : nil;
+    if (urgent && opt_tag && !par_has_key(optKey)) {
+        if (out_need_upgrade) *out_need_upgrade = YES;
+        NSString *baseKey = par_mkey(pk, ts, ms, fs, pad, merged, has_fsfn ? (id)NSNull.null : nil, nil);
+        return par_mesh(m, baseKey, error);
+    }
     id<MTLFunction> origMfn = m.meshFunction, origFfn = m.fragmentFunction;
-    NSString *opt_tag = mtk_opt_apply(m, pk, ms, fs, pad, merged, has_fsfn);
-    NSString *akey = par_mkey(pk, ts, ms, fs, pad, merged, has_fsfn ? (id)NSNull.null : nil, opt_tag);
+    if (opt_tag && msSrc) {
+        if (dev) (void)mtk_scratch_gpu();
+        NSString *meshEntry = [ms->fn.name hasSuffix:@"_z"] ? @"main0_z" : @"main0";
+        NSString *mpfx = fsSrc ? @"pm|" : @"bm|";
+        id<MTLLibrary> mlib = mtk_opt_compile([mpfx stringByAppendingString:opt_tag], msSrc);
+        id<MTLLibrary> flib = (mlib && fsSrc) ? mtk_opt_compile([@"pf|" stringByAppendingString:opt_tag], fsSrc) : nil;
+        id<MTLFunction> mf = mlib ? lib_entry(mlib, meshEntry) : nil;
+        id<MTLFunction> ff = fsSrc ? (flib ? lib_entry(flib, @"main0") : nil) : origFfn;
+        if (mf && ff) {
+            m.meshFunction = mf;
+            if (fsSrc) m.fragmentFunction = ff;
+            os_unfair_lock_lock(&g_mopt_lock);
+            if (!g_mopt_meta) g_mopt_meta = [NSMutableDictionary dictionary];
+            NSString *logKey = fsSrc ? [NSString stringWithFormat:@"%s/%s", ms->key, fs->key] : @(ms->key);
+            if (!g_mopt_meta[logKey]) {
+                g_mopt_meta[logKey] = @YES;
+                if (fsSrc) MLOG("[mesh-opt] mesh %s fs %s: dev=%d bstore=%d slots %u->%u", ms->key, fs->key, dev, bstore, origSlots, newSlots);
+                else MLOG("[mesh-opt] mesh %s: dev=%d bstore=%d", ms->key, dev, bstore);
+            }
+            os_unfair_lock_unlock(&g_mopt_lock);
+        } else {
+            opt_tag = nil; optKey = nil;
+        }
+    } else {
+        opt_tag = nil; optKey = nil;
+    }
+    NSString *akey = optKey ?: par_mkey(pk, ts, ms, fs, pad, merged, has_fsfn ? (id)NSNull.null : nil, nil);
     id<MTLRenderPipelineState> p = par_mesh(m, akey, error);
     if (!p && opt_tag) {
         MLOG("【黄】 [mesh-opt] pipeline with opt refused (%s), falling back: %s", ms->key, error && *error ? (*error).localizedDescription.UTF8String : "-");
@@ -1087,7 +1137,7 @@ static id mtk_warm(const pso_skey *sk, NSString *mkey, NSString *fkey, NSString 
     if (mk.k.fc && fs && !se_warm(fs, mk.k.fc)) return nil;   // a sampler-emulation variant this device has not made yet (as R rows)
     MTLMeshRenderPipelineDescriptor *m = mtk_desc(&mk.k, ts, ms, fs, pf, 0, nil);
     NSError *e = nil; uint64_t t0 = bp_now();
-    id<MTLRenderPipelineState> p = mtk_build_with_opt(m, &mk.k, ts, ms, fs, pad, 0, NO, &e);
+    id<MTLRenderPipelineState> p = mtk_build_with_opt(m, &mk.k, ts, ms, fs, pad, 0, NO, 0, NULL, &e);
     if (!p) { MLOG("【红】 prewarm: task / mesh pipeline refused (task %s mesh %s fragment %s): %s", ts ? ts->key : "-", ms->key, fs ? fs->key : "-", e.localizedDescription.UTF8String); return nil; }
     NSString *names = [NSString stringWithFormat:@"task %s mesh %s%s fragment %s", ts ? ts->key : "-", ms->key, pf ? " (padded)" : "", fs ? fs->key : "-"];
     os_unfair_lock_lock(&g_pso_mtk_lock); if (!g_mtk_names) g_mtk_names = [NSMapTable strongToStrongObjectsMapTable]; [g_mtk_names setObject:names forKey:p]; os_unfair_lock_unlock(&g_pso_mtk_lock);
@@ -1103,15 +1153,52 @@ static void mtk_warm_claim(NSData *key, id ps) {   // submit thread (warm_claim)
 // The background build of a mesh pipeline: a concurrent queue, at most mtk_width() at a time (the system compiler service builds them in parallel; one serial queue left a draw that
 //   could not wait behind every other pipeline queued before it)
 static int mtk_width(void) { static int w; if (!w) { const char *e = getenv("DM_NVN_MESH_PAR"); int n = (int)NSProcessInfo.processInfo.activeProcessorCount; w = e && atoi(e) > 0 ? atoi(e) : n > 4 ? n - 2 : 2; MLOG("task / mesh pipelines: built in the background %d at a time (DM_NVN_MESH_PAR)", w); } return w; }
-static dispatch_semaphore_t g_mtk_sem;
-static void mtk_kick(id m, const pso_key *pk, NvShader *ts, NvShader *ms, NvShader *fs, int merged, int has_fsfn, NSString *names, const mtk_key *key) {   // m: a mesh pipeline descriptor, or (#770 host stages) an ordinary one
+static dispatch_semaphore_t g_mtk_sem, g_mtk_opt_sem;
+static dispatch_queue_t g_mtk_opt_q;
+static void mtk_opt_upgrade(id m, pso_key pk_copy, NvShader *ts, NvShader *ms, NvShader *fs, int merged, int has_fsfn, NSString *names, mtk_key kk, id<MTLRenderPipelineState> orig) {
+    if (![m isKindOfClass:[MTLMeshRenderPipelineDescriptor class]]) return;
+    NSData *kd = [NSData dataWithBytes:&kk length:sizeof kk];
+    os_unfair_lock_lock(&g_mopt_lock);
+    if (!g_mopt_upgrading) g_mopt_upgrading = [NSMutableSet set];
+    BOOL busy = [g_mopt_upgrading containsObject:kd];
+    if (!busy) [g_mopt_upgrading addObject:kd];
+    os_unfair_lock_unlock(&g_mopt_lock);
+    if (busy) return;
+    dispatch_group_async(g_mtk_group, g_mtk_opt_q, ^{ @autoreleasepool {
+        dispatch_semaphore_wait(g_mtk_opt_sem, DISPATCH_TIME_FOREVER);
+        NSError *e = nil;
+        id<MTLRenderPipelineState> opt = mtk_build_with_opt((MTLMeshRenderPipelineDescriptor *)m, &pk_copy, ts, ms, fs, kk.pad, merged, has_fsfn, 0, NULL, &e);
+        dispatch_semaphore_signal(g_mtk_opt_sem);
+        if (opt && opt != orig) {
+            os_unfair_lock_lock(&g_pso_mtk_lock);
+            if (hm_get_id(&g_pso_mtk, &kk) == orig) {
+                hm_put_id(&g_pso_mtk, &kk, opt);
+                if (!g_mtk_names) g_mtk_names = [NSMapTable strongToStrongObjectsMapTable];
+                [g_mtk_names setObject:[names stringByAppendingString:@" (opt)"] forKey:opt];
+                if (!g_mtk_drawn) g_mtk_drawn = [NSMutableSet set];
+                [g_mtk_drawn addObject:opt];
+            }
+            os_unfair_lock_unlock(&g_pso_mtk_lock);
+        }
+        os_unfair_lock_lock(&g_mopt_lock);
+        [g_mopt_upgrading removeObject:kd];
+        os_unfair_lock_unlock(&g_mopt_lock);
+    } });
+}
+static void mtk_kick(id m, const pso_key *pk, NvShader *ts, NvShader *ms, NvShader *fs, int merged, int has_fsfn, NSString *names, const mtk_key *key, int urgent) {   // m: a mesh pipeline descriptor, or (#770 host stages) an ordinary one
     mtk_key kk = *key; pso_key pk_copy = *pk;
     atomic_fetch_add(&g_mtk_inflight, 1);
-    if (!g_mtk_q) { g_mtk_q = dispatch_queue_create("dm.nvn.mesh", s2a_qos_queue_attr(DISPATCH_QUEUE_CONCURRENT, S2A_QOS_SHADER_VARIANT)); g_mtk_group = dispatch_group_create(); g_mtk_sem = dispatch_semaphore_create(mtk_width()); }
+    if (!g_mtk_q) {
+        g_mtk_q = dispatch_queue_create("dm.nvn.mesh", s2a_qos_queue_attr(DISPATCH_QUEUE_CONCURRENT, S2A_QOS_SHADER_VARIANT));
+        g_mtk_opt_q = dispatch_queue_create("dm.nvn.mesh.opt", s2a_qos_queue_attr(DISPATCH_QUEUE_CONCURRENT, S2A_QOS_SHADER_PREFETCH));
+        g_mtk_group = dispatch_group_create();
+        g_mtk_sem = dispatch_semaphore_create(mtk_width());
+        g_mtk_opt_sem = dispatch_semaphore_create(2);
+    }
     dispatch_group_async(g_mtk_group, g_mtk_q, ^{ @autoreleasepool {
         dispatch_semaphore_wait(g_mtk_sem, DISPATCH_TIME_FOREVER);
-        NSError *e = nil; uint64_t t0 = bp_now();
-        id<MTLRenderPipelineState> p = [m isKindOfClass:[MTLMeshRenderPipelineDescriptor class]] ? mtk_build_with_opt((MTLMeshRenderPipelineDescriptor *)m, &pk_copy, ts, ms, fs, kk.pad, merged, has_fsfn, &e)
+        NSError *e = nil; uint64_t t0 = bp_now(); BOOL need_up = NO;
+        id<MTLRenderPipelineState> p = [m isKindOfClass:[MTLMeshRenderPipelineDescriptor class]] ? mtk_build_with_opt((MTLMeshRenderPipelineDescriptor *)m, &pk_copy, ts, ms, fs, kk.pad, merged, has_fsfn, urgent, &need_up, &e)
                                                                                                  : [g_dev newRenderPipelineStateWithDescriptor:m error:&e];
         dispatch_semaphore_signal(g_mtk_sem);
         int left = atomic_fetch_sub(&g_mtk_inflight, 1) - 1;
@@ -1123,6 +1210,7 @@ static void mtk_kick(id m, const pso_key *pk, NvShader *ts, NvShader *ms, NvShad
         if (mtk_pace()) { if (!g_mtk_ready) g_mtk_ready = [NSMutableArray array]; [g_mtk_ready addObject:@[[NSData dataWithBytes:&kk length:sizeof kk], p ? (id)p : NSNull.null]]; }   // held: mtk_publish delivers
         else if (hm_get_id(&g_pso_mtk, &kk) == g_pso_mtk_building) hm_put_id(&g_pso_mtk, &kk, p ?: NSNull.null);   // the prewarm may have handed one over meanwhile: keep that one
         os_unfair_lock_unlock(&g_pso_mtk_lock);
+        if (p && need_up && !mtk_pace()) mtk_opt_upgrade(m, pk_copy, ts, ms, fs, merged, has_fsfn, names, kk, p);
     } });
 }
 // A draw that cannot be skipped waits on the submit thread for its pipeline's background build until it is ready, capped only by the stuck-compiler limit every other draw that cannot
@@ -1205,7 +1293,7 @@ static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
         if (mk.emu) { MTLRenderPipelineDescriptor *d = pso_desc(k, nil, fs, g_pso_fsfn, merged); d.vertexFunction = g_mtk.emu_fn; d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle; m = d; }
         else m = mtk_desc(k, ts, ms, fs, pf, merged, g_pso_fsfn);
         NSString *names = [NSString stringWithFormat:@"task %s mesh %s%s fragment %s", ts ? ts->key : "-", ms->key, mk.emu ? " (host stages)" : pf ? " (padded)" : "", fs ? fs->key : "-"];
-        mtk_kick(m, k, ts, ms, fs, merged, g_pso_fsfn != nil, names, &mk);
+        mtk_kick(m, k, ts, ms, fs, merged, g_pso_fsfn != nil, names, &mk, why != NULL);
         if (!mk.emu) mtk_record(&mk, ts, ms, fs, merged);   // 请求编译时就记：只在一小段画面里用到、又编得慢的管线（0400486024DEC000 一段事件里那条 2 秒的），等它编好那笔已不再画，「第一次画出」时记就永远进不了种子
     }
     if (!why) return nil;   // building in the background, and this draw may wait for it

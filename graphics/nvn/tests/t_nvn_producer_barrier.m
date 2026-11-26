@@ -165,13 +165,21 @@ int main(int argc,char **argv) {
         add_seven(out); finish(); pixels(out,0xff4d3721u+7);
 
         if(barrier_game()) {
-            // Every NVN game barrier forces a full consumer barrier in draw_barriers=game mode.
+            // In draw_barriers=game mode, fragment-only ordering/invalidate bits stay relaxed, while primitive/indirect ordering forces a full consumer barrier.
             nvn_be_sub_begin();
             color(target,data); // establishes g_last_end_relaxed=1
             uint64_t skip0=g_bar_skip, full0=g_bar_full;
-            g_game_barrier=1;
+            g_game_barrier=NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_INVALIDATE_TEXTURE_BIT;
             color(target,data);
-            CHECK(g_bar_full==full0+1 && g_bar_skip==skip0,"game NVN barrier forces full consumer barrier");
+            CHECK(g_bar_skip==skip0+1 && g_bar_full==full0,"fragment-only NVN barrier keeps relaxed consumer skip");
+            skip0=g_bar_skip; full0=g_bar_full;
+            g_game_barrier=NVN_BARRIER_ORDER_INDIRECT_DATA_BIT;
+            color(target,data);
+            CHECK(g_bar_full==full0+1 && g_bar_skip==skip0,"indirect NVN barrier forces full consumer barrier");
+            skip0=g_bar_skip; full0=g_bar_full;
+            g_game_barrier=NVN_BARRIER_ORDER_PRIMITIVES_BIT;
+            color(target,data);
+            CHECK(g_bar_full==full0+1 && g_bar_skip==skip0,"primitive NVN barrier forces full consumer barrier");
             CHECK(g_last_end_relaxed,"relaxed draw pass end still tracks same-CB chaining");
             main_barrier_reset();
             CHECK(!g_last_end_relaxed,"main_barrier_reset clears relaxed end across CB/submission boundaries");

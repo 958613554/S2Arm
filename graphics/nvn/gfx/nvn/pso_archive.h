@@ -252,6 +252,14 @@ static id<MTLBinaryArchive> par_archive_for(NSString *key) {
     pthread_mutex_unlock(&g_par_mu);
     return a;
 }
+static BOOL par_has_key(NSString *key) {
+    par_open_dir();
+    if (!g_par_on || !key) return NO;
+    pthread_mutex_lock(&g_par_mu);
+    BOOL have = (g_par_bhave && [g_par_bhave containsObject:key]) || (g_par_have && [g_par_have containsObject:key]);
+    pthread_mutex_unlock(&g_par_mu);
+    return have;
+}
 static void par_drop(NSString *key) {   // its file did not give the pipeline (another package's libraries under the same key): written again by the next write
     pthread_mutex_lock(&g_par_mu); [g_par_open removeObjectForKey:key]; [g_par_have removeObject:key];
     BOOL batched = g_par_bmap[key] != nil; [g_par_bmap removeObjectForKey:key]; pthread_mutex_unlock(&g_par_mu);

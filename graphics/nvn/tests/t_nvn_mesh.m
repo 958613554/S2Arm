@@ -493,10 +493,17 @@ int main(void) {
                  "        uint idx = (w >> ((dm_lid & 3u) * 8u)) & 0xffu;\n"
                  "        dm_out.set_index(dm_lid, idx);\n"
                  "    }\n"
-                 "}\n";
+                 "}\n"
+                 "\n#ifdef S2A_MESH_EMU\n"
+                 "kernel void main0_mc(uint dm_lid [[thread_index_in_threadgroup]], device uint* dm_xo [[buffer(28)]])\n"
+                 "{\n"
+                 "    if (dm_lid == 0u) dm_xo[0] = 0u;\n"
+                 "}\n"
+                 "#endif\n";
             NSString *fSrc16 =
                 @"#include <metal_stdlib>\n"
                  "using namespace metal;\n"
+                 "struct main0_out_u { uint4 c0 [[color(0)]]; };\n"
                  "struct main0_in\n"
                  "{\n"
                  "    float4 a0 [[user(locn0)]];\n"
@@ -511,6 +518,10 @@ int main(void) {
                  "    float s = in.a0.x + in.a0.y + in.a0.z + in.a0.w + in.a1.x + in.a1.y + in.a1.z + in.a1.w +\n"
                  "              in.a2.x + in.a2.w + in.a3.x + in.a3.w + in.a4.y + in.a4.z + in.a5.y + in.a5.w;\n"
                  "    return fabs(s - 5.75) < 0.01 ? float4(1.0) : float4(1.0, 0.0, 0.0, 1.0);\n"
+                 "}\n"
+                 "[[early_fragment_tests]] fragment main0_out_u main0_u(main0_in in [[stage_in]])\n"
+                 "{\n"
+                 "    return main0_out_u{uint4(1)};\n"
                  "}\n";
 
             int dev16 = 0, bstore16 = 0;

@@ -1969,7 +1969,8 @@ static void sub_cut_begin(void);   // the segment draw count starts with the sub
 static void dsnap_stale(void);   // #387 (with fb_prepare)
 static void up_pool_trim(void);   // upload staging pool (with up_flush)
 static void pool_age(void);   // below (with gmem_scan)
-static int g_dsp_game_bar, g_game_barrier;   // g_game_barrier: the game issued nvnCommandBufferBarrier since the last draw pass began
+static int g_dsp_game_bar;
+static uint32_t g_game_barrier;   // pending NVN barrier bits issued since the last draw pass began (draw_barriers=game)
 void nvn_be_sub_begin(void) {
     adhoc_drop();   // 上一次提交里地址兜底登记的池（addr_adhoc）
     dsnap_stale();   // #387: depth may change between submissions (CPU writes, other queues)
@@ -2243,13 +2244,21 @@ static inline void enc_c_table(id e, id t) { if (!g_m3) [(id<MTL4ComputeCommandE
 static inline void m3_bind_draw(id e) { m3_table_apply(e, 0, g_m3_tab[0]); m3_table_apply(e, 1, g_m3_tab[1]); }
 static inline void m3_bind_dispatch(id e) { m3_table_apply(e, 2, g_m3_tab[2]); }
 static inline void m3_bind_mesh(id e) { m3_table_apply(e, 1, g_m3_tab[1]); m3_table_apply(e, 3, g_m3_tab[3]); m3_table_apply(e, 4, g_m3_tab[4]); }   // a task / mesh draw: fragment, object, mesh (no vertex stage)
+#define BAR_FRAG_ONLY_BITS ((uint32_t)(NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT | NVN_BARRIER_INVALIDATE_TEXTURE_BIT | \
+    NVN_BARRIER_INVALIDATE_SHADER_BIT | NVN_BARRIER_INVALIDATE_TEXTURE_DESCRIPTOR_BIT | NVN_BARRIER_INVALIDATE_ZCULL_BIT))
+static int bar_frag_skip_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_NVN_BAR_FRAG_SKIP"); v = !(e && !strcmp(e, "0")); }
+    return v;
+}
 static inline id<MTL4RenderCommandEncoder> enc_r_begin_pass(MTL4RenderPassDescriptor *d) {   // the draw passes (rp_begin_ex); see barrier_game
     if (!g_rlane) geo_run_flush();
     enc_close_blit();
     g_half_mask_sent = -1;
     gp_pre(d, 'R');   // Metal 3: the sample points go on the pass descriptor before the encoder is made (no-op elsewhere)
     id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d]; fault_enc_pass(e, d);
-    int relaxed = g_last_end_relaxed && !g_game_barrier;
+    int frag_only = g_game_barrier && bar_frag_skip_on() && !(g_game_barrier & ~BAR_FRAG_ONLY_BITS);
+    int relaxed = g_last_end_relaxed && (!g_game_barrier || frag_only);
     int full = !relaxed;
     if (g_m3) m3_wait(e, 1, relaxed);
     else full = main_barrier_begin(e, relaxed);
@@ -12319,6 +12328,13 @@ static NSArray<WarmTask *> *warm_parse(NSArray<NSString *> *paths, long *lines) 
           if (drop.count) { MLOG("pipeline prewarm: %lu unpadded task / mesh lines dropped (the same pair has a padded line: the unpadded one was refused)", (unsigned long)drop.count);
                             [tasks removeObjectsAtIndexes:drop]; n -= (long)drop.count; }
       } }
+    // Prioritize task/mesh pipelines (M rows) at the front of the prewarm queue so heavy mesh shaders warm before thousands of R rows.
+    { NSMutableArray<WarmTask *> *mfirst = [NSMutableArray arrayWithCapacity:tasks.count];
+      for (WarmTask *t in tasks) if (t->kind == 4) [mfirst addObject:t];
+      if (mfirst.count && mfirst.count < tasks.count) {
+          for (WarmTask *t in tasks) if (t->kind != 4) [mfirst addObject:t];
+          tasks = mfirst;
+      } }
     *lines = n; return tasks;
 }
 // 预热插队（11-06 卡顿线，异度3 测试设备1 冷装读档）：清单按录制局「首次用到的先后」排，读档直接进的场景，它的管线在 12796 行的清单里排第 12679–12744 行；
@@ -12334,7 +12350,7 @@ static _Atomic uint64_t g_wu_bumped, g_wu_taken;                        // 放�
 static void warm_urgent_index(NSArray<WarmTask *> *tasks) {
     NSMutableDictionary<NSString *, NSMutableArray<NSNumber *> *> *m = [NSMutableDictionary dictionary];
     NSMutableDictionary<NSData *, NSNumber *> *rows = [NSMutableDictionary dictionary];
-    for (NSUInteger i = 0; i < tasks.count; i++) { WarmTask *t = tasks[i]; if (t->kind != 1) continue;
+    for (NSUInteger i = 0; i < tasks.count; i++) { WarmTask *t = tasks[i]; if (t->kind != 1 && t->kind != 4) continue;
         NSString *k = [NSString stringWithFormat:@"%@|%@", t->vkey, t->fkey ?: @""];
         NSMutableArray *a = m[k]; if (!a) m[k] = a = [NSMutableArray array]; [a addObject:@(i)];
         for (NSData *r in t->rs) if (!rows[r]) rows[r] = @(i); }
@@ -17053,7 +17069,7 @@ static void ixc_prefetch(void) {
     const uint8_t *q; op_hdr h; const void *a;
     uint64_t ulo[64], uhi[64]; int nu = 0; int ubd = ubd_on();
     for (int guard = 0; guard < 4096 && fz_next(&cur, &q, &h, &a); guard++) {
-        if (h.op == OP_DISPATCH || h.op == OP_COPY_B2B || h.op == OP_CLEAR_BUF || h.op == OP_COPY_T2B || h.op == OP_BARRIER || h.op == OP_WAIT_SYNC || h.op == OP_FENCE_SYNC) break;
+        if (h.op == OP_DISPATCH || h.op == OP_COPY_B2B || h.op == OP_CLEAR_BUF || h.op == OP_COPY_T2B || h.op == OP_WAIT_SYNC || h.op == OP_FENCE_SYNC) break;
         if (h.op == OP_SET_RT) {
             p_set_rt rb; const p_set_rt *r = set_rt_rec(a, h.size, &rb);
             if (!r || !rt_same(&R.rt, r)) break;
@@ -19899,7 +19915,7 @@ void nvn_be_exec(const uint8_t *p) {
                 int split = g_enc && g_pass_swrite && (bits & (NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT));
                 PD("I %llu barrier bits %#x%s", g_stat_pass, bits, split ? ": ends the pass (shader writes)" : g_enc ? " (render pass open)" : "");
                 if (split) { rp_end(); static int once; if (!once++) MLOG("a game barrier (bits %#x) after shader writes in a draw pass: the pass ends there (first case pass %llu)", bits, (unsigned long long)g_stat_pass); }
-                if (bits) { g_game_barrier = 1; g_dsp_game_bar = 1; } break; }   // g_dsp_game_bar：下一次派发要排在之前的派发后面（disp_hits）
+                if (bits) { g_game_barrier |= (uint32_t)bits; g_dsp_game_bar = 1; } break; }   // g_dsp_game_bar：下一次派发要排在之前的派发后面（disp_hits）
             case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: state_op(h.op, a, h.size); break;
             default: break;
         }
