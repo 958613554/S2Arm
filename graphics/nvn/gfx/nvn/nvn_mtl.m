@@ -12806,23 +12806,35 @@ static int tex_storage_live(const treg_t *r) {
 // A handle read from game memory may name any registered texture, and on the console that costs nothing: the data is in the pool and a handle is a number. Here each is a Metal texture beside
 // the pool's copy, and making them all took Ocarina of Time past Metal's working set on a 16 GB Mac (upstream: 12.1 GB, once a kernel panic at 14.7 GB wired). Shaders read few of them:
 // a shader's read sets the ID's bit (pool_seen) and those are made whatever the budget, up to POOL_REQ_BYTES a frame (a budget without this left out exactly the large textures those
-// shaders read: scenery in shadow near black, upstream). The smallest textures are made up front, POOL_FRAME_BYTES a frame up to a twentieth of the working set, as a pass that
-// runs once (a bake) has no second frame to find its texture in. A read of the rest finds the dummy until the next submission folds its bit
+// shaders read: scenery in shadow near black, upstream). The smallest textures are made up front, POOL_FRAME_BYTES a frame while what the GPU really holds stays under half the working
+// set (and, where known, memory headroom above mem_margin), as a pass that runs once (a bake) has no second frame to find its texture in, and a texture registered while the game streams
+// is read the frame it arrives. A read of the rest finds the dummy until the next submission folds its bit.
+// The limit used to be device-allocated bytes under a twentieth of the working set, but currentAllocatedSize counts every zero-copy wrap of game memory (several times over, see
+// nocopy_buf): in play it was over that twentieth always (player diagnostics: 0.7–6.8 GB against a few hundred MB), nothing was made up front, and each newly streamed texture
+// showed the dummy for a frame before the seen scan made it
 enum { POOL_FRAME_BYTES = 32u << 20, POOL_REQ_BYTES = 128u << 20 };
 static uint64_t g_walk_frame = ~0ull, g_walk_spent, g_walk_req;
 static uint64_t pool_tex_size(const tex_t *t) { return t->L.size ? t->L.size : 1; }
-static uint64_t pool_budget(void) { return g_dev.recommendedMaxWorkingSetSize / 20; }
 uint64_t s2a_gpu_alloc_bytes(void) {   // 浮层「GPU 已分配」（runtime/src/hud.c 弱定义）：设备总量减去零拷贝缓冲（游戏内存，已在进程实占里；nocopy_buf）
     if (!g_dev) return 0;
     uint64_t a = (uint64_t)g_dev.currentAllocatedSize, z = atomic_load(&g_nocopy_bytes);
     return a > z ? a - z : 0;
 }
 static void pool_walk_frame(void) { uint64_t f = atomic_load(&g_cur_frame); if (f != g_walk_frame) { g_walk_frame = f; g_walk_spent = 0; g_walk_req = 0; } }
-static uint64_t pool_room(void) {   // what may still be made up front this frame
+// What may still be made up front this frame: gpu = GPU allocation without the zero-copy wraps (s2a_gpu_alloc_bytes), ws = recommendedMaxWorkingSetSize, spent = made this frame
+// floor: the headroom made-up-front textures must leave. Not below what idle-texture reclaim brings headroom back to (2 × tex_reclaim_low, see tex_idle_reclaim):
+//   those textures sit in pool tables, which reclaim skips (tex_pinned), so making them between reclaim's threshold and its target pinned memory it could then not take back
+static uint64_t pool_avail_floor(uint64_t margin, uint64_t reclaim_low) { return 2 * reclaim_low > margin ? 2 * reclaim_low : margin; }
+static uint64_t pool_room_calc(uint64_t gpu, uint64_t ws, uint64_t spent, int has_avail, uint64_t avail, uint64_t floor) {
+    if (has_avail && avail <= floor) return 0;
+    uint64_t cap = ws / 2; if (gpu >= cap) return 0;
+    uint64_t head = cap - gpu, left = spent < POOL_FRAME_BYTES ? POOL_FRAME_BYTES - spent : 0;
+    return head < left ? head : left;
+}
+static uint64_t pool_room(void) {
     pool_walk_frame();
-    uint64_t want = pool_budget(), have = g_dev.currentAllocatedSize, room = have < want ? want - have : 0;
-    uint64_t left = g_walk_spent < POOL_FRAME_BYTES ? POOL_FRAME_BYTES - g_walk_spent : 0;
-    return room < left ? room : left;
+    uint64_t avail = 0; int has = mem_avail(&avail);
+    return pool_room_calc(s2a_gpu_alloc_bytes(), (uint64_t)g_dev.recommendedMaxWorkingSetSize, g_walk_spent, has, avail, pool_avail_floor(mem_margin(), tex_reclaim_low()));
 }
 // A render target no pass has written holds nothing to read, and a pass makes its texture when it renders. Made for a read, one that only registers next frame's target took three times the
 // textures and 17 GB allocated on Ocarina of Time (upstream): the game re-registers its IDs with transient targets, whose IDs a shader read as the previous texture
@@ -13221,8 +13233,8 @@ static uint64_t pool_gpu(int samp, int dtt, int dpf, int rw, int base, __unsafe_
         for (int s = 0; s < 2; s++) if (g_pdirty[s].n) {
             uint32_t m = g_pdirty[s].n; uint32_t *ids = malloc(m * sizeof *ids); if (!ids) break;
             memcpy(ids, g_pdirty[s].list, m * sizeof *ids); pool_dset_clear(&g_pdirty[s]);
-            uint64_t room = s ? 0 : pool_room();
-            for (uint32_t j = 0; j < m; j++) { g_pool_upd_dirty++; if (s) pool_samp_update((int)ids[j]); else { int lr = pool_tex_update((int)ids[j], room); if (lr == 1) pool_dset_add(&g_pleft, (int)ids[j]); else if (lr == 2) pool_dset_add(&g_punwritten, (int)ids[j]); } }
+            uint64_t room0 = s ? 0 : pool_room(), spent0 = g_walk_spent;   // once a batch (headroom and device size are system calls); each texture then takes what the batch made so far off it
+            for (uint32_t j = 0; j < m; j++) { g_pool_upd_dirty++; if (s) pool_samp_update((int)ids[j]); else { uint64_t used = g_walk_spent - spent0, room = room0 > used ? room0 - used : 0; int lr = pool_tex_update((int)ids[j], room); if (lr == 1) pool_dset_add(&g_pleft, (int)ids[j]); else if (lr == 2) pool_dset_add(&g_punwritten, (int)ids[j]); } }
             free(ids);
         }
         pool_unwritten_scan();
