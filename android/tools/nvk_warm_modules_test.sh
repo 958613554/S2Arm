@@ -296,7 +296,7 @@ print('PASS: nowindow installer leaves accepted; external, cyclic, absolute, buc
 
 prog_cache, pipe_warm = repo/'android/native/direct/program_cache.c', repo/'android/native/nvn/nvn_vk_pipe_warm.c'
 cases = [   # (名字, 被改文件, 改动, 必须出现在红因里的片段)
-    ('program-plain-open', prog_cache, [('int fd = installed ? s2a_installed_seed_open(path) : open(path, O_RDONLY | O_CLOEXEC);', 'int fd = installed ? open(path, O_RDONLY | O_CLOEXEC) : open(path, O_RDONLY | O_CLOEXEC);')],
+    ('program-plain-open', prog_cache, [('int fd = installed ? s2a_installed_seed_open(path) : idx_open(dir, identity, path);', 'int fd = installed ? open(path, O_RDONLY | O_CLOEXEC) : idx_open(dir, identity, path);')],
      'program result: expected rejected'),     # 程序结果改回普通 open：库外 / 绝对链接照收
     ('pipe-plain-read', pipe_warm, [('int rc = pw_read_file(seed_path, 1, &buf, &bytes, &se);', 'int rc = pw_read_file(seed_path, 0, &buf, &bytes, &se);')],
      'installer leaves'),                       # 管线读退回普通 open：碰到安装器相对链接的 ELOOP，补件整份读不到
