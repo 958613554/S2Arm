@@ -79,6 +79,51 @@ int main(void) { @autoreleasepool {
     arena_begin(); h0 = g_drv_cache_hits;
     args_dirty_all(); encode_args(nil, ds, 1, 0);
     VERIFY(g_drv_cache_hits == h0, "⑦d 换暂存代号（arena_begin）后重编：缓存失效（+%llu）", (unsigned long long)(g_drv_cache_hits - h0));
+    // ⑧ 带 NVN_RB_PUSH / NVN_RB_TEXP 的着色器只换 cb0 走打补丁；同名 push 重复写入不脏 g_args_dirty；改 push 或 g_psnap_gen 前进时退回整块重编
+    NvShader *ps = cb_shader(NVN_RB_PUSH); ps->rf.b[2].reg = 0;
+    uint32_t pv1[4] = {1, 2, 3, 4}, pv2[4] = {5, 6, 7, 8};
+    p_push_const_ptr pp = {.compute = 0, .slot = 0, .offset = 0, .size = sizeof pv1, .data = (uint64_t)(uintptr_t)pv1};
+    state_op(OP_PUSH_CONST_PTR, &pp, sizeof pp);
+    bind_cb0((uint64_t)(uintptr_t)pool, 4096); args_dirty_all(); encode_args(nil, ps, 1, 0);
+    uint64_t push_ptr = slot(ps, 2);
+    // 重复写相同 push 字节：不脏 g_args_dirty，再换 cb0 仍走打补丁
+    state_op(OP_PUSH_CONST_PTR, &pp, sizeof pp);
+    e0 = g_stat_args_enc; p0 = g_stat_args_patch;
+    bind_cb0((uint64_t)(uintptr_t)pool + 4096, 512); encode_args(nil, ps, 1, 0);
+    VERIFY(g_stat_args_patch == p0 + 1 && g_stat_args_enc == e0 && slot(ps, 2) == push_ptr && slot(ps, 0) == A + 4096,
+           "⑧a PUSH 着色器（同值 push + 换 cb0）：打补丁 +%llu、整块 +%llu（期望 1 / 0）、push 槽位保持不变",
+           (unsigned long long)(g_stat_args_patch - p0), (unsigned long long)(g_stat_args_enc - e0));
+    // 写不同 push 字节：脏 g_args_dirty，退回整块重编并更新 push 槽位
+    pp.data = (uint64_t)(uintptr_t)pv2; state_op(OP_PUSH_CONST_PTR, &pp, sizeof pp);
+    e0 = g_stat_args_enc; p0 = g_stat_args_patch;
+    bind_cb0((uint64_t)(uintptr_t)pool + 8192, 512); encode_args(nil, ps, 1, 0);
+    VERIFY(g_stat_args_enc == e0 + 1 && g_stat_args_patch == p0 && slot(ps, 2) != push_ptr,
+           "⑧b PUSH 着色器（新值 push + 换 cb0）：整块 +%llu、打补丁 +%llu（期望 1 / 0）、push 槽位更新",
+           (unsigned long long)(g_stat_args_enc - e0), (unsigned long long)(g_stat_args_patch - p0));
+    // ⑨ 带 NVN_RB_TEXP（贴图池）的着色器：池建表并完成首次 pool_seen_scan 后只换 cb0 走打补丁；g_psnap_gen 或 g_ser_gen 前进时退回整块重编
+    NvShader *tp = cb_shader(NVN_RB_TEXP); tp->rf.pool = 1; tp->rf.b[2].dtt = (uint8_t)MTLTextureType2D; tp->rf.b[2].dpf = NVN_DPF_FLOAT;
+    bind_cb0((uint64_t)(uintptr_t)pool, 4096); args_dirty_all(); encode_args(nil, tp, 1, 0);   // 建表 0（g_ptab_any 0→1）
+    args_dirty_all(); encode_args(nil, tp, 1, 0);   // 同步 pool_seen_scan（g_seen_sub / g_seen_ser）
+    uint64_t pool_ptr = slot(tp, 2);
+    e0 = g_stat_args_enc; p0 = g_stat_args_patch;
+    bind_cb0((uint64_t)(uintptr_t)pool + 4096, 512); encode_args(nil, tp, 1, 0);
+    VERIFY(g_stat_args_patch == p0 + 1 && g_stat_args_enc == e0 && slot(tp, 2) == pool_ptr,
+           "⑨a TEXP 贴图池着色器只换 cb0：打补丁 +%llu、整块 +%llu（期望 1 / 0）、池地址不变",
+           (unsigned long long)(g_stat_args_patch - p0), (unsigned long long)(g_stat_args_enc - e0));
+    g_psnap_gen++;
+    e0 = g_stat_args_enc; p0 = g_stat_args_patch;
+    bind_cb0((uint64_t)(uintptr_t)pool + 8192, 512); encode_args(nil, tp, 1, 0);
+    VERIFY(g_stat_args_enc == e0 + 1 && g_stat_args_patch == p0,
+           "⑨b TEXP 池快照代号前进后换 cb0：整块 +%llu、打补丁 +%llu（期望 1 / 0）",
+           (unsigned long long)(g_stat_args_enc - e0), (unsigned long long)(g_stat_args_patch - p0));
+    if (!g_seen_buf) g_seen_buf = [g_dev newBufferWithLength:POOL_SEEN_WORDS * 4 options:MTLResourceStorageModeShared];
+    g_seen_sub = g_sub_serial; g_seen_ser = g_ser_gen;
+    g_ser_gen++;   // 模拟贴图升级或未写目标刚被渲染遍写入：不能跳过 pool_gpu()
+    e0 = g_stat_args_enc; p0 = g_stat_args_patch;
+    bind_cb0((uint64_t)(uintptr_t)pool + 12288, 512); encode_args(nil, tp, 1, 0);
+    VERIFY(g_stat_args_enc == e0 + 1 && g_stat_args_patch == p0,
+           "⑨c TEXP 在 g_ser_gen 前进后换 cb0：不跳过 pool_gpu（整块 +%llu、打补丁 +%llu，期望 1 / 0）",
+           (unsigned long long)(g_stat_args_enc - e0), (unsigned long long)(g_stat_args_patch - p0));
   }
     printf("%s t_nvn_args_patch：%u 项，失败 %u\n", failures ? "✗" : "✓", checks, failures); return failures ? 1 : 0;
 }
