@@ -367,7 +367,7 @@ class Secrets:
             raise Failure("钥匙串在这个会话里读不了（ssh 等没有图形界面的会话里登录钥匙串是锁的）：请在这台 Mac 的图形会话里运行，或先解锁登录钥匙串。",
                           code="devcert_keychain")
         if r.returncode:
-            raise Failure(f"读钥匙串里的证书密码失败（security 退出 {r.returncode}）：{(r.stderr or '').strip()[-200:]}", code="devcert_keychain")
+            raise Failure(f"读钥匙串里的证书密码失败（security 退出 {r.returncode}）：{(r.stderr or '').strip()[-200:]}", code="devcert_keychain")  # 非玩家句
         try:
             return base64.b64decode(r.stdout.strip(), validate=True).decode("utf-8")
         except ValueError:
