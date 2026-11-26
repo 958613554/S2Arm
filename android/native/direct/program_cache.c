@@ -222,6 +222,11 @@ static int idx_lookup(const char *dir, const uint8_t id[32]) {
     pthread_mutex_unlock(&g_idx_mu);
     return r;
 }
+// 本机缓存目录里的条目只读打开：索引确定没有就不碰文件系统，按 ENOENT 返回（与真 open 落空走同一条报告路径）
+static int idx_open(const char *dir, const uint8_t id[32], const char *path) {
+    if (idx_lookup(dir, id) == 0) { errno = ENOENT; return -1; }
+    return open(path, O_RDONLY | O_CLOEXEC);
+}
 static void idx_note_stored(const char *dir, const uint8_t id[32]) {
     pthread_mutex_lock(&g_idx_mu);
     if (g_idx.state == 1 && !strcmp(g_idx.dir, dir) && idx_insert_locked(id)) g_idx.state = -1;   // 记不下就整体退回逐次 open，不漏报
@@ -240,12 +245,7 @@ static int program_cache_load(const char *dir, const uint8_t identity[32],
     char path[PCACHE_PATH];
     if (entry_path(dir, identity, path, sizeof path)) { setwhy(why, why_size, "缓存路径过长"); return -1; }
 
-    if (!installed && idx_lookup(dir, identity) == 0) {   // 目录索引确定没有这个文件：不 open，按未命中报（同 ENOENT）
-        atomic_fetch_add(&g_misses, 1);
-        setwhy(why, why_size, "未命中");
-        return -1;
-    }
-    int fd = installed ? s2a_installed_seed_open(path) : open(path, O_RDONLY | O_CLOEXEC);
+    int fd = installed ? s2a_installed_seed_open(path) : idx_open(dir, identity, path);
     if (fd < 0) {
         atomic_fetch_add(&g_misses, 1);
         setwhy(why, why_size, errno == ENOENT ? "未命中" : "打开失败：%s", strerror(errno));
@@ -344,8 +344,7 @@ int s2a_program_cache_probe(const char *dir, const uint8_t identity[32],
     if (!dir || !*dir || !identity || !result_sha || !len) { setwhy(why, why_size, "参数缺失"); return -1; }
     char path[PCACHE_PATH];
     if (entry_path(dir, identity, path, sizeof path)) { setwhy(why, why_size, "缓存路径过长"); return -1; }
-    if (idx_lookup(dir, identity) == 0) { setwhy(why, why_size, "未命中"); return 1; }   // 目录索引确定没有：同 ENOENT
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    int fd = idx_open(dir, identity, path);
     if (fd < 0) {
         if (errno == ENOENT) { setwhy(why, why_size, "未命中"); return 1; }   // 没有这个身份的文件：与「文件坏」分开返回（调用方分开计数）
         setwhy(why, why_size, "打开失败：%s", strerror(errno)); return -1;
