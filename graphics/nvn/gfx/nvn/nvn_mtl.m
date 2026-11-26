@@ -9942,6 +9942,14 @@ static uint64_t g_tex_mis_n, g_tex_mis_shown;
 static int tex_mis_placeholder(uint64_t serial, unsigned long w, unsigned long h, unsigned long d, unsigned long layers, unsigned long levels) {
     return serial && serial < 64 && w <= 4 && h <= 4 && d <= 1 && layers <= 1 && levels <= 1;
 }
+// A 3D texture in a slot the shader declares 2D / 2D array: the game left another draw's 3D texture bound (one title's layout UI shader, 2cb15d249f23ab19, keeps an 8x8x8 R11G11B10F
+//   3D texture, a colour-grading lookup table, in its third texture slot; the dialog window it draws is intact on screen). Metal has no 2D view of a 3D texture, so the slot reads 0;
+//   Ryujinx binds nothing there either (Texture.GetTargetTexture: IsSameDimensionsTarget is false for 3D against 2D) and reads 0 too. A plain line naming that, not a red one, so red
+//   stays for what needs looking at. Narrow on purpose: the other way round, a 2D texture read as 3D, the hardware samples the texture's own texels (#674, the tex3d bridge copies
+//   them), so a 2D-in-3D slot left without the bridge stays red, as do buffer textures, 1D and multisample mismatches. Pure, t_nvn_tex_mis_placeholder tests it
+static int tex_mis_3d_in_2d(unsigned long want, unsigned long have) {
+    return have == MTLTextureType3D && (want == MTLTextureType2D || want == MTLTextureType2DArray);
+}
 uint64_t mtl_tex_mis_count(void) { return g_tex_mis_n; }
 static void tex_mis_note(NvShader *sh, int stage, int slot, int tid, id<MTLTexture> t, MTLTextureType want, const char *outcome) {
     g_tex_mis_n++;
@@ -9953,11 +9961,12 @@ static void tex_mis_note(NvShader *sh, int stage, int slot, int tid, id<MTLTextu
     if (t.textureType == MTLTextureTypeTextureBuffer) snprintf(bt, sizeof bt, ", %lu elements at pool offset %lu, %lu past the linear-texture alignment", (unsigned long)t.width, (unsigned long)t.bufferOffset,
                                                                 (unsigned long)(t.bufferOffset % [g_dev minimumLinearTextureAlignmentForPixelFormat:t.pixelFormat]));
     int ph = tt && tex_mis_placeholder(tt->serial, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth, (unsigned long)t.arrayLength, (unsigned long)t.mipmapLevelCount);
+    int d3 = tt && !ph && tex_mis_3d_in_2d((unsigned long)want, (unsigned long)t.textureType);
     // 尺寸与创建序号一并打出（11-19 定性：红行里约 56% 是开局占位小贴图；有一款游戏的 ID 263 不算占位、原因读不出——序号 ≥ 64 还是比 4x4 大，下一批诊断看这里）
     MLOG("%stexture type mismatch: shader %s (stage %d) declares slot %d as Metal type %lu, texture ID %d is type %lu (NVN target %d, format %#x, Metal format %lu, serial %llu, %lux%lux%lu, layers %lu, levels %lu%s); %s%s",
-         ph ? "" : "【红】 ", sh->key, stage, slot, (unsigned long)want, tid, (unsigned long)t.textureType, tt ? (int)tt->d.target : -1, tt ? (unsigned)tt->d.format : 0u, (unsigned long)t.pixelFormat,
+         ph || d3 ? "" : "【红】 ", sh->key, stage, slot, (unsigned long)want, tid, (unsigned long)t.textureType, tt ? (int)tt->d.target : -1, tt ? (unsigned)tt->d.format : 0u, (unsigned long)t.pixelFormat,
          tt ? (unsigned long long)tt->serial : 0ull, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth, (unsigned long)t.arrayLength, (unsigned long)t.mipmapLevelCount, bt, outcome,
-         ph ? " (the game's start-up placeholder texture)" : "");
+         ph ? " (the game's start-up placeholder texture)" : d3 ? " (游戏绑了不同维度的贴图：3D 贴图在声明 2D 的槽，Ryujinx 同样不绑、读 0；真机可能取第 0 层)" : "");
 }
 // Alpha from red: the fragment shaders the game profile's alpha_from_red lists read a single-channel render target whose channel mapping is exactly (R, 0, 0, 1) as (R, 0, 0, R).
 // A workaround for NintendoWare layout captures (BotW, Odyssey): the game rebuilds each capture on the same storage with its own mapping ((1, 1, 1, R) for an A8 capture), which was lost while
