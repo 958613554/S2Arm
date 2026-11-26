@@ -658,8 +658,10 @@ static id mtk_warm(const pso_skey *sk, NSString *mkey, NSString *fkey, NSString 
     if (pad && !(pf = vp_warm(ms, pad))) return nil;   // the padded variant: made now from this device's translation on disk (vp_warm); none there yet: the draw makes it (vp_ask)
     mtk_key mk; mtk_warm_key(sk, ts, ms, fs, pad, &mk);
     if (mk.k.fc && fs && !se_warm(fs, mk.k.fc)) return nil;   // a sampler-emulation variant this device has not made yet (as R rows)
+    MTLMeshRenderPipelineDescriptor *m = mtk_desc(&mk.k, ts, ms, fs, pf, 0, nil);
+    NSString *akey = par_mkey(&mk.k, ts, ms, fs, pad, 0, nil);
     NSError *e = nil; uint64_t t0 = bp_now();
-    id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithMeshDescriptor:mtk_desc(&mk.k, ts, ms, fs, pf, 0, nil) options:MTLPipelineOptionNone reflection:nil error:&e];
+    id<MTLRenderPipelineState> p = par_mesh(m, akey, &e);
     if (!p) { MLOG("【红】 prewarm: task / mesh pipeline refused (task %s mesh %s fragment %s): %s", ts ? ts->key : "-", ms->key, fs ? fs->key : "-", e.localizedDescription.UTF8String); return nil; }
     NSString *names = [NSString stringWithFormat:@"task %s mesh %s%s fragment %s", ts ? ts->key : "-", ms->key, pf ? " (padded)" : "", fs ? fs->key : "-"];
     os_unfair_lock_lock(&g_pso_mtk_lock); if (!g_mtk_names) g_mtk_names = [NSMapTable strongToStrongObjectsMapTable]; [g_mtk_names setObject:names forKey:p]; os_unfair_lock_unlock(&g_pso_mtk_lock);
@@ -676,14 +678,14 @@ static void mtk_warm_claim(NSData *key, id ps) {   // submit thread (warm_claim)
 //   could not wait behind every other pipeline queued before it)
 static int mtk_width(void) { static int w; if (!w) { const char *e = getenv("DM_NVN_MESH_PAR"); int n = (int)NSProcessInfo.processInfo.activeProcessorCount; w = e && atoi(e) > 0 ? atoi(e) : n > 4 ? n - 2 : 2; MLOG("task / mesh pipelines: built in the background %d at a time (DM_NVN_MESH_PAR)", w); } return w; }
 static dispatch_semaphore_t g_mtk_sem;
-static void mtk_kick(id m, NSString *names, const mtk_key *key) {   // m: a mesh pipeline descriptor, or (#770 host stages) an ordinary one
+static void mtk_kick(id m, NSString *akey, NSString *names, const mtk_key *key) {   // m: a mesh pipeline descriptor, or (#770 host stages) an ordinary one
     mtk_key kk = *key;
     atomic_fetch_add(&g_mtk_inflight, 1);
     if (!g_mtk_q) { g_mtk_q = dispatch_queue_create("dm.nvn.mesh", s2a_qos_queue_attr(DISPATCH_QUEUE_CONCURRENT, S2A_QOS_SHADER_VARIANT)); g_mtk_group = dispatch_group_create(); g_mtk_sem = dispatch_semaphore_create(mtk_width()); }
     dispatch_group_async(g_mtk_group, g_mtk_q, ^{ @autoreleasepool {
         dispatch_semaphore_wait(g_mtk_sem, DISPATCH_TIME_FOREVER);
         NSError *e = nil; uint64_t t0 = bp_now();
-        id<MTLRenderPipelineState> p = [m isKindOfClass:[MTLMeshRenderPipelineDescriptor class]] ? [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionNone reflection:nil error:&e]
+        id<MTLRenderPipelineState> p = [m isKindOfClass:[MTLMeshRenderPipelineDescriptor class]] ? par_mesh((MTLMeshRenderPipelineDescriptor *)m, akey, &e)
                                                                                                  : [g_dev newRenderPipelineStateWithDescriptor:m error:&e];
         dispatch_semaphore_signal(g_mtk_sem);
         int left = atomic_fetch_sub(&g_mtk_inflight, 1) - 1;
@@ -777,7 +779,8 @@ static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
         if (mk.emu) { MTLRenderPipelineDescriptor *d = pso_desc(k, nil, fs, g_pso_fsfn, merged); d.vertexFunction = g_mtk.emu_fn; d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle; m = d; }
         else m = mtk_desc(k, ts, ms, fs, pf, merged, g_pso_fsfn);
         NSString *names = [NSString stringWithFormat:@"task %s mesh %s%s fragment %s", ts ? ts->key : "-", ms->key, mk.emu ? " (host stages)" : pf ? " (padded)" : "", fs ? fs->key : "-"];
-        mtk_kick(m, names, &mk);
+        NSString *akey = mk.emu ? nil : par_mkey(k, ts, ms, fs, mk.pad, merged, g_pso_fsfn);
+        mtk_kick(m, akey, names, &mk);
         if (!mk.emu) mtk_record(&mk, ts, ms, fs, merged);   // 请求编译时就记：只在一小段画面里用到、又编得慢的管线（0400486024DEC000 一段事件里那条 2 秒的），等它编好那笔已不再画，「第一次画出」时记就永远进不了种子
     }
     if (!why) return nil;   // building in the background, and this draw may wait for it
@@ -1145,7 +1148,7 @@ static int mesh_run_plain(const p_draw *dw, const p_draw_idx *di) {
     return 1;
 }
 static int mesh_run_lane2(int on) {
-    if (on) { if (!g_gr.active) return 0; geo_lane(2); if (!g_enc) { g_game_barrier = 1; g_bar_bits = ~0u; main_barrier_reset(); } return 1; }   // the main pass opened in lane 2 waits for everything before it: the host stages in lane 1
+    if (on) { if (!g_gr.active) return 0; geo_lane(2); if (!g_enc) { g_game_barrier = 1; main_barrier_reset(); } return 1; }   // the main pass opened in lane 2 waits for everything before it: the host stages in lane 1
     geo_lane(0); if (!g_gr.active) { static int said; if (!said++) MLOG("【红】 task / mesh draw: the geometry run ended inside its main-pass draw"); }
     return 0;
 }
@@ -1405,7 +1408,7 @@ static void geo_draw(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0) {
     }
     g_geo_program = raster; g_geo_indices = fast ? map : packed; g_geo_index_bytes = fast ? words * 4 : packed_size; g_geo_args = args;   // fast: the input primitives' capture indices (map) are the main pass's
     p_draw synthetic = {.prim = gs->geo_output == 1 ? 0 : gs->geo_output == 6 ? 1 : 4, .count = 3, .instances = 1, .base_instance = (int32_t)first_instance};
-    if (run) { geo_lane(2); if (!g_enc) { g_game_barrier = 1; g_bar_bits = ~0u; main_barrier_reset(); } }   // the main pass opened in lane 2 waits for everything before it: the compactions in lane 1
+    if (run) { geo_lane(2); if (!g_enc) { g_game_barrier = 1; main_barrier_reset(); } }   // the main pass opened in lane 2 waits for everything before it: the compactions in lane 1
     draw(&synthetic, NULL);
     if (run) { geo_lane(0); if (!g_gr.active) MDIE("geometry run ended inside its draw's main-pass draw"); }
     g_geo_program = nil; args_dirty_all();

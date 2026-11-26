@@ -270,6 +270,7 @@ static void par_write(NSString *key, id desc) {
         id<MTLBinaryArchive> a = [g_dev newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&e];
         // 加管线 / 序列化不取 error（见 par_write_batch：Metal 失败路径交回的 error 是失效指针，读它就崩）
         ok = a && ([desc isKindOfClass:MTLRenderPipelineDescriptor.class] ? [a addRenderPipelineFunctionsWithDescriptor:desc error:nil]
+                                                                          : [desc isKindOfClass:MTLMeshRenderPipelineDescriptor.class] ? [a addMeshRenderPipelineFunctionsWithDescriptor:desc error:nil]
                                                                           : [a addComputePipelineFunctionsWithDescriptor:desc error:nil]);
         if (ok && ![a serializeToURL:[NSURL fileURLWithPath:temp] error:nil]) { ok = NO; atomic_fetch_add(&g_par_ser_failed, 1); }
         if (ok) ok = rename(temp.fileSystemRepresentation, path.fileSystemRepresentation) == 0;
@@ -308,7 +309,7 @@ static void par_write_batch(NSArray<NSArray *> *items) {
         // 加管线与序列化不取 error（11-23 #756 根修）：唯一留下现场的那次真崩 = serializeToURL:error: 失败返回后 ARC retain 写回的 NSError 时总线错——
         //   Metal 在失败路径交回的 error 指针返回那一刻就已失效，读它（哪怕只是 ARC 的写回 retain）就崩。失败只看返回值、计数（g_par_ser_failed），这一批下次再写
         for (NSArray *it in todo) { id desc = it[1];
-            BOOL one = a && ([desc isKindOfClass:MTLRenderPipelineDescriptor.class] ? [a addRenderPipelineFunctionsWithDescriptor:desc error:nil] : [a addComputePipelineFunctionsWithDescriptor:desc error:nil]);
+            BOOL one = a && ([desc isKindOfClass:MTLRenderPipelineDescriptor.class] ? [a addRenderPipelineFunctionsWithDescriptor:desc error:nil] : [desc isKindOfClass:MTLMeshRenderPipelineDescriptor.class] ? [a addMeshRenderPipelineFunctionsWithDescriptor:desc error:nil] : [a addComputePipelineFunctionsWithDescriptor:desc error:nil]);
             if (one) [keys addObject:it[0]]; else atomic_fetch_add(&g_par_write_failed, 1); }
         if (keys.count && ![a serializeToURL:[NSURL fileURLWithPath:temp] error:nil]) atomic_fetch_add(&g_par_ser_failed, 1);
         else if (keys.count) ok = rename(temp.fileSystemRepresentation, path.fileSystemRepresentation) == 0;
@@ -463,6 +464,37 @@ static id<MTLRenderPipelineState> par_render(MTLRenderPipelineDescriptor *d, NSS
     if (par_fl_enter(key, &got, &mine) && got) return got;
     ParSlow *sw = par_slow_begin(key, "render", [NSString stringWithFormat:@"%@ %@", d.vertexFunction.name ?: @"-", d.fragmentFunction.name ?: @"-"]);
     id<MTLRenderPipelineState> ps = par_render_(d, key, e);
+    par_slow_end(sw, ps != nil);
+    par_fl_leave(key, mine, ps);
+    return ps;
+}
+static id<MTLRenderPipelineState> par_mesh_(MTLMeshRenderPipelineDescriptor *m, NSString *key, NSError **e) {
+    id<MTLBinaryArchive> b = par_bundle_for(key);
+    if (b) {
+        m.binaryArchives = @[b];
+        id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:nil];
+        m.binaryArchives = nil;
+        if (ps) { par_count(1); return ps; }
+    }
+    id<MTLBinaryArchive> a = par_archive_for(key);
+    if (a) {
+        m.binaryArchives = @[a];
+        id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:nil];
+        m.binaryArchives = nil;
+        if (ps) { par_count(1); return ps; }
+        par_drop(key);
+    }
+    if (key && g_par_on) par_count(0);
+    id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionNone reflection:nil error:e];
+    if (ps && key && g_par_on) { if (g_par_harvest) par_write(key, m); else par_note(key, m); }
+    return ps;
+}
+// Build a task / mesh pipeline through the archive. key = par_mkey(...), nil = not archived.
+static id<MTLRenderPipelineState> par_mesh(MTLMeshRenderPipelineDescriptor *m, NSString *key, NSError **e) {
+    id got; ParFlight *mine;
+    if (par_fl_enter(key, &got, &mine) && got) return got;
+    ParSlow *sw = par_slow_begin(key, "mesh", [NSString stringWithFormat:@"%@ %@ %@", m.objectFunction.name ?: @"-", m.meshFunction.name ?: @"-", m.fragmentFunction.name ?: @"-"]);
+    id<MTLRenderPipelineState> ps = par_mesh_(m, key, e);
     par_slow_end(sw, ps != nil);
     par_fl_leave(key, mine, ps);
     return ps;

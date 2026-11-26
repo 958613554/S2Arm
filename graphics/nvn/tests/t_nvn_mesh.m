@@ -387,6 +387,45 @@ int main(void) {
             cols = frame_columns();
             VERIFY(cols == 0, "⑭ 无任务直跑网格 first=1024 count=4：提交无报错、列掩码 %#x（期望 0）", cols);
         }
+
+        // ⑮ 任务 / 网格管线二进制归档（par_mkey + par_mesh → MTLBinaryArchive 落盘并命中；mtk_pso 重用同一份）
+        {
+            pso_key pk15; memset(&pk15, 0, sizeof pk15);
+            pso_key_fill(&pk15, md, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, 0);
+            memset(pk15.attr, 0, sizeof pk15.attr); memset(pk15.stream, 0, sizeof pk15.stream);
+            NSString *k15 = par_mkey(&pk15, nil, md, fs, 0, 0, nil);
+            VERIFY(k15 && [k15 hasPrefix:@"m"], "⑮ par_mkey 产出带前缀的网格管线归档键（%s）", k15 ? k15.UTF8String : "-");
+
+            MTLMeshRenderPipelineDescriptor *d15a = mtk_desc(&pk15, nil, md, fs, nil, 0, nil);
+            NSError *e15 = nil;
+            uint64_t h0 = atomic_load(&g_par_hits), m0 = atomic_load(&g_par_misses), sf0 = atomic_load(&g_par_ser_failed), wf0 = atomic_load(&g_par_write_failed);
+            int had = g_par_have && [g_par_have containsObject:k15];
+            id<MTLRenderPipelineState> ps15a = par_mesh(d15a, k15, &e15);
+            VERIFY(ps15a != nil && (had || atomic_load(&g_par_misses) == m0 + 1), "⑮ par_mesh 首次建管线成功（archive had=%d, misses +%llu）", had, (unsigned long long)(atomic_load(&g_par_misses) - m0));
+            par_write(k15, mtk_desc(&pk15, nil, md, fs, nil, 0, nil));
+            VERIFY(atomic_load(&g_par_ser_failed) == sf0 && atomic_load(&g_par_write_failed) == wf0 && [g_par_have containsObject:k15],
+                   "⑮ addMeshRenderPipelineFunctionsWithDescriptor + serializeToURL 写盘成功（ser_fail=%llu write_fail=%llu）",
+                   (unsigned long long)(atomic_load(&g_par_ser_failed) - sf0), (unsigned long long)(atomic_load(&g_par_write_failed) - wf0));
+
+            MTLMeshRenderPipelineDescriptor *d15b = mtk_desc(&pk15, nil, md, fs, nil, 0, nil);
+            uint64_t h1 = atomic_load(&g_par_hits);
+            id<MTLRenderPipelineState> ps15b = par_mesh(d15b, k15, &e15);
+            VERIFY(ps15b != nil && atomic_load(&g_par_hits) == h1 + 1, "⑮ par_mesh 二次经 MTLBinaryArchive 直接命中（hits +%llu, before_first=%llu）",
+                   (unsigned long long)(atomic_load(&g_par_hits) - h1), (unsigned long long)h0);
+
+            if (ps15b) {
+                mtk_key mk15; memset(&mk15, 0, sizeof mk15); mk15.k = pk15; mk15.ts = NULL;
+                os_unfair_lock_lock(&g_pso_mtk_lock);
+                hm_put_id(&g_pso_mtk, &mk15, ps15b);
+                os_unfair_lock_unlock(&g_pso_mtk_lock);
+                frame_begin(); S.prog = &gp[0]; int w15 = 0;
+                p_draw dw15 = {.prim = DM_PRIM_MESH_TASKS, .first = 4, .count = 2, .instances = 1};
+                mesh_draw(&dw15, &w15);
+                int cols15 = frame_columns();
+                VERIFY(cols15 == 0x30, "⑮ 归档命中的网格管线绘制列 4..5（列掩码 %#x，期望 0x30）", cols15);
+            }
+            [NSFileManager.defaultManager removeItemAtPath:@(pdir) error:nil];
+        }
     }
     if (failures) { printf("✗ t_nvn_mesh：%u 项里 %u 项不符\n", checks, failures); return 1; }   // 原生门禁按「✓ t_ / ✗ t_」逐组判
     printf("✓ t_nvn_mesh：%u 项全过（任务 / 网格绘制：约定字段载入、上限报红、无顶点阶段的程序、直接 / 有任务 / GPU 写参数的间接 / 零工作量画出的列与手算一致、缺网格着色器报红、映射表阶段名 task / mesh 载入、无网格管线的 GPU 跳过报红）\n", checks); return 0;

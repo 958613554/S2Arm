@@ -1969,11 +1969,12 @@ static void sub_cut_begin(void);   // the segment draw count starts with the sub
 static void dsnap_stale(void);   // #387 (with fb_prepare)
 static void up_pool_trim(void);   // upload staging pool (with up_flush)
 static void pool_age(void);   // below (with gmem_scan)
+static int g_dsp_game_bar;
 void nvn_be_sub_begin(void) {
     adhoc_drop();   // 上一次提交里地址兜底登记的池（addr_adhoc）
     dsnap_stale();   // #387: depth may change between submissions (CPU writes, other queues)
     mtl_init(); g_sub_serial++; pthread_mutex_lock(&g_mu); pool_reap(0, 0); pool_age(); pthread_mutex_unlock(&g_mu); g_pkg_epoch++;   // pool_reap：游戏已释放、回放用完的池；pool_age：久不取址的池出驻留集
-    wd_sub_begin(); g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL; rc_retire(); g_rc_npend = 0; g_rc_skip = 0;
+    wd_sub_begin(); g_seg = 0; g_dsp_game_bar = 0; seg_clk_put(g_sclk); g_sclk = NULL; rc_retire(); g_rc_npend = 0; g_rc_skip = 0;
     up_pool_trim();   // the staging pool's idle blocks go 5 s after their last use, whether or not anything uploads again
     defer_drain();
     rh_trim();   // 回收贴图堆：等太久 / 超量的出驻留集
@@ -2027,14 +2028,7 @@ static void ser_gate(void) {
 static int g_pass_swrite;   // the open draw pass has shader writes (swrite_note)
 static void img_wr_upgrade(void); static int g_imwr_npend;   // textures bound to an image slot without the shader-write usage (img_wr_note), upgraded before the next pass or dispatch
 static void img_fit_upgrade(void); static int g_imfit_npend;   // textures an image slot needs a format view of (img_fit), upgraded before the next draw pass opens
-enum { NVN_BAR_FRAG_ONLY_MASK = NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT | NVN_BARRIER_INVALIDATE_TEXTURE_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT | NVN_BARRIER_INVALIDATE_TEXTURE_DESCRIPTOR_BIT | NVN_BARRIER_INVALIDATE_ZCULL_BIT };
 static int g_last_end_relaxed, g_game_barrier;   // the last encoder ended was a draw pass with the relaxed end barrier (nothing else since); the game issued nvnCommandBufferBarrier since the last draw pass began
-static uint32_t g_bar_bits;                      // accumulated NVN_BARRIER_* bits since the last draw pass began
-static int g_bar_frag_skip_on = -1;
-static int bar_frag_skip_on(void) {
-    if (g_bar_frag_skip_on < 0) { const char *e = getenv("DM_NVN_BAR_FRAG_SKIP"); g_bar_frag_skip_on = !(e && !strcmp(e, "0")); }
-    return g_bar_frag_skip_on;
-}
 static uint64_t g_bar_skip, g_bar_full;            // draw entries without / with consumer (relaxed mode or proven full producer coverage)
 static void gp_end(id e);
 // Metal 3 (#278): the old encoders have no queue barriers. Every encoder of g_q3 waits for g_fence3 when it begins (m3_wait) and updates it when it ends (m4_end), so each one runs after
@@ -2076,7 +2070,7 @@ static int g_bar_main_full;
 static uint64_t g_bar_covered;
 static int producer_cover_on(void) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("DM_NVN_PRODUCER_COVER"); on = e && !strcmp(e, "1"); }
+    if (on < 0) { const char *e = getenv("DM_NVN_PRODUCER_COVER"); on = e && *e ? !strcmp(e, "1") : !TARGET_OS_IPHONE; }
     return on;
 }
 static void main_barrier_reset(void) { g_bar_main_cb = g_bar_main_encoder = nil; g_bar_main_full = 0; }
@@ -2255,13 +2249,12 @@ static inline id<MTL4RenderCommandEncoder> enc_r_begin_pass(MTL4RenderPassDescri
     g_half_mask_sent = -1;
     gp_pre(d, 'R');   // Metal 3: the sample points go on the pass descriptor before the encoder is made (no-op elsewhere)
     id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d]; fault_enc_pass(e, d);
-    int frag_only = g_game_barrier && bar_frag_skip_on() && (g_bar_bits & ~(uint32_t)NVN_BAR_FRAG_ONLY_MASK) == 0;
-    int relaxed = g_last_end_relaxed && (!g_game_barrier || frag_only);
+    int relaxed = g_last_end_relaxed && !g_game_barrier;
     int full = !relaxed;
     if (g_m3) m3_wait(e, 1, relaxed);
     else full = main_barrier_begin(e, relaxed);
     if (full) g_bar_full++; else g_bar_skip++;
-    g_game_barrier = 0; g_bar_bits = 0;
+    g_game_barrier = 0;
     enc_r_table(e, g_vt, MTLRenderStageVertex); enc_r_table(e, g_ft, MTLRenderStageFragment); gp_begin(e, 'R', d); return e;
 }
 static inline void enc_r_end_pass(id e) {
@@ -2404,7 +2397,7 @@ static uint64_t g_bw_lo[BW_MAX], g_bw_hi[BW_MAX], g_br_lo[BW_MAX], g_br_hi[BW_MA
 // 按游戏屏障排序的派发上次屏障以来写过 / 读过的范围（disp_note），与拷贝的表分开：之后的拷贝要排在它们后面，之后的派发只在游戏要求时（g_dsp_game_bar）排。
 //   每次屏障、每个新拷贝编码器清空；DM_NVN_DISPATCH_RANGE=0 / range 时不用（马车世界缺口 ⑥，照上游参考实现（MIT）547c5db6）
 enum { DW_MAX = 256 };
-static uint64_t g_dw_lo[DW_MAX], g_dw_hi[DW_MAX], g_dr_lo[DW_MAX], g_dr_hi[DW_MAX]; static int g_dw_n, g_dr_n, g_dsp_game_bar;
+static uint64_t g_dw_lo[DW_MAX], g_dw_hi[DW_MAX], g_dr_lo[DW_MAX], g_dr_hi[DW_MAX]; static int g_dw_n, g_dr_n;
 static uint64_t g_blit_splits;   // copies / buffer updates / fills that ended an open draw pass (the residency set line; a pass ended this way stores and the next one reloads its attachments)
 uint64_t nvn_be_blit_splits(void) { return g_blit_splits; }
 static int enc_open(void);
@@ -8447,6 +8440,16 @@ static NSString *par_rkey(const pso_key *k, NvShader *vs, NvShader *fs, int merg
     if (fsfn || merged) return nil;
     pso_skey sk; pso_skey_from(k, vs, fs, 0, NULL, &sk); return par_hash(&sk, sizeof sk);
 }
+static NSString *par_mkey(const pso_key *k, NvShader *ts, NvShader *ms, NvShader *fs, uint32_t pad, int merged, id fsfn) {
+    if (fsfn || merged || !ms) return nil;
+    struct { pso_skey sk; char tkey[24]; uint32_t pad; uint16_t mthr, tthr, tpay; uint8_t trelay; } b;
+    memset(&b, 0, sizeof b);
+    pso_skey_from(k, ms, fs, 0, NULL, &b.sk);
+    if (ts && ts->key[0]) memcpy(b.tkey, ts->key, strnlen(ts->key, sizeof b.tkey));
+    b.pad = pad; b.mthr = ms->mesh_threads;
+    if (ts) { b.tthr = ts->mesh_threads; b.tpay = ts->mesh_payload; b.trelay = ts->mesh_relay; }
+    return [@"m" stringByAppendingString:par_hash(&b, sizeof b)];
+}
 static NSString *par_ckey(NvShader *cs, int fc) {   // fc: the pipeline is of the sampler-emulation variant with these SE_* bits (dispatch, se_want): another archive entry from main0's
     if (!cs || !cs->key[0]) return nil;
     size_t n = strnlen(cs->key, sizeof cs->key); char b[sizeof cs->key + 2]; memcpy(b, cs->key, n);
@@ -10647,6 +10650,7 @@ static void prog_resolve(void) {
 }
 static void state_reset(void) {
     memset(&S, 0, sizeof S);
+    g_dsp_game_bar = 0;
     g_pso_dirty = g_dss_dirty = 1;
     for (int i = 0; i < 8; i++) S.blend[i] = (blend_st){i, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_EQUATION_ADD, NVN_BLEND_EQUATION_ADD};
     S.color = (color_st){0, NVN_LOGIC_OP_COPY, NVN_ALPHA_FUNC_ALWAYS}; S.chmask.mask = 0xffffffffu;
@@ -18384,28 +18388,43 @@ static int disp_hits(const disp_rng *rg) {
     for (int i = 0; i < rg->nw; i++) if (bw_hit(rg->wlo[i], rg->whi[i]) || br_hit(rg->wlo[i], rg->whi[i])) return 1;
     return 0;
 }
-static void dw_put(uint64_t *lo, uint64_t *hi, int *n, uint64_t a, uint64_t b) { for (int k = 0; k < *n; k++) if (lo[k] == a && hi[k] == b) return; lo[*n] = a; hi[(*n)++] = b; }   // 同一段不重记：粒子系统共用它们的表
+static void dw_put(uint64_t *lo, uint64_t *hi, int *n, uint64_t a, uint64_t b) { for (int k = 0; k < *n; k++) if (lo[k] == a && hi[k] == b) return; if (*n >= DW_MAX) return; lo[*n] = a; hi[(*n)++] = b; }   // 同一段不重记：粒子系统共用它们的表
 static void disp_note(const disp_rng *rg) {   // 记下这次派发的读写范围（屏障之后表是空的，放得下）
     if (disp_mode() == 2) {
-        for (int i = 0; i < rg->nw; i++) dw_put(g_dw_lo, g_dw_hi, &g_dw_n, rg->wlo[i], rg->whi[i]);
-        for (int i = 0; i < rg->nr; i++) dw_put(g_dr_lo, g_dr_hi, &g_dr_n, rg->rlo[i], rg->rhi[i]);
+        if (!(g_dw_n == 1 && g_dw_lo[0] == 0 && g_dw_hi[0] == ~0ull)) {
+            for (int i = 0; i < rg->nw; i++) dw_put(g_dw_lo, g_dw_hi, &g_dw_n, rg->wlo[i], rg->whi[i]);
+            for (int i = 0; i < rg->nr; i++) dw_put(g_dr_lo, g_dr_hi, &g_dr_n, rg->rlo[i], rg->rhi[i]);
+        }
         g_blit_ops++; return;
     }
     for (int i = 0; i < rg->nw; i++) { g_bw_lo[g_bw_n] = rg->wlo[i]; g_bw_hi[g_bw_n++] = rg->whi[i]; }
     for (int i = 0; i < rg->nr; i++) { g_br_lo[g_br_n] = rg->rlo[i]; g_br_hi[g_br_n++] = rg->rhi[i]; }
     g_blit_ops++;
 }
+static int disp_need_barrier(const disp_rng *rg) {
+    if (!g_blit_ops) return 0;
+    if (rg) return disp_hits(rg);
+    if (disp_mode() == 2) {
+        if (g_dsp_game_bar) { g_disp_gbar++; return 1; }
+        return g_bw_n > 0 || g_br_n > 0;
+    }
+    return 1;
+}
 static id<MTL4ComputeCommandEncoder> dispatch_enc(const disp_rng *rg) {
     blit_open_k(1);   // Metal 3: a compute encoder (blit_open_k)
     if ((g_disp_ranged + g_disp_full) && !((g_disp_ranged + g_disp_full) % 20000)) MLOG("compute dispatches: read / write ranges known for %llu (no barrier before %llu of them, a barrier of the game's before %llu), not known for %llu (barrier before each)", (unsigned long long)g_disp_ranged, (unsigned long long)g_disp_nobar, (unsigned long long)g_disp_gbar, (unsigned long long)g_disp_full);
     if (rg) {
         g_disp_ranged++;
-        if (g_blit_ops && disp_hits(rg)) blit_barrier(); else if (g_blit_ops) g_disp_nobar++;
+        if (disp_need_barrier(rg)) blit_barrier(); else if (g_blit_ops) g_disp_nobar++;
         disp_note(rg);
     } else {
-    g_disp_full++;
-    if (g_blit_ops) blit_barrier();
-    g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1;   // recorded as "everything written": the next copy or dispatch gets a barrier
+        g_disp_full++;
+        if (disp_need_barrier(NULL)) blit_barrier(); else if (g_blit_ops) g_disp_nobar++;
+        if (disp_mode() == 2) {
+            g_dw_lo[0] = 0; g_dw_hi[0] = ~0ull; g_dw_n = 1; g_dr_n = 0; g_blit_ops = 1;
+        } else {
+            g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1;   // recorded as "everything written": the next copy or dispatch gets a barrier
+        }
     }
     g_dsp_game_bar = 0;   // 游戏屏障只管到下一次派发
     if (!g_blit_ct) { enc_c_table(g_blit, g_ct); g_blit_ct = 1; }
@@ -19687,6 +19706,7 @@ void nvn_be_exec(const uint8_t *p) {
                 p = (const uint8_t *)t; list = p; prev = NULL; continue; }
             case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4);
                 if (m & NVN_EV_WAIT) { PD("Y wait_event cmd=%p dst=%p mode=%u value=%u now=%u", p, val, m & ~NVN_EV_WAIT, v, val ? *val : 0);   // nvnCommandBufferWaitEvent（同一记录，见 ev_wait）
+                    g_dsp_game_bar = 1;
                     if (ev_wait(val, m & ~NVN_EV_WAIT, v, p + h.size)) { PD("Y parked at the wait (cross-queue order)"); xq_unwind_push(p + h.size); g_exec_cur = NULL;
                         while (g_ret_n > base) xq_unwind_push(g_cstk_ret[--g_ret_n]);   // 各层调用方续点，里到外（同原先递归逐层返回）
                         return; }
@@ -19706,7 +19726,7 @@ void nvn_be_exec(const uint8_t *p) {
                 break; }
             case OP_WAIT_SYNC: { const sync_t *s; memcpy(&s, a, 8); void *ev; uint64_t v;   // another queue's fence: the queue waits for it before this submission commits (hle_nvn.c WaitSync)
                 if (s && sync_ext(s, &ev, &v)) queue_wait_event(ev, v);
-                g_pkg_epoch++;   // what the other queue wrote before its fence is visible after the wait: packaged textures are checked again
+                g_pkg_epoch++; g_dsp_game_bar = 1;   // what the other queue wrote before its fence is visible after the wait: packaged textures are checked again
                 PD("Y wait_sync cmd=%p sync=%p", p, (const void *)s); break; }
             case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); uint64_t fv = g_fence + 1; sync_publish(s, fv);   // the fence value this submission (segment) commits with
                 PD("Y fence_sync cmd=%p sync=%p fence=%llu", p, (void *)s, (unsigned long long)fv); break; }
@@ -19822,7 +19842,7 @@ void nvn_be_exec(const uint8_t *p) {
                 int split = g_enc && g_pass_swrite && (bits & (NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT));
                 PD("I %llu barrier bits %#x%s", g_stat_pass, bits, split ? ": ends the pass (shader writes)" : g_enc ? " (render pass open)" : "");
                 if (split) { rp_end(); static int once; if (!once++) MLOG("a game barrier (bits %#x) after shader writes in a draw pass: the pass ends there (first case pass %llu)", bits, (unsigned long long)g_stat_pass); }
-                if (bits) { g_game_barrier = 1; g_bar_bits |= (uint32_t)bits; g_dsp_game_bar = 1; } break; }   // g_dsp_game_bar：下一次派发要排在之前的派发后面（disp_hits）
+                if (bits) { g_game_barrier = 1; g_dsp_game_bar = 1; } break; }   // g_dsp_game_bar：下一次派发要排在之前的派发后面（disp_hits）
             case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: state_op(h.op, a, h.size); break;
             default: break;
         }

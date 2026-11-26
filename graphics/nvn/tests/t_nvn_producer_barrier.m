@@ -165,30 +165,13 @@ int main(int argc,char **argv) {
         add_seven(out); finish(); pixels(out,0xff4d3721u+7);
 
         if(barrier_game()) {
-            // Fragment-only barrier skip in draw_barriers=game mode.
+            // Every NVN game barrier forces a full consumer barrier in draw_barriers=game mode.
             nvn_be_sub_begin();
             color(target,data); // establishes g_last_end_relaxed=1
             uint64_t skip0=g_bar_skip, full0=g_bar_full;
-            g_game_barrier=1; g_bar_bits=NVN_BARRIER_ORDER_FRAGMENTS_BIT|NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT|NVN_BARRIER_INVALIDATE_TEXTURE_BIT;
+            g_game_barrier=1;
             color(target,data);
-            CHECK(g_bar_skip==skip0+1 && g_bar_full==full0,"fragment-only NVN barrier keeps relaxed entry in game mode");
-
-            skip0=g_bar_skip; full0=g_bar_full;
-            g_game_barrier=1; g_bar_bits=NVN_BARRIER_ORDER_PRIMITIVES_BIT;
-            color(target,data);
-            CHECK(g_bar_full==full0+1 && g_bar_skip==skip0,"primitive-order NVN barrier forces full consumer barrier");
-
-            skip0=g_bar_skip; full0=g_bar_full;
-            g_game_barrier=1; g_bar_bits=NVN_BARRIER_ORDER_INDIRECT_DATA_BIT;
-            color(target,data);
-            CHECK(g_bar_full==full0+1 && g_bar_skip==skip0,"indirect-data NVN barrier forces full consumer barrier");
-
-            skip0=g_bar_skip; full0=g_bar_full;
-            g_bar_frag_skip_on=0;
-            g_game_barrier=1; g_bar_bits=NVN_BARRIER_ORDER_FRAGMENTS_BIT;
-            color(target,data);
-            CHECK(g_bar_full==full0+1 && g_bar_skip==skip0,"DM_NVN_BAR_FRAG_SKIP=0 disables fragment-only skip");
-            g_bar_frag_skip_on=-1;
+            CHECK(g_bar_full==full0+1 && g_bar_skip==skip0,"game NVN barrier forces full consumer barrier");
             finish();
         }
 
