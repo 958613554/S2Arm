@@ -65,9 +65,14 @@ link=(xcrun --sdk macosx clang -mmacosx-version-min="$MACOSX_DEPLOYMENT_TARGET" 
     -Wl,-rpath,"$(dirname "$widen")" -framework AppKit -framework GameController -framework CoreHaptics -framework CoreBluetooth -framework IOKit -framework Metal -framework Foundation \
     -framework QuartzCore -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -lc++ \
     -framework Security -framework CoreFoundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -lcompression)
-printf '%s\0' "${link[@]}" > "$out/link.args0"   # 生成器拿同一条链接行做闭包实验
+printf '%s\0' "${link[@]}" > "$out/link.args0"   # 生成器拿同一条链接行做闭包实验（不带映射：生成器自己加）
+[[ "$gen" == 1 ]] || link+=(-Wl,-map,"$out/link.map")
 "${link[@]}"
-[[ "$gen" == 1 ]] || python3 graphics/nvn/tests/t_present_settings.py dyncheck "$list" "$out/t_present_settings"
+if [[ "$gen" != 1 ]]; then
+    # 链进来的静态库成员读的源文件 / 头文件都要在清单 lib 行（11-26：#2242 改 libnvn 的 nvn2_codec.c 不在本测输入里，没触发本测，下一笔背锅）
+    python3 graphics/nvn/tests/t_present_settings.py libcheck "$list" "$out/link.map" "$root" "$nvn" "$gal" "$dsx"
+    python3 graphics/nvn/tests/t_present_settings.py dyncheck "$list" "$out/t_present_settings" "$main_obj" "${objects[@]}" "$nvn" "$gal" "$dsx"
+fi
 shasum -a 256 "$root/graphics/nvn/tests/t_present_settings.m" "$root/graphics/nvn/tests/t_present_settings.sh" "$list" \
     "${objects[@]}" "$main_obj" "$nvn" "$gal" "$dsx" "$widen" "$out/t_present_settings" > "$out/link-inputs.sha256"
 if [[ "$gen" == 1 ]]; then printf 'present settings candidate build: %s\n' "$out/t_present_settings"; exit 0; fi
