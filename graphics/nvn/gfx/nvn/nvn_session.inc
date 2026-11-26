@@ -35,6 +35,8 @@ int nvn_be_present_shutdown(void) {
         if (g_present_layer_resident && !g_m3) [g_q4 removeResidencySet:g_present_layer_resident.residencySet];
     }
     g_present_layer_resident = nil;
+    atomic_store_explicit(&g_present_out_w, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_present_out_h, 0, memory_order_relaxed);
     return 0;
 }
 static int session_wait_backend(void) {

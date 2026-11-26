@@ -21650,6 +21650,11 @@ API_AVAILABLE(macos(26.0), ios(26.0)) static inline void m4_begin_on(id cb, id a
 API_AVAILABLE(macos(26.0), ios(26.0)) static inline id m4_render_on(id cb, id d) { return [(id<MTL4CommandBuffer>)cb renderCommandEncoderWithDescriptor:d]; }
 API_AVAILABLE(macos(26.0), ios(26.0)) static inline void m4_commit_one(id cb, id o) { id<MTL4CommandBuffer> b[] = {cb}; [g_q4 commit:b count:1 options:o]; }
 #include "nvn_present_fi.inc"   // 出图补帧（没有社区帧率补丁的 30 帧款缺省补到 60，开关按游戏）
+static _Atomic int g_present_out_w, g_present_out_h;   // Last presented source crop size (storage pixels) for HUD
+void nvn_be_present_out_size(int *w, int *h) {
+    if (w) *w = atomic_load_explicit(&g_present_out_w, memory_order_relaxed);
+    if (h) *h = atomic_load_explicit(&g_present_out_h, memory_order_relaxed);
+}
 static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
     if (mtl_gpu_halted()) { atomic_fetch_add_explicit(&g_gpu_refused, 1, memory_order_relaxed); return 0; }   // GPU 安全停：不取画布、不交上屏（调用方按「没交」把票记完成）
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
@@ -21687,6 +21692,12 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     int rsc[4]; if (crop && rs_src) {   // S2Arm internal resolution: a scaled present source takes the crop in storage texels
         long x = crop[0], y = crop[1], w = crop[2], h = crop[3]; if (!w && !h) { w = (long)cvw; h = (long)cvh; }
         rs_rect(rs_of(src), &x, &y, &w, &h); rsc[0] = (int)x; rsc[1] = (int)y; rsc[2] = (int)w; rsc[3] = (int)h; crop = rsc; }
+    int out_w = (int)(crop && (crop[2] || crop[3]) ? (NSUInteger)crop[2] : src.width);
+    int out_h = (int)(crop && (crop[2] || crop[3]) ? (NSUInteger)crop[3] : src.height);
+    if (out_w > 0 && out_h > 0) {
+        atomic_store_explicit(&g_present_out_w, out_w, memory_order_relaxed);
+        atomic_store_explicit(&g_present_out_h, out_h, memory_order_relaxed);
+    }
     // DM_NVN_REGLUM=x0,y0,x1,y1:file (normalized coordinates): read back this region on every present and record "present sequence number, present time ns, region mean luminance, subsampled grayscale thumbnail (hex)" (diagnostic: verify that animation speed is independent of frame rate).
     // Does not wait for the GPU and does not disturb frame pacing. Metal 4 with a window: the copy goes into this present's own command buffer, after the present blit and behind the same
     //   queue barrier, so the row is exactly the picture this present showed. A classic-queue command buffer (the only way before 11-06, still used without a window or on Metal 3) is not
