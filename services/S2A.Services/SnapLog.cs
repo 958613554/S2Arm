@@ -303,7 +303,48 @@ namespace S2A.Services
             if (n.EndsWith("LmLogger") && c == 0) return true;
             //   共享字体：取载入状态 / 字号 / 共享内存偏移 / 按优先级列字体 / 取字体信息（1 / 2 / 3 / 5 / 6）；取共享内存句柄（4）照常
             if (n.EndsWith("ISharedFontManager") && (c == 1 || c == 2 || c == 3 || c == 5 || c == 6)) return true;
+            //   网络连接请求 nifm IRequest 的取结果（1）：只回结果码。取请求状态（0）只有 Submit 之后第一次改状态（清挂起、发事件），由 NifmStateRule 按对象判；
+            //   取事件句柄（2）、取消（3）、提交（4）、设选项（11）照常记（D-NXYJ：哈迪斯离线轮询 nifm，开局 40 秒请求日志 128 MB / 63.8 万条，托管堆每 30 秒涨约 200 MB 到 abort）
+            if (NifmRulesOn && n.EndsWith("Nifm.StaticService.IRequest") && c == 1) return true;
             return false;
+        }
+        internal static bool NifmRulesOn = true;   // 单测负对照用：关掉就 nifm IRequest 的查询照常进日志
+        private static readonly HashSet<ReqTable.Key> _nifmSubmitted = new();   // Submit 过、还没被取过状态的 nifm 请求对象
+        // nifm IRequest：Submit（4）记下这个对象；取请求状态（0）只有对象 Submit 过、这是之后第一次时记（它清挂起、发事件，改状态），其余的重复查询不记
+        internal static bool NifmStateRule(string n, long cmd, ReqTable.Key key)
+        {
+            if (!NifmRulesOn || !n.EndsWith("Nifm.StaticService.IRequest")) return false;
+            uint c = (uint)cmd;
+            lock (_lock)
+            {
+                if (c == 4) { _nifmSubmitted.Add(key); return false; }
+                if (c == 0) return !_nifmSubmitted.Remove(key);   // 第一次：记；之后：不记
+            }
+            return false;
+        }
+        // 请求日志总上限（维护者 11-19「快照日志要有界」）：规则管不到的高频请求兜底。超了这一局放弃即时存档——红行、清空日志、停止记录，
+        //   不删条目（删了重放会错）。日志大小因此不超过 LogCapBytes + 一条
+        internal static long LogCapBytes = 96L << 20;
+        [DllImport("s2a_native")] private static extern void s2a_snap_disable(int why);
+        private const int SnapOffLogCap = 2;   // runtime/src/native.h S2A_SNAP_OFF_LOGCAP
+        private static bool _capped;
+        internal static bool Capped => _capped;
+        internal static bool CapReached(ReqTable tab, long cap) => tab.Bytes > cap;   // 纯判定，单测直接用
+        // 持 _lock 调：超上限就放弃本局即时存档。回 true = 已放弃（调用方本条不记）
+        private static bool CapLocked()
+        {
+            if (!CapReached(_tab, LogCapBytes)) return false;
+            if (!_capped)
+            {
+                _capped = true;
+                var top = new List<KeyValuePair<string, long>>(_bytesBy); top.Sort((x, y) => y.Value.CompareTo(x.Value));
+                var sb = new StringBuilder(); for (int i = 0; i < Math.Min(5, top.Count); i++) sb.Append($"{top[i].Key} {top[i].Value >> 10} KB×{_countBy[top[i].Key]}；");
+                Console.Error.WriteLine($"[s2a] 【红】即时存档：服务请求日志超过上限 {LogCapBytes >> 20} MB（{_tab.Count} 条），这一局放弃即时存档、清空日志、不再记（游戏照常玩）。占地最多：{sb}");
+                SnapSwitch.Save = false;
+                _tab.Clear(); _lastUpdate.Clear(); _lastMm.Clear(); _lastNvWait.Clear(); _nifmSubmitted.Clear();
+                try { s2a_snap_disable(SnapOffLogCap); } catch (DllNotFoundException) { } catch (EntryPointNotFoundException) { }
+            }
+            return true;
         }
 
         // 请求开始（游戏线程上，处理前）：回本条序号，不记回 -1
@@ -332,9 +373,10 @@ namespace S2A.Services
                 lock (_lock) { _lastMm.Remove((cookie, 2u, fid)); _lastMm.Remove((cookie, 6u, fid)); }   // Finalize 了这个请求号：之前留的最后一次设值作废（Finalize 本身照常进日志）
             _pendingNvMap = null;
             if (NvRule(n, num, cookie, cmd, msg, size)) { lock (_lock) { _dropped++; _dropBy[n + "#" + (uint)cmd] = _dropBy.GetValueOrDefault(n + "#" + (uint)cmd) + 1; } s2a_snap_hctx(-3); return -1; }
-            if (Drop(n, cmd) || DropNvSubmit(n, cmd, msg, size) || DropBinderQuery(n, cmd, msg, size)) { lock (_lock) { _dropped++; _dropBy[n + "#" + (uint)cmd] = _dropBy.GetValueOrDefault(n + "#" + (uint)cmd) + 1; } s2a_snap_hctx(-3); return -1; }
+            if (Drop(n, cmd) || DropNvSubmit(n, cmd, msg, size) || DropBinderQuery(n, cmd, msg, size) || NifmStateRule(n, cmd, TargetKey(cookie, msg, size, out _))) { lock (_lock) { _dropped++; _dropBy[n + "#" + (uint)cmd] = _dropBy.GetValueOrDefault(n + "#" + (uint)cmd) + 1; } s2a_snap_hctx(-3); return -1; }
             lock (_lock)
             {
+                if (_capped || CapLocked()) { s2a_snap_hctx(-3); return -1; }
                 int seq = _seq++; _kept++;
                 _pending = Serialize(seq, num, cookie, cmd, n, msg, size); _pendingIds?.Clear(); _pendingTipc = size >= 4 && (*(uint*)msg & 0xFFFF) >= 0x10;
                 _pendingKey = TargetKey(cookie, msg, size, out _pendingClose); _pendingSessions?.Clear();
@@ -642,7 +684,7 @@ namespace S2A.Services
         [UnmanagedCallersOnly(EntryPoint = "S2A_SnapSessionReset")]
         private static int SessionReset(int restoring)
         {
-            lock (_lock) { _tab.Clear(); _seq = 0; _kept = 0; _dropped = 0; _maxSeq = -1; _dropBy.Clear(); _lastUpdate.Clear(); _lastMm.Clear(); _lastNvWait.Clear(); _nvMapped.Clear(); _nvCookies.Clear(); }
+            lock (_lock) { _capped = false; _nifmSubmitted.Clear(); _tab.Clear(); _seq = 0; _kept = 0; _dropped = 0; _maxSeq = -1; _dropBy.Clear(); _lastUpdate.Clear(); _lastMm.Clear(); _lastNvWait.Clear(); _nvMapped.Clear(); _nvCookies.Clear(); }
             SnapSwitch.Save = SnapSwitch.CanSave && restoring == 0;
             return 0;
         }

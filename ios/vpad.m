@@ -594,6 +594,10 @@ static NSString *vp_running_gid(void) { const char *g = getenv("S2A_LAUNCH_GAME_
                   NSString *(^gb)(uint64_t) = ^NSString *(uint64_t b) { return [NSString localizedStringWithFormat:@"%.1f", b / 1073741824.0]; };
                   off.subtitle = [off.subtitle stringByAppendingString:[NSString stringWithFormat:S2AL(@"vpad.snap.offAddressNums"), gm ? gb(gm) : @"?", gb(sn), gb(hv)]]; }
               [items addObject:vp_inline(@[off])];
+          } else if (s2a_snap_off_reason && s2a_snap_off_reason() == 2) {   // 服务请求日志超过上限（SnapLog.LogCapBytes）：这一局放弃即时存档
+              UIAction *off = vp_act(S2AL(@"vpad.snap.save"), @"record.circle", NO, ^{});
+              off.attributes = UIMenuElementAttributesDisabled; off.subtitle = S2AL(@"vpad.snap.offLogCap");
+              [items addObject:vp_inline(@[off])];
           } } }
     [items addObject:[self sgradeSection]];
     UIAction *edit = vp_act(S2AL(@"vpad.edit.title"), @"gamecontroller", NO, ^{ [ws afterMenu:^{ [ws beginEditing]; }]; });
