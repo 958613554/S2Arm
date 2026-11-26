@@ -8717,7 +8717,10 @@ static NvShader *shader_build(NSString *pc, int stage, int layer, int depth_zero
             fb_compile_note(stl_now() - t0, pc); mnote = msl_note(pc, src); msrc = sp; }
         if (lib) MLOG("shader %s loaded from the fallback translation (%s)", pc.UTF8String, fb);
     }
-    if (!lib || !j) { MLOG("【红】 failed to load shader %s: %s", pc.UTF8String, e ? e.localizedDescription.UTF8String : "no reflection json"); return nil; }
+    if (!lib || !j) {   // the reason, never a bare miss: an empty library with no error used to read as "no reflection json" while the json was there (restore before mtl_init)
+        MLOG("【红】 failed to load shader %s: %s", pc.UTF8String, e ? e.localizedDescription.UTF8String : !jd ? "no reflection json (not in the library container)" : !j ? "reflection json unreadable"
+             : !g_dev ? "no Metal device yet" : "its library was not built (no error given)");
+        return nil; }
     if (![j[@"chain"] isEqual:@DMSH_CHAIN]) { MLOG("【红】 shader %s has translation chain version %s, but this host expects %s", pc.UTF8String, [[j[@"chain"] description] UTF8String], DMSH_CHAIN); return nil; }
     if (layer && !j[@"entry_layer"]) { MLOG("【红】 vertex shader %s has no layer entry points", pc.UTF8String); return nil; }
     NvShader *o = [NvShader new]; o->gs_loc = o->lay_loc = -1; o->pkg_lib = dir == g_msl_dir;
