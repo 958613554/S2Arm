@@ -20,7 +20,7 @@ index de1340554dad9f1fd1a9914177132e07a8885c12..a6527fd767375c045a93f891a16765ea
                      HudAudio(d.Index, gap * 1000 / d._rate, 0);
  
 diff --git a/src/Ryujinx.Audio/Renderer/Dsp/AudioProcessor.cs b/src/Ryujinx.Audio/Renderer/Dsp/AudioProcessor.cs
-index 7d834cf50ed07ffeb53b9d11f477334737e8ab0c..7f87e956af4858286f4ea7ba1934ca7692761ebd 100644
+index 7d834cf50ed07ffeb53b9d11f477334737e8ab0c..b04698f9ab2832d53f0fcbe6e56d7e35cf374f3c 100644
 --- a/src/Ryujinx.Audio/Renderer/Dsp/AudioProcessor.cs
 +++ b/src/Ryujinx.Audio/Renderer/Dsp/AudioProcessor.cs
 @@ -297,6 +297,21 @@ namespace Ryujinx.Audio.Renderer.Dsp
@@ -45,7 +45,13 @@ index 7d834cf50ed07ffeb53b9d11f477334737e8ab0c..7f87e956af4858286f4ea7ba1934ca76
          // S2Arm (11-22 门禁偶发红): 节拍读的钟与睡的钟。单测（S2A.Services.Tests AudioDepthPaceTest）换成可控的虚拟钟：
          //   原先单测用真墙钟，机器忙时测试线程分不到 CPU，假设备照墙钟吃帧、渲染跟不上，判据量到的是调度而不是节拍逻辑。
          //   S2ATestClock 为 null（宿主恒为 null）= 真墙钟；设了就由它给「现在」、由它「睡到」某一刻（虚拟钟直接把时间拨过去）
-@@ -383,6 +398,7 @@ namespace Ryujinx.Audio.Renderer.Dsp
+@@ -378,11 +393,13 @@ namespace Ryujinx.Audio.Renderer.Dsp
+             _s2aVirt = Math.Max(_s2aVirt, timeNow - 8 * increment);
+ 
+             bool catchUp = false;
++            bool drained = false;   // at most one drain per render (see _s2aDrain): with 4 credits saved up, one hitch would otherwise hold a render ~8 periods
+ 
+             if (++_s2aCatchUpTick >= S2ACatchUpEvery)
              {
                  _s2aCatchUpTick = 0;
                  _s2aCatchUp = Math.Min(_s2aCatchUp + 1, 4);
@@ -53,14 +59,15 @@ index 7d834cf50ed07ffeb53b9d11f477334737e8ab0c..7f87e956af4858286f4ea7ba1934ca76
              }
  
              while (true)
-@@ -402,6 +418,16 @@ namespace Ryujinx.Audio.Renderer.Dsp
+@@ -402,6 +419,17 @@ namespace Ryujinx.Audio.Renderer.Dsp
                      break;
                  }
  
 +                // Well above the target at the bound: hold one more period instead of rendering (see _s2aDrain)
-+                if (timeNow >= _s2aVirt + 4 * increment && buffered >= depthFrames + S2ADrainMargin(depthFrames) && _s2aDrain > 0)
++                if (timeNow >= _s2aVirt + 4 * increment && buffered >= depthFrames + S2ADrainMargin(depthFrames) && _s2aDrain > 0 && !drained)
 +                {
 +                    _s2aDrain--;
++                    drained = true;
 +                    _s2aVirt += increment;
 +                    Interlocked.Increment(ref S2ADrains);
 +

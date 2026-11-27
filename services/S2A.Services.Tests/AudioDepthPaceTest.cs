@@ -260,6 +260,31 @@ namespace S2A.Services.Tests
             p6.Stop();
             chain6.Dispose();
 
+            // ⑦ 退设备一次至多一拍（#2300 复审）：额度最多攒 4 个，平时在目标附近不用、攒满。卡顿 100 ms 后的第一拍若在同一次 Wait 里连退 4 次，
+            //   要到原定时刻后约 8 拍才渲染。稳态 200 拍（> 4 × 32，攒满）后卡顿，记卡顿后每一拍 Wait 的用时与该拍退设备次数：
+            //   期望每拍至多退 1 次、最长一拍用时 ≤ 5 拍 = 25 ms（上限 4 拍 + 退 1 拍）；负控：不限次数时第一拍退 4 次、用时 35 ms（#2300 复审前的实现实测）
+            var drv7 = new FakeDriver(false);
+            var p7 = new AudioProcessor();
+            IHardwareDeviceDriver chain7 = Chain(drv7);
+            p7.Start(chain7);
+            RenderN(p7, 200, drv7.Session0);
+            drv7.Session0.Hiccup(100_000_000L);
+            double maxWait7 = 0;
+            long maxDrain7 = 0;
+
+            for (int i = 0; i < 40; i++)
+            {
+                long d0 = Interlocked.Read(ref AudioProcessor.S2ADrains), t0 = Clock.NowNs();
+                Render(p7);
+                maxWait7 = Math.Max(maxWait7, (Clock.NowNs() - t0) / 1e6);
+                maxDrain7 = Math.Max(maxDrain7, Interlocked.Read(ref AudioProcessor.S2ADrains) - d0);
+            }
+
+            Row("⑦ 额度攒满后卡顿，每拍退设备次数最多", "≤ 1", maxDrain7.ToString(), maxDrain7 <= 1);
+            Row("⑦ 卡顿后 40 拍里最长一拍用时", "≤ 25 ms（至多晚 5 拍）", $"{maxWait7:F1} ms", maxWait7 <= 25);
+            p7.Stop();
+            chain7.Dispose();
+
             AudioProcessor.S2ATestClock = null;
             return bad == 0 ? 0 : 1;
         }

@@ -393,6 +393,7 @@ namespace Ryujinx.Audio.Renderer.Dsp
             _s2aVirt = Math.Max(_s2aVirt, timeNow - 8 * increment);
 
             bool catchUp = false;
+            bool drained = false;   // at most one drain per render (see _s2aDrain): with 4 credits saved up, one hitch would otherwise hold a render ~8 periods
 
             if (++_s2aCatchUpTick >= S2ACatchUpEvery)
             {
@@ -419,9 +420,10 @@ namespace Ryujinx.Audio.Renderer.Dsp
                 }
 
                 // Well above the target at the bound: hold one more period instead of rendering (see _s2aDrain)
-                if (timeNow >= _s2aVirt + 4 * increment && buffered >= depthFrames + S2ADrainMargin(depthFrames) && _s2aDrain > 0)
+                if (timeNow >= _s2aVirt + 4 * increment && buffered >= depthFrames + S2ADrainMargin(depthFrames) && _s2aDrain > 0 && !drained)
                 {
                     _s2aDrain--;
+                    drained = true;
                     _s2aVirt += increment;
                     Interlocked.Increment(ref S2ADrains);
 
