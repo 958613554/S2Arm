@@ -21646,6 +21646,12 @@ API_AVAILABLE(macos(26.0), ios(26.0)) static inline void m4_begin_on(id cb, id a
 API_AVAILABLE(macos(26.0), ios(26.0)) static inline id m4_render_on(id cb, id d) { return [(id<MTL4CommandBuffer>)cb renderCommandEncoderWithDescriptor:d]; }
 API_AVAILABLE(macos(26.0), ios(26.0)) static inline void m4_commit_one(id cb, id o) { id<MTL4CommandBuffer> b[] = {cb}; [g_q4 commit:b count:1 options:o]; }
 #include "nvn_present_fi.inc"   // 出图补帧（没有社区帧率补丁的 30 帧款缺省补到 60，开关按游戏）
+// 拿到 drawable 后编码失败、这一帧不呈现（调用方按「没提交」记完成）：原先一声不响，平台呈现回调永远不来，外面看到的只是「卡住」
+//   （11-27 上屏设置矩阵门禁偶发：第一帧 drawable 拿到、回调 30 秒不来）。打一行红点名哪一帧、哪条路；具体哪一步失败由编码函数自己的红行写
+static void present_dropped(uint64_t ticket, const char *path) {
+    static _Atomic int said;
+    if (atomic_fetch_add(&said, 1) < 8) MLOG("【红】 present ticket %llu: drawable taken but not presented (%s encode failed; the reason is the line above)", (unsigned long long)ticket, path);
+}
 static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
     if (mtl_gpu_halted()) { atomic_fetch_add_explicit(&g_gpu_refused, 1, memory_order_relaxed); return 0; }   // GPU 安全停：不取画布、不交上屏（调用方按「没交」把票记完成）
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
@@ -21797,13 +21803,13 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (g_m3) {
         cb3 = [g_q3 commandBuffer];   // retained references: keeps the drawable and the source until it is done
         ext_wait3(cb3);
-        if (!present_encode_slot(cb3, src, dr.texture, crop, alloc_i)) return 0;
+        if (!present_encode_slot(cb3, src, dr.texture, crop, alloc_i)) { present_dropped(ticket, "Metal 3"); return 0; }
     } else if (@available(macOS 26.0, iOS 26.0, *)) {
         [g_present_alloc4[alloc_i] reset];
         [g_q4 waitForDrawable:dr];
         cb = g_present_cb[alloc_i];
         [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
-        if (!present_encode_m4(cb, src, dr.texture, crop, alloc_i)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
+        if (!present_encode_m4(cb, src, dr.texture, crop, alloc_i)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; present_dropped(ticket, "Metal 4"); return 0; }
         if (rl_m4) {   // DM_NVN_REGLUM: after the present blit, behind the same queue barrier
             id<MTLBuffer> b = g_rl_buf[alloc_i];
             if (!b || b.length < rw * rh * 4) { if (b) res_remove(b); b = g_rl_buf[alloc_i] = [g_dev newBufferWithLength:rw * rh * 4 options:MTLResourceStorageModeShared]; res_add(b); }
