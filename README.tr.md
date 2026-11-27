@@ -2,6 +2,9 @@
 
 <p align="center"><a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.md">English</a> · <a href="README.ja.md">日本語</a> · <a href="README.es.md">Español</a> · <a href="README.fr.md">Français</a> · <a href="README.tr.md">Türkçe</a></p>
 
+> [!IMPORTANT]
+> **Community translation (Topluluk çevirisi).** This page is maintained by the community and may lag behind the English [README.md](README.md), which is authoritative. Translated from `README.md` at commit `ec26a3bc6`; compare with `git log ec26a3bc6..HEAD -- README.md` to see what has changed since.
+
 > [!NOTE]
 > **[s2arm.com](https://s2arm.com), S2Arm'ın resmi web sitesidir.** S2Arm ücretsiz ve açık kaynaklıdır, kesinlikle bağış kabul etmez; S2Arm'ı yalnızca [s2arm.com](https://s2arm.com) adresinden veya bu GitHub deposundan edinin.
 
