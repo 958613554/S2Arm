@@ -22,6 +22,7 @@ namespace S2A.Services.Tests
     //   ② 稳态后线程停 60 ms（设备吃掉 2880 帧 > 在途，排空）：不扔拍（S2ASkippedPeriods 仍 0），连续补 6 拍到 ≥ 1440 帧，补满用时 < 5 ms（不等墙钟）
     //   ③ 设备交还即丢（iOS 时间轴跑前，在途永远 0）：不空转。墙钟上限 = 欠 8 拍起算、可超前深度 + 1 拍：先连续 8 + 6 + 1 = 15 拍，之后 5 ms 一拍
     //      → 渲染 75 拍至少用 60 × 5 = 300 ms（取 ≥ 240 ms；空转会是零点几毫秒）
+    //   ⑤⑥ 在途高于目标时退设备（11-27 落地声晚约半秒）：上限照墙钟一拍一拍地渲染，设备少播的部分（卡顿、设备钟慢）永远留在在途里。见 ⑤⑥ 处
     static class AudioDepthPaceTest
     {
         private const int Rate = 48000;
@@ -43,6 +44,11 @@ namespace S2A.Services.Tests
             private readonly double _speed;   // 设备时钟比墙钟快多少倍（④ 1.01 = 快 1%，#1957 设备钟快于墙钟）
             private readonly long _t0 = Clock.NowNs();
             private long _given;
+            private long _lostNs;   // ⑥ 卡顿：这段时间设备没播（回调晚到 / 载入卡住），已播帧数少算这么多
+
+            public void Hiccup(long ns) { lock (this) { _lostNs += ns; } }
+
+            private long Played() => (long)((Clock.NowNs() - _t0 - Interlocked.Read(ref _lostNs)) * _speed * Rate / 1_000_000_000L);
 
             public FakeSession(bool dropAll, double speed = 1.0) : base(null, SampleFormat.PcmInt16, Rate, 2)
             {
@@ -59,7 +65,7 @@ namespace S2A.Services.Tests
                         return 0;
                     }
 
-                    long played = (long)((Clock.NowNs() - _t0) * _speed * Rate / 1_000_000_000L);
+                    long played = Played();
 
                     lock (this)
                     {
@@ -71,7 +77,7 @@ namespace S2A.Services.Tests
 
             public override void QueueBuffer(AudioBuffer buffer)
             {
-                long played = (long)((Clock.NowNs() - _t0) * _speed * Rate / 1_000_000_000L);
+                long played = Played();
 
                 lock (this)
                 {
@@ -212,6 +218,47 @@ namespace S2A.Services.Tests
             Row("④ 设备钟快 2%、渲染 1400 拍后最后 100 拍在途中位数", "≥ 240（追设备，不被吃光）", $"{m4}（追设备 {cu4} 拍）", m4 >= 240 && cu4 > 0);
             p4.Stop();
             chain4.Dispose();
+
+            // ⑤ 设备钟比墙钟慢 2%（④ 的反方向）：渲染照墙钟时每秒多出 960 帧、永远排不掉。渲染 1400 拍（约 7 秒）：改前在途一路涨到约
+            //   1440 + 0.02 × 7 s × 48000 ≈ 8160 帧；改后在途高于目标 + 2 拍（1920 帧）时每 32 拍多等一拍（−3.1% > 2%）→ 最后 100 拍交完的在途中位数
+            //   ≤ 1440 + 2 × 240 + 480（睡醒误差）= 2400、退设备拍数 > 0
+            var drv5 = new FakeDriver(false, 0.98);
+            var p5 = new AudioProcessor();
+            IHardwareDeviceDriver chain5 = Chain(drv5);
+            p5.Start(chain5);
+            Interlocked.Exchange(ref AudioProcessor.S2ADrains, 0);
+            var d5 = new System.Collections.Generic.List<long>();
+            RenderN(p5, 1300, drv5.Session0);
+            RenderN(p5, 100, drv5.Session0, d5);
+            d5.Sort();
+            long m5 = d5.Count > 0 ? d5[d5.Count / 2] : -1;
+            long dr5 = Interlocked.Read(ref AudioProcessor.S2ADrains);
+            Row("⑤ 设备钟慢 2%、渲染 1400 拍后最后 100 拍在途中位数", "≤ 2400（退设备，不越积越多）", $"{m5}（退设备 {dr5} 拍）", m5 >= 0 && m5 <= 2400 && dr5 > 0);
+            p5.Stop();
+            chain5.Dispose();
+
+            // ⑥ 稳态后设备卡顿 100 ms 没播（11-27 那局一次载入少播约 3400 帧，在途从约 2500 跳到排满、此后不降）：在途 +4800 帧。改前此后渲染照墙钟，
+            //   在途停在约 1440 + 4800 = 6240；改后高出的部分按每秒约 48000 × 3.1% ≈ 1500 帧排掉，约 3.2 秒回到目标附近。卡顿后渲染 1000 拍（约 5 秒）：
+            //   卡顿刚过的在途 ≥ 5000（确认卡顿生效）、最后 100 拍交完的在途中位数 ≤ 2400、全程不扔拍
+            var drv6 = new FakeDriver(false);
+            var p6 = new AudioProcessor();
+            IHardwareDeviceDriver chain6 = Chain(drv6);
+            p6.Start(chain6);
+            Interlocked.Exchange(ref AudioProcessor.S2ASkippedPeriods, 0);
+            RenderN(p6, 200, drv6.Session0);
+            drv6.Session0.Hiccup(100_000_000L);
+            long b6 = drv6.Session0.S2ABufferedFrames;
+            var d6 = new System.Collections.Generic.List<long>();
+            RenderN(p6, 900, drv6.Session0);
+            RenderN(p6, 100, drv6.Session0, d6);
+            d6.Sort();
+            long m6 = d6.Count > 0 ? d6[d6.Count / 2] : -1;
+            long sk6 = Interlocked.Read(ref AudioProcessor.S2ASkippedPeriods);
+            Row("⑥ 卡顿 100 ms 刚过的在途", "≥ 5000", b6.ToString(), b6 >= 5000);
+            Row("⑥ 卡顿后渲染 1000 拍、最后 100 拍在途中位数", "≤ 2400（多出的在途排掉）", m6.ToString(), m6 >= 0 && m6 <= 2400);
+            Row("⑥ 扔拍数", "0", sk6.ToString(), sk6 == 0);
+            p6.Stop();
+            chain6.Dispose();
 
             AudioProcessor.S2ATestClock = null;
             return bad == 0 ? 0 : 1;
