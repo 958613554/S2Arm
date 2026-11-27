@@ -556,6 +556,35 @@ static void pipe_creation_open(const struct s2a_vk_device *dev) {
 
 static struct nvn_gpu_vk g;
 static _Atomic int g_open;   // 跨线程：close 置 0 后其他线程据此拒收
+// 浮点混合 NaN 保护留存的片元 SPIR-V 副本账（会话级，跨装载 / 建管线 / 销毁线程原子更新；读数见 nvn_gpu_stats）
+static _Atomic uint64_t g_float_nan_src_live;
+static _Atomic uint64_t g_float_nan_src_bytes;
+static _Atomic uint64_t g_float_nan_src_alloc;
+static _Atomic uint64_t g_float_nan_src_freed;
+
+static void float_nan_src_stats_reset(void) {
+    atomic_store_explicit(&g_float_nan_src_live, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_float_nan_src_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_float_nan_src_alloc, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_float_nan_src_freed, 0, memory_order_relaxed);
+}
+
+static void float_nan_src_note_alloc(size_t bytes) {
+    atomic_fetch_add_explicit(&g_float_nan_src_live, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_float_nan_src_bytes, (uint64_t)bytes, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_float_nan_src_alloc, 1, memory_order_relaxed);
+}
+
+static void float_nan_src_free(struct nvn_vk_blend_shader *guard) {
+    if (!guard || !guard->source) return;
+    const uint64_t bytes = (uint64_t)guard->words * sizeof *guard->source;
+    free(guard->source);
+    guard->source = NULL;
+    guard->words = 0;
+    atomic_fetch_sub_explicit(&g_float_nan_src_live, 1, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&g_float_nan_src_bytes, bytes, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_float_nan_src_freed, 1, memory_order_relaxed);
+}
 static uint64_t g_border_nearest;     // sampler_border_color_nearest 计数（samp_border_nearest_note）
 static int g_border_nearest_said;     // 本局已打过边框色就近那一行：开会话时清零
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -2511,6 +2540,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     memset(&g, 0, sizeof g);
     g.dev = dev;
     pipe_creation_open(dev);
+    float_nan_src_stats_reset();
     g.float_blend_nan_guard = nvn_plat_flag("nvk_float_blend_nan_guard", 1) != 0;
     const int land_setting = nvn_plat_flag("nvk_land_readback", 0);
     g.land_auto = land_setting == 2;
@@ -3723,7 +3753,7 @@ static void destroy_shader_objects(VkDevice dev, struct nvn_gpu_shader_s *sh) {
     if (sh->blend_guard) {
         struct nvn_vk_blend_shader *guard = sh->blend_guard;
         if (guard->module) vkDestroyShaderModule(dev, guard->module, NULL);
-        free(guard->source);
+        float_nan_src_free(guard);
         pthread_mutex_destroy(&guard->mu);
         free(guard);
     }
@@ -4074,6 +4104,7 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
             guard->source = source;
             guard->words = ci.codeSize / sizeof *source;
             sh->blend_guard = guard;
+            float_nan_src_note_alloc(guard->words * sizeof *guard->source);
         }
         free(array_code);
         if (module_result != VK_SUCCESS) {
@@ -4608,8 +4639,7 @@ static nvn_gpu_rc float_blend_nan_module(const struct nvn_gpu_shader_s *sh, uint
             guard->spec_id = patched.spec_id;
             guard->slots = patched.slots;
         }
-        free(guard->source);
-        guard->source = NULL;
+        float_nan_src_free(guard);
     }
     const uint32_t wanted = *slots;
     *slots &= guard->slots;
@@ -9438,6 +9468,10 @@ void nvn_gpu_stats(nvn_gpu_stat_fn fn, void *user, int take) {
     fn(user, "spv_unlisted_extension", __atomic_load_n(&g_spv_unlisted_ext, __ATOMIC_RELAXED));
     fn(user, "spv_device_limit_rejected", __atomic_load_n(&g_spv_devlimit_reject, __ATOMIC_RELAXED));   // 本机上限（特性 / 限值 / apiVersion / 启用扩展）核对拒收次数
     fn(user, "sampler_border_color_nearest", __atomic_load_n(&g_border_nearest, __ATOMIC_RELAXED));   // 没有自定义边框色扩展、边框色就近取内置档建成的采样器数（进程累计）
+    fn(user, "float_nan_src_live", atomic_load_explicit(&g_float_nan_src_live, memory_order_relaxed));
+    fn(user, "float_nan_src_bytes", atomic_load_explicit(&g_float_nan_src_bytes, memory_order_relaxed));
+    fn(user, "float_nan_src_alloc", atomic_load_explicit(&g_float_nan_src_alloc, memory_order_relaxed));
+    fn(user, "float_nan_src_freed", atomic_load_explicit(&g_float_nan_src_freed, memory_order_relaxed));
 }
 
 // 用例读：视图全局链与帧缓冲缓存的当前账。0 现存视图数；1 旧路径（nvk_ulist=0）摘链累计走过的节点数（缺省路径恒为 0）；

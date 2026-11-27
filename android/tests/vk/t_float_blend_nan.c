@@ -13,13 +13,34 @@ int nvn_plat_flag(const char *name, int dflt) {
     return backend_fixture_flag(name, dflt);
 }
 
-static nvn_gpu_shader load_stage(const char *dir, const char *name, nvn_gpu_stage stage, int precompiled) {
+struct nan_src_stats {
+    uint64_t live, bytes, alloc, freed;
+    unsigned seen;
+};
+
+static void collect_nan_src_stat(void *user, const char *name, uint64_t value) {
+    struct nan_src_stats *st = user;
+    if (!strcmp(name, "float_nan_src_live")) { st->live = value; st->seen |= 1u; }
+    else if (!strcmp(name, "float_nan_src_bytes")) { st->bytes = value; st->seen |= 2u; }
+    else if (!strcmp(name, "float_nan_src_alloc")) { st->alloc = value; st->seen |= 4u; }
+    else if (!strcmp(name, "float_nan_src_freed")) { st->freed = value; st->seen |= 8u; }
+}
+
+static struct nan_src_stats read_nan_src_stats(void) {
+    struct nan_src_stats st = {0};
+    nvn_gpu_stats(collect_nan_src_stat, &st, 0);
+    CHECK(st.seen == 0xfu, "nvn_gpu_stats missing float_nan_src_* keys: mask=0x%x", st.seen);
+    return st;
+}
+
+static nvn_gpu_shader load_stage(const char *dir, const char *name, nvn_gpu_stage stage, int precompiled, size_t *out_bytes) {
     char path[512];
     size_t bytes = 0;
     snprintf(path, sizeof path, "%s/%s.spv", dir, name);
     void *words = read_file(path, &bytes);
     CHECK(words != NULL, "read %s", name);
     if (!words) return NULL;
+    if (out_bytes) *out_bytes = bytes;
     const nvn_gpu_shader_src src = {.stage = stage, .kind = NVN_GPU_BLOB_SPIRV,
         .blob = words, .bytes = bytes, .entry = "main", .precompiled = precompiled};
     nvn_gpu_shader shader = NULL;
@@ -106,8 +127,24 @@ out:
 }
 
 static void test_source(const char *dir, nvn_gpu_shader vs, int precompiled) {
-    nvn_gpu_shader fs = load_stage(dir, "float_blend_nan.frag", NVN_GPU_SH_FS, precompiled);
+    const struct nan_src_stats before = read_nan_src_stats();
+    size_t fs_bytes = 0;
+    nvn_gpu_shader fs = load_stage(dir, "float_blend_nan.frag", NVN_GPU_SH_FS, precompiled, &fs_bytes);
     if (!fs) return;
+    const struct nan_src_stats after_load = read_nan_src_stats();
+    if (!use_original_module) {
+        CHECK(after_load.live == before.live + 1 && after_load.live > 0 &&
+              after_load.bytes == before.bytes + fs_bytes && after_load.bytes > 0 &&
+              after_load.alloc == before.alloc + 1 && after_load.alloc >= after_load.live &&
+              after_load.freed == before.freed,
+              "stats after load precompiled=%d: live=%llu bytes=%llu alloc=%llu freed=%llu (exp +1/+%zu)",
+              precompiled, (unsigned long long)after_load.live, (unsigned long long)after_load.bytes,
+              (unsigned long long)after_load.alloc, (unsigned long long)after_load.freed, fs_bytes);
+    } else {
+        CHECK(after_load.live == 0 && after_load.bytes == 0 &&
+              after_load.alloc == 0 && after_load.freed == 0,
+              "original-module keeps float_nan_src stats zero after load");
+    }
     nvn_gpu_pipe_desc pd = {.cfmt = {NVN_FORMAT_RGBA16F, NVN_FORMAT_RGBA16F},
         .lmap = {0, 1}, .samples = 1, .prim = 4, .origin_ll = 1};
     pd.poly.mode = NVN_POLYGON_MODE_FILL;
@@ -128,6 +165,18 @@ static void test_source(const char *dir, nvn_gpu_shader vs, int precompiled) {
     nvn_gpu_pipe_warm_scope(0);
     CHECK(OK(warm) && prewarmed, "prewarm blend pipeline: %s", err.why);
     if (!prewarmed) goto out;
+    const struct nan_src_stats after_pipe = read_nan_src_stats();
+    if (!use_original_module) {
+        CHECK(after_pipe.live == before.live && after_pipe.bytes == before.bytes &&
+              after_pipe.alloc == after_load.alloc && after_pipe.freed == before.freed + 1,
+              "stats after rewrite precompiled=%d: live=%llu bytes=%llu alloc=%llu freed=%llu",
+              precompiled, (unsigned long long)after_pipe.live, (unsigned long long)after_pipe.bytes,
+              (unsigned long long)after_pipe.alloc, (unsigned long long)after_pipe.freed);
+    } else {
+        CHECK(after_pipe.live == 0 && after_pipe.bytes == 0 &&
+              after_pipe.alloc == 0 && after_pipe.freed == 0,
+              "original-module keeps float_nan_src stats zero after pipe");
+    }
     for (unsigned i = 0; i < 3; i++) {
         pd.color.blend_en = i == 1 ? 0 : 2;
         nvn_gpu_pipe pipe = NULL;
@@ -140,6 +189,42 @@ static void test_source(const char *dir, nvn_gpu_shader vs, int precompiled) {
     CHECK(nvn_gpu_pipe_warm_hits() == hits + 1, "one protected graphics prewarm hit per source");
 out:
     nvn_gpu_shader_release(fs);
+    const struct nan_src_stats after_rel = read_nan_src_stats();
+    if (!use_original_module) {
+        CHECK(after_rel.live == before.live && after_rel.bytes == before.bytes &&
+              after_rel.alloc == after_load.alloc && after_rel.freed == before.freed + 1,
+              "stats stable after releasing rewritten shader precompiled=%d: live=%llu bytes=%llu freed=%llu",
+              precompiled, (unsigned long long)after_rel.live, (unsigned long long)after_rel.bytes,
+              (unsigned long long)after_rel.freed);
+    }
+}
+
+static void test_unused_shader_release(const char *dir) {
+    const struct nan_src_stats before = read_nan_src_stats();
+    size_t fs_bytes = 0;
+    nvn_gpu_shader fs = load_stage(dir, "float_blend_nan.frag", NVN_GPU_SH_FS, 0, &fs_bytes);
+    if (!fs) return;
+    const struct nan_src_stats after_load = read_nan_src_stats();
+    if (!use_original_module) {
+        CHECK(after_load.live == before.live + 1 && after_load.bytes == before.bytes + fs_bytes &&
+              after_load.alloc == before.alloc + 1 && after_load.freed == before.freed,
+              "unused fs load stats: live=%llu bytes=%llu alloc=%llu freed=%llu",
+              (unsigned long long)after_load.live, (unsigned long long)after_load.bytes,
+              (unsigned long long)after_load.alloc, (unsigned long long)after_load.freed);
+    }
+    nvn_gpu_shader_release(fs);
+    const struct nan_src_stats after_rel = read_nan_src_stats();
+    if (!use_original_module) {
+        CHECK(after_rel.live == 0 && after_rel.bytes == 0 &&
+              after_rel.alloc == before.alloc + 1 && after_rel.freed == before.freed + 1,
+              "unused fs destroy stats: live=%llu bytes=%llu alloc=%llu freed=%llu",
+              (unsigned long long)after_rel.live, (unsigned long long)after_rel.bytes,
+              (unsigned long long)after_rel.alloc, (unsigned long long)after_rel.freed);
+    } else {
+        CHECK(after_rel.live == 0 && after_rel.bytes == 0 &&
+              after_rel.alloc == 0 && after_rel.freed == 0,
+              "original-module keeps float_nan_src stats zero on unused destroy");
+    }
 }
 
 int main(int argc, char **argv) {
@@ -156,14 +241,43 @@ int main(int argc, char **argv) {
     if (!open_backend()) return 2;
     CHECK(nvn_gpu_format_caps(NVN_FORMAT_RGBA16F) & NVN_GPU_FMT_BLEND, "RGBA16F blending supported");
     CHECK(g_dev.core_features.independentBlend, "independent MRT blending supported");
-    nvn_gpu_shader vs = load_stage(argv[1], "libpack_depth.vert", NVN_GPU_SH_VS, 0);
+    const struct nan_src_stats init = read_nan_src_stats();
+    CHECK(init.live == 0 && init.bytes == 0 && init.alloc == 0 && init.freed == 0,
+          "initial float_nan_src stats zero: live=%llu bytes=%llu alloc=%llu freed=%llu",
+          (unsigned long long)init.live, (unsigned long long)init.bytes,
+          (unsigned long long)init.alloc, (unsigned long long)init.freed);
+    nvn_gpu_shader vs = load_stage(argv[1], "libpack_depth.vert", NVN_GPU_SH_VS, 0, NULL);
     if (vs && !g_fail) {
+        const struct nan_src_stats after_vs = read_nan_src_stats();
+        CHECK(after_vs.live == 0 && after_vs.bytes == 0 && after_vs.alloc == 0 && after_vs.freed == 0,
+              "vertex stage does not retain float_nan_src");
         test_source(argv[1], vs, 0);
         test_source(argv[1], vs, 1);
+        test_unused_shader_release(argv[1]);
+        // Load one unreleased fragment shader so close-time teardown + session reopen reset are both exercised.
+        size_t close_bytes = 0;
+        nvn_gpu_shader leaked_to_close = load_stage(argv[1], "float_blend_nan.frag", NVN_GPU_SH_FS, 0, &close_bytes);
+        if (leaked_to_close && !use_original_module) {
+            const struct nan_src_stats before_close = read_nan_src_stats();
+            CHECK(before_close.live == 1 && before_close.bytes == close_bytes &&
+                  before_close.alloc == 4 && before_close.freed == 3,
+                  "pre-close resident stats: live=%llu bytes=%llu alloc=%llu freed=%llu",
+                  (unsigned long long)before_close.live, (unsigned long long)before_close.bytes,
+                  (unsigned long long)before_close.alloc, (unsigned long long)before_close.freed);
+        }
     }
     nvn_gpu_shader_release(vs);
     nvn_gpu_err err = {0};
     CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "close: %s", err.why);
+    // Reopen once to verify close teardown + session restart leave zero stale counts.
+    if (open_backend()) {
+        const struct nan_src_stats reopened = read_nan_src_stats();
+        CHECK(reopened.live == 0 && reopened.bytes == 0 && reopened.alloc == 0 && reopened.freed == 0,
+              "reopened session stats zero: live=%llu bytes=%llu alloc=%llu freed=%llu",
+              (unsigned long long)reopened.live, (unsigned long long)reopened.bytes,
+              (unsigned long long)reopened.alloc, (unsigned long long)reopened.freed);
+        CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "reopen close: %s", err.why);
+    }
     s2a_vk_device_destroy(&g_dev, 1);
     printf("float-blend-nan: failures=%d\n", g_fail);
     return g_fail ? 1 : 0;
