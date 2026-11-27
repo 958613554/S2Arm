@@ -637,7 +637,7 @@ def to_img(c, gid, root, pack_dir):
         if e.code == "tool_exit":
             # 退出码留在原因里（#2295：img.py 一行没打就退，原因只剩一行工具链记录，退出码 / 是否被信号结束都丢了）。c.run 已把信号折成 128 + 信号号
             rc = getattr(c, "last_rc", None)
-            sig = f"，即被信号 {rc - 128} 结束、没来得及留下输出" if isinstance(rc, int) and 128 < rc < 160 and os.name != "nt" else ""
+            sig = f"，即被信号 {rc - 128} 结束、没来得及留下输出" if isinstance(rc, int) and 128 < rc < 160 and os.name != "nt" else ""  # 非玩家句
             reason = "写单一 IMG（game.img）失败" + (f"（退出码 {rc}{sig}）" if rc is not None else "") + "：" + tool_reason(log)  # 非玩家句
         else:   # 阶段超时、输出未关闭等：c.run 自己的话就是原因，不拿日志末行盖掉
             reason = "写单一 IMG（game.img）失败：" + str(e)  # 非玩家句
