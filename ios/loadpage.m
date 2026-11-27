@@ -8,6 +8,7 @@
 #import "s2a_l10n.h"
 #import "bundle_icon.h"
 #include "s2a_loadprog.h"
+#include "native.h"   // LOG（测试开关 S2A_LOADPAGE_SKIP 的日志行）
 uint64_t now_ns(void);
 
 // 剩余时间小字：档位同 runtime/src/loadprog.c s2a_load_eta_text（<0 估算中 / <5 秒 / 逐秒 / 分秒 / 整分），文字按 App 语言取字符串表（#316），中文值与那份 C 原句逐字相同
@@ -168,7 +169,14 @@ static UILabel *label(CGFloat size, UIFontWeight w, UIColor *c) {
         self.detail.text = [NSString stringWithFormat:S2AL(@"loadpage.optimized"), [nf stringFromNumber:@(v.done)], [nf stringFromNumber:@(v.total)]];
         NSString *b = eta_text(v.eta_s); self.eta.text = v.eta_s >= 0 ? [NSString stringWithFormat:S2AL(@"loadpage.remaining"), b] : b;
     } else { self.detail.text = v.go_reason == S2A_LOAD_GO_DONE ? S2AL(@"loadpage.go.done") : S2AL(@"loadpage.go.early"); self.eta.text = @""; }
-    if (v.can_skip && self.skip.hidden) { self.skip.hidden = NO; [UIView animateWithDuration:0.4 animations:^{ self.skip.alpha = 1; }]; }
+    if (v.can_skip && self.skip.hidden) { self.skip.hidden = NO; [UIView animateWithDuration:0.4 animations:^{ self.skip.alpha = 1; }];
+        // 测试开关 S2A_LOADPAGE_SKIP=1（发版真机冒烟按 60 秒判首帧，首装云端种子大的款首帧前要编几分钟，同 app.m S2A_LIBRARY_AUTOPLAY）：按钮淡入后 1 秒替玩家点一次
+        //   「先开始玩」，走玩家点按钮的同一个动作（s2a_load_user_skip）；只点一次。不设开关行为不变
+        const char *e = getenv("S2A_LOADPAGE_SKIP"); static int clicked;
+        if (e && !strcmp(e, "1") && !clicked) { clicked = 1; UIButton *b = self.skip;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                if (b.hidden) return;   // 1 秒内已不能点（编完 / 已放行）：不点
+                LOG("加载页：测试开关 S2A_LOADPAGE_SKIP，替玩家点先开始玩"); [b sendActionsForControlEvents:UIControlEventPrimaryActionTriggered]; }); } }
     else if (!v.can_skip && !self.skip.hidden) { [UIView animateWithDuration:0.2 animations:^{ self.skip.alpha = 0; } completion:^(BOOL f) { (void)f; self.skip.hidden = YES; }]; }
 }
 @end
