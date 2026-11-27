@@ -1141,15 +1141,14 @@ static uint64_t betop_pro_registry_id(GCController *controller) {
     if (physical) objc_setAssociatedObject(controller, &registryCacheKey, @[entry, @(physical)], OBJC_ASSOCIATION_RETAIN);
     return physical ?: service;
 }
-static void sample_left_stick(GCController *controller, GCControllerDirectionPad *left, float *x, float *y) {
-    int16_t axes[2];
-    if (s2a_mac_hid_betop_left(betop_pro_registry_id(controller), axes)) {
-        *x = axes[0] / 32767.0f;
-        *y = axes[1] / 32767.0f;
-        return;
-    }
-    *x = left.xAxis.value;
-    *y = left.yAxis.value;
+static void sample_sticks(GCController *controller, GCControllerDirectionPad *left, GCControllerDirectionPad *right,
+                          float *lx, float *ly, float *rx, float *ry) {
+    *lx = left.xAxis.value; *ly = left.yAxis.value;
+    *rx = right.xAxis.value; *ry = right.yAxis.value;
+    int16_t axes[4];
+    int count = s2a_mac_hid_betop_sticks(betop_pro_registry_id(controller), axes);
+    if (count >= 2) { *lx = axes[0] / 32767.0f; *ly = axes[1] / 32767.0f; }
+    if (count == 4) { *rx = axes[2] / 32767.0f; *ry = axes[3] / 32767.0f; }
 }
 static void sample_pad_state(GCExtendedGamepad *pad, NSDictionary *cfg, uint32_t *out_buttons, int32_t sticks[4]) {
     // GameController 通常按物理方位上报（buttonA 在南侧）；Switch Pro 手柄在 macOS 上按键面字母上报（A 在东侧、X 在北侧）
@@ -1167,10 +1166,9 @@ static void sample_pad_state(GCExtendedGamepad *pad, NSDictionary *cfg, uint32_t
     if (pad.rightThumbstickButton) inputs[@"rightStick"] = pad.rightThumbstickButton;
     NSMutableDictionary *all = [NSMutableDictionary new];
     for (NSString *code in inputs) all[code] = @([inputs[code] isPressed]);
-    float lx, ly;
-    sample_left_stick(pad.controller, pad.leftThumbstick, &lx, &ly);
-    map_pad_inputs(cfg, all, @{@"leftX": @(lx), @"leftY": @(ly),
-                          @"rightX": @(pad.rightThumbstick.xAxis.value), @"rightY": @(pad.rightThumbstick.yAxis.value)}, out_buttons, sticks);
+    float lx, ly, rx, ry;
+    sample_sticks(pad.controller, pad.leftThumbstick, pad.rightThumbstick, &lx, &ly, &rx, &ry);
+    map_pad_inputs(cfg, all, @{@"leftX": @(lx), @"leftY": @(ly), @"rightX": @(rx), @"rightY": @(ry)}, out_buttons, sticks);
 }
 // 只有通用物理描述的手柄：按标准键名读，位序与扩展手柄同一套（s2a_pad_abxy_order，类型按 productCategory 判）
 static void sample_profile_state(GCController *c, NSDictionary *cfg, uint32_t *out_buttons, int32_t sticks[4]) {
@@ -1187,9 +1185,9 @@ static void sample_profile_state(GCController *c, NSDictionary *cfg, uint32_t *o
     for (NSString *code in named) all[code] = @(btn(named[code]).isPressed);
     GCControllerDirectionPad *dpad = p.dpads[GCInputDirectionPad], *ls = p.dpads[GCInputLeftThumbstick], *rs = p.dpads[GCInputRightThumbstick];
     all[@"dpadLeft"] = @(dpad.left.isPressed); all[@"dpadRight"] = @(dpad.right.isPressed); all[@"dpadUp"] = @(dpad.up.isPressed); all[@"dpadDown"] = @(dpad.down.isPressed);
-    float lx, ly;
-    sample_left_stick(c, ls, &lx, &ly);
-    map_pad_inputs(cfg, all, @{@"leftX": @(lx), @"leftY": @(ly), @"rightX": @(rs.xAxis.value), @"rightY": @(rs.yAxis.value)}, out_buttons, sticks);
+    float lx, ly, rx, ry;
+    sample_sticks(c, ls, rs, &lx, &ly, &rx, &ry);
+    map_pad_inputs(cfg, all, @{@"leftX": @(lx), @"leftY": @(ly), @"rightX": @(rx), @"rightY": @(ry)}, out_buttons, sticks);
 }
 // 槽位计划 s2a_slot_plan 在 runtime/src/pad.c（iOS ios/controller.m 共用同一份规则）
 // R5：原始键态 → HID 键盘区（s2a_kb_update，键码表 mac_key_hid）。位图是 (keys, modifiers, caps_locked, muted) 的

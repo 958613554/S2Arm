@@ -1224,6 +1224,7 @@
   "display.mods.remove": "Supprimer",
   "display.mods.files": "{0} fichiers · {1}",
   "display.mods.imported": "Importé : {0}",
+  "display.recommended": "Recommandé pour ce jeu (testé)",
   "display.cheats.player": "Importé par vous",
   "display.cheats.library": "De {0}",
   "display.cheats.author": "Par {0}",

@@ -21864,6 +21864,14 @@ void nvn_be_present_out_size(int *w, int *h) {
     if (w) *w = atomic_load_explicit(&g_present_out_w, memory_order_relaxed);
     if (h) *h = atomic_load_explicit(&g_present_out_h, memory_order_relaxed);
 }
+// 拿到 drawable 后编码失败、这一帧不呈现（调用方按「没提交」记完成）：原先一声不响，平台呈现回调永远不来，外面看到的只是「卡住」
+//   （11-27 上屏设置矩阵门禁偶发：第一帧 drawable 拿到、回调 30 秒不来）。打一行红点名哪一帧、哪条路；具体哪一步失败由编码函数自己的红行写
+// 上屏各阶段最近一帧的帧号（诊断：上屏设置矩阵卡帧现场按它分清停在哪一步——拿到 drawable / 提交 / GPU 做完 / 调了 present）
+static _Atomic uint64_t g_prs_taken, g_prs_committed, g_prs_called;
+static void present_dropped(uint64_t ticket, const char *path) {
+    static _Atomic int said;
+    if (atomic_fetch_add(&said, 1) < 8) MLOG("【红】 present ticket %llu: drawable taken but not presented (%s encode failed; the reason is the line above)", (unsigned long long)ticket, path);
+}
 static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
     if (mtl_gpu_halted()) { atomic_fetch_add_explicit(&g_gpu_refused, 1, memory_order_relaxed); return 0; }   // GPU 安全停：不取画布、不交上屏（调用方按「没交」把票记完成）
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
@@ -22000,6 +22008,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     id<CAMetalDrawable> dr = supplied ? supplied : [layer nextDrawable];
     if (!supplied) g_drawable_ns += now_ns() - dt0;
     if (!dr) return 0;
+    atomic_store(&g_prs_taken, ticket);
     int alloc_i = (int)(ticket % 3);
     present_options();
     if (g_present_aa || g_present_fx) {
@@ -22021,13 +22030,13 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (g_m3) {
         cb3 = [g_q3 commandBuffer];   // retained references: keeps the drawable and the source until it is done
         ext_wait3(cb3);
-        if (!present_encode_slot(cb3, src, dr.texture, crop, alloc_i)) return 0;
+        if (!present_encode_slot(cb3, src, dr.texture, crop, alloc_i)) { present_dropped(ticket, "Metal 3"); return 0; }
     } else if (@available(macOS 26.0, iOS 26.0, *)) {
         [g_present_alloc4[alloc_i] reset];
         [g_q4 waitForDrawable:dr];
         cb = g_present_cb[alloc_i];
         [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
-        if (!present_encode_m4(cb, src, dr.texture, crop, alloc_i)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
+        if (!present_encode_m4(cb, src, dr.texture, crop, alloc_i)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; present_dropped(ticket, "Metal 4"); return 0; }
         if (rl_m4) {   // DM_NVN_REGLUM: after the present blit, behind the same queue barrier
             id<MTLBuffer> b = g_rl_buf[alloc_i];
             if (!b || b.length < rw * rh * 4) { if (b) res_remove(b); b = g_rl_buf[alloc_i] = [g_dev newBufferWithLength:rw * rh * 4 options:MTLResourceStorageModeShared]; res_add(b); }
@@ -22050,11 +22059,11 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     });
     pthread_mutex_lock(&g_pq_mu); if (aa) aa->busy = YES; if (fxs) fxs->busy = YES; g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
     if (fsrs) { pthread_mutex_lock(&g_pq_mu); fsrs->busy = YES; pthread_mutex_unlock(&g_pq_mu); }   // FSR 槽
-    if (g_m3) { present_m3(cb3, dr, ticket, period, target_ts); m3_commit(cb3, o, nil, 0); }
+    if (g_m3) { present_m3(cb3, dr, ticket, period, target_ts); m3_commit(cb3, o, nil, 0); atomic_store(&g_prs_committed, ticket); atomic_store(&g_prs_called, ticket); }   // Metal 3：present 随命令缓冲
     else {
         // Publish residency before every Metal 4 present submit, including resources added during encoding (#298).
         res_commit();
-        id<MTL4CommandBuffer> buffers[] = {cb}; [g_q4 commit:buffers count:1 options:o];
+        id<MTL4CommandBuffer> buffers[] = {cb}; [g_q4 commit:buffers count:1 options:o]; atomic_store(&g_prs_committed, ticket);
     }
     if (target_ts > 0) {
         static double leads[300], e2e[300];   // e2e: game enqueue -> system-scheduled present (including the time waiting in the queue for the display-link callback), the full span of input latency that our side can read
@@ -22083,6 +22092,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (target_ts > 0) [dr present];
     else if (period > 0) [dr presentAfterMinimumDuration:period]; else [dr present];
 #endif
+    atomic_store(&g_prs_called, ticket);
     (void)frame;
     return 1;
 }
@@ -22100,6 +22110,10 @@ static void ext_wait(uint64_t v) { g_ext_cur = v; if (g_m3) { if (v) g_ext_pend3
 static void ext_wait3(id<MTLCommandBuffer> cb) { if (g_ext_pend3 && g_ext_ev) [cb encodeWaitForEvent:g_ext_ev value:g_ext_pend3]; g_ext_pend3 = 0; }
 static pq_item g_pq[PQ];
 static uint64_t g_pq_in;
+void nvn_be_present_progress(uint64_t out[6]) {   // 入队、出队、拿到 drawable、提交、GPU 做完、调了 present
+    pthread_mutex_lock(&g_pq_mu); out[0] = g_pq_in; out[1] = g_pq_read; out[4] = g_pq_done; pthread_mutex_unlock(&g_pq_mu);
+    out[2] = atomic_load(&g_prs_taken); out[3] = atomic_load(&g_prs_committed); out[5] = atomic_load(&g_prs_called);
+}
 static int present_now(const tex_t *, double, uint64_t, uint64_t, const int[4], id<CAMetalDrawable>, double);
 static double g_link_vperiod, g_link_vhalf;   // virtual ticks (link_range): seconds per counted tick (0 = every callback is a tick) and half a refresh of the screen
 // Protected by g_pq_mu. Measure delegate arrivals, before virtual-tick filtering;
