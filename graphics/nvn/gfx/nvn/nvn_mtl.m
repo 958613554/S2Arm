@@ -3503,6 +3503,12 @@ static __unsafe_unretained id hm_get_id(const nvn_hmap *m, const void *k) { retu
 static void hm_put_id(nvn_hmap *m, const void *k, id o) { void *old = nvn_hm_put(m, k, (void *)CFBridgingRetain(o)); if (old) CFRelease(old); }
 static void hm_del_id(nvn_hmap *m, const void *k) { void *old = nvn_hm_del(m, k); if (old) CFRelease(old); }
 static nvn_hmap g_by_serial = {.klen = 8};     // Serial → MTLTexture / NvPkg / NvProg
+// Why a serial left g_by_serial, the last DROP_RING of them (#2269: a texture a pool table had made, gone when a shader read its ID, with no table lookup since —
+//   which path dropped it). Written under g_smu; the pool case lines (pool_seen_word) read it
+enum { DR_OTHER = 1, DR_SRGB_STALE, DR_FINALIZED, DR_TAKEOVER, DR_RECLAIM, DROP_RING = 4096 };
+static struct { uint64_t ser, frame; uint8_t why; } g_drop_ring[DROP_RING]; static uint32_t g_drop_next;
+static void drop_note(uint64_t ser, int why) { g_drop_ring[g_drop_next % DROP_RING].ser = ser; g_drop_ring[g_drop_next % DROP_RING].why = (uint8_t)why;
+    g_drop_ring[g_drop_next % DROP_RING].frame = atomic_load(&g_cur_frame); g_drop_next++; }   // caller holds g_smu
 static pthread_mutex_t g_smu = PTHREAD_MUTEX_INITIALIZER;
 // Serial table generation: +1 when entries are added / removed or a packaged texture is replaced. Downstream caches (texture views, programs) record the generation at fetch time; if it is unchanged they can be used directly without another table lookup
 static _Atomic uint64_t g_ser_gen = 1;
@@ -3661,7 +3667,7 @@ static void alias_take_over(const alias_key *nk) {
         id o = CFBridgingRelease(old);
         if (g_alias_set) CFSetRemoveValue(g_alias_set, (__bridge const void *)o);
         for (uint32_t i = 0; i < g_by_serial.cap; i++) if (g_by_serial.vals[i] == (__bridge void *)o) {   // live objects over overwritten storage: their next use makes the texture anew (tex_mtl_)
-            uint64_t sk; memcpy(&sk, g_by_serial.keys + (size_t)i * g_by_serial.klen, sizeof sk); defer_obj_unref(o); hm_del_id(&g_by_serial, &sk); i = (uint32_t)-1; g_alias_dead++;   // deletion shifts entries: rescan
+            uint64_t sk; memcpy(&sk, g_by_serial.keys + (size_t)i * g_by_serial.klen, sizeof sk); defer_obj_unref(o); hm_del_id(&g_by_serial, &sk); drop_note(sk, DR_TAKEOVER); i = (uint32_t)-1; g_alias_dead++;   // deletion shifts entries: rescan
             if (g_alias_dead_n == g_alias_dead_cap) { uint32_t c = g_alias_dead_cap ? 2 * g_alias_dead_cap : 64; uint64_t *q = realloc(g_alias_dead_ser, c * sizeof *q); if (q) { g_alias_dead_ser = q; g_alias_dead_cap = c; } }
             if (g_alias_dead_n < g_alias_dead_cap) g_alias_dead_ser[g_alias_dead_n++] = sk; }   // its texture-ID views go at the end of the submission (alias_dead_views: they need g_rmu, taken before g_smu)
         @autoreleasepool { evict_note(o); }
@@ -3787,7 +3793,8 @@ static void alias_orphan_pass(void) {
 }
 static __unsafe_unretained id serial_get(uint64_t k) { pthread_mutex_lock(&g_smu); __unsafe_unretained id o = hm_get_id(&g_by_serial, &k); pthread_mutex_unlock(&g_smu); return o; }
 static void serial_put(uint64_t k, id o) { pthread_mutex_lock(&g_smu); id old = hm_get_id(&g_by_serial, &k); if (old) { if (alias_has(old)) defer_obj_unref(old); else defer_obj_release(old); } hm_put_id(&g_by_serial, &k, o); g_ser_gen++; pthread_mutex_unlock(&g_smu); }
-static void serial_del(uint64_t k) { pthread_mutex_lock(&g_smu); id old = hm_get_id(&g_by_serial, &k); if (old) { if (alias_has(old)) defer_obj_unref(old); else defer_obj_release(old); hm_del_id(&g_by_serial, &k); g_ser_gen++; } pthread_mutex_unlock(&g_smu); }   // nothing to drop: the texture ID caches stay valid
+static void serial_del_why(uint64_t k, int why) { pthread_mutex_lock(&g_smu); id old = hm_get_id(&g_by_serial, &k); if (old) { if (alias_has(old)) defer_obj_unref(old); else defer_obj_release(old); hm_del_id(&g_by_serial, &k); g_ser_gen++; drop_note(k, why); } pthread_mutex_unlock(&g_smu); }
+static void serial_del(uint64_t k) { serial_del_why(k, DR_OTHER); }   // nothing to drop: the texture ID caches stay valid
 // Texture serials owned by a live NVN texture object (TextureInitialize until Finalize or re-initialization, hle_nvn.c). Command records and texture pool registrations snapshot the
 // texture object (tex_snap in hle_nvn.c, nvn_be_reg_tex), so replay can resolve a texture the game has already finalized: Breath of the Wild records each frame's transient render targets
 // (the HUD captures, the 640x360 half-resolution buffers) and finalizes their objects before it submits. Those serials went back into g_by_serial and stayed there for good, as no second
@@ -6528,7 +6535,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         //   bytes (upstream reference implementation, MIT, 92f223a7): dropped, and made again below on what holds them now
         pthread_mutex_lock(&g_smu); int stale = !alias_has(have) && !alias_has(((id<MTLTexture>)have).parentTexture); pthread_mutex_unlock(&g_smu);
         if (stale) { static int nstale; if (nstale++ < 4) MLOG("stale sRGB / linear view dropped ser=%llu format %lu (%d so far)", (unsigned long long)t->serial, (unsigned long)((id<MTLTexture>)have).pixelFormat, nstale);
-            serial_del(t->serial); have = nil; }
+            serial_del_why(t->serial, DR_SRGB_STALE); have = nil; }
     }
     if (have) return have;
     if (t->d.target == 10) {   // Buffer texture (TARGET_BUFFER): create the texture-buffer view directly on the memory pool buffer (zero copy; the GPU reads the pool's current content at execution time, same as NVN semantics)
@@ -6913,10 +6920,10 @@ void nvn_be_tex_release(tex_t *t) {
         //   (late / in flight). Dropping it from g_by_serial made tex_get re-create it from the all-zero guest storage (BotW's 100x56 / 400x225 R8 masks:
         //   one-frame light / dark flashes on iPad). Keep the GPU result under the existing bounded ghost-ring lifetime instead, as tex_put does for evicted ones
         tex_put_locked(t->serial, holder);
-        hm_del_id(&g_by_serial, &t->serial);   // borrow-safe: the ghost ring keeps holder (tex_put_locked above), so a replay borrowing it this submission still has it
+        hm_del_id(&g_by_serial, &t->serial); drop_note(t->serial, DR_FINALIZED);   // borrow-safe: the ghost ring keeps holder (tex_put_locked above), so a replay borrowing it this submission still has it
     }
     pthread_mutex_unlock(&g_smu);
-    serial_del(t->serial);
+    serial_del_why(t->serial, DR_FINALIZED);
     mtl_vc_drop(t->serial);
     gpw_forget(t->serial);
     wd_release(t->serial);
@@ -9645,7 +9652,7 @@ static void tex_idle_reclaim(void) {
         uint32_t k = 0; for (uint32_t j = 1; j < m; j++) if (c[j].used < c[k].used) k = j;   // least recently used first
         cand_t x = c[k]; c[k] = c[--m];
         id o = hm_get_id(&g_by_serial, &x.ser); if ((__bridge void *)o != x.o) continue;   // replaced or finalized meanwhile
-        if (alias_has(o)) defer_obj_unref(o); else defer_obj_release(o); hm_del_id(&g_by_serial, &x.ser);   // as serial_del (deferred, borrow-safe): a shared texture stays in the sharing table (unreferenced now, alias_orphan_pass)
+        if (alias_has(o)) defer_obj_unref(o); else defer_obj_release(o); hm_del_id(&g_by_serial, &x.ser); drop_note(x.ser, DR_RECLAIM);   // as serial_del (deferred, borrow-safe): a shared texture stays in the sharing table (unreferenced now, alias_orphan_pass)
         freed += x.bytes; cnt++;
         if (g_alias_dead_n == g_alias_dead_cap) { uint32_t cc = g_alias_dead_cap ? 2 * g_alias_dead_cap : 64; uint64_t *q = realloc(g_alias_dead_ser, cc * sizeof *q); if (q) { g_alias_dead_ser = q; g_alias_dead_cap = cc; } }
         if (g_alias_dead_n < g_alias_dead_cap) g_alias_dead_ser[g_alias_dead_n++] = x.ser;
@@ -13185,13 +13192,19 @@ static void pool_seen_word(unsigned i, int recheck, int sg_chg, uint64_t sg) {
         for (int k = 0; k < POOL_TABS && unmade && !dummy; k++) { const pool_tab *t = &g_ptab[k]; if (!t->samp && !t->rw && pool_covers(t, id_) && !t->obj[id_ - t->base]) dummy = 1; }
         int in_left = g_pleft.bits && (g_pleft.bits[(uint32_t)id_ >> 5] >> (id_ & 31) & 1);   // left out by the up-front budget (pool_left_scan's queue) vs never looked up since it registered
         uint64_t spent = g_walk_spent; int why = id_ < (1 << 20) ? g_pool_miss[id_] : PM_NEVER;
+        static const char *const k_drop[] = {"not dropped in the last 4096", "dropped (other)", "dropped: stale sRGB / linear view", "dropped: the game finalized it",
+                                             "dropped: its storage taken over", "dropped: idle reclaim"};
+        int dwhy = 0; uint64_t dframe = 0;
+        if (unmade) { pthread_mutex_lock(&g_smu); uint64_t ser = g_treg[id_].t.serial;
+            for (uint32_t k = 0; k < DROP_RING && k < g_drop_next; k++) { uint32_t j = (g_drop_next - 1 - k) % DROP_RING; if (g_drop_ring[j].ser == ser) { dwhy = g_drop_ring[j].why; dframe = g_drop_ring[j].frame; break; } }
+            pthread_mutex_unlock(&g_smu); }
         pool_tex_update(id_, 0); g_pool_upd_seen++;
         if (unmade && (g_treg[id_].view || tex_get(g_treg[id_].t.serial))) {
             g_pool_seen_late++;
             // The first cases one by one (#2269): which way each was missed — waiting in the budget queue, or not there (a registration path that never looked it up)
-            if (g_pool_seen_late <= 32) MLOG("pool tables: made only once a shader read the dummy, case %llu: ID %d %ux%u format %#x %llu KB, %s (%s), table entry %s; made this frame so far %llu MB (up-front budget %u MB), frame %llu",
+            if (g_pool_seen_late <= 32) MLOG("pool tables: made only once a shader read the dummy, case %llu: ID %d %ux%u format %#x %llu KB, %s (%s), table entry %s, serial %s (frame %llu); made this frame so far %llu MB (up-front budget %u MB), frame %llu",
                 (unsigned long long)g_pool_seen_late, id_, g_treg[id_].t.d.width, g_treg[id_].t.d.height, g_treg[id_].t.d.format,
-                (unsigned long long)(pool_tex_size(&g_treg[id_].t) >> 10), in_left ? "waiting in the budget queue" : "not in the budget queue", k_pool_miss[why], dummy ? "the dummy" : "still the texture it had",
+                (unsigned long long)(pool_tex_size(&g_treg[id_].t) >> 10), in_left ? "waiting in the budget queue" : "not in the budget queue", k_pool_miss[why], dummy ? "the dummy" : "still the texture it had", k_drop[dwhy], (unsigned long long)dframe,
                 (unsigned long long)(spent >> 20), POOL_FRAME_BYTES >> 20, (unsigned long long)atomic_load(&g_cur_frame));
         }
     }
