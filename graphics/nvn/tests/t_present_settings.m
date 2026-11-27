@@ -104,7 +104,9 @@ static BOOL presentationConsistent(const PresentObservation *o, double productio
 // 门禁偶发：某格停在下面的等待里，直到 60 秒闹钟（11-21 起每天数局，单机连跑 144 格复现不出）。等过 5 秒打一行现场：
 //   观测值、本窗口状态、最前台 App、压在本窗口上面的屏上窗口（所属 App / 层级 / 位置；不取窗口标题，不需要录屏授权）、主屏睡眠。
 //   第一次打出时门槛临时改 0 实跑过一格（68/68 过、行如期出现）
+void nvn_be_present_progress(uint64_t out[6]) __attribute__((weak));   // 生产上屏各阶段最近帧号（nvn_mtl.m）；弱引用：老库没有它就不打这一段
 static void stallReport(const char *name, uint64_t ticket, const PresentObservation *o, double production, double waited) {
+    uint64_t pp[6] = {0}; if (nvn_be_present_progress) nvn_be_present_progress(pp);
     __block NSString *win = @"本窗口没找到";
     dispatch_sync(dispatch_get_main_queue(), ^{
         for (NSWindow *window in NSApp.windows) {
@@ -125,8 +127,10 @@ static void stallReport(const char *name, uint64_t ticket, const PresentObservat
                 above];
         }
     });
-    printf("【卡】%s ticket %llu 等呈现回调 %.1f 秒：handlers=%u platform=%.6f sampled=%.6f ring=%.6f drawable#%llu acquired=%.3f now=%.3f；%s；主屏睡眠=%d\n",
+    // 上屏阶段：本帧卡在哪一步——没出队 / 出队没拿到 drawable / 拿到没提交（编码失败或在等）/ 提交了 GPU 没做完 / 做完没调 present / 调了 present 系统没显示
+    printf("【卡】%s ticket %llu 等呈现回调 %.1f 秒：handlers=%u platform=%.6f sampled=%.6f ring=%.6f drawable#%llu acquired=%.3f now=%.3f；上屏阶段 入队 %llu 出队 %llu 拿到 drawable %llu 提交 %llu GPU 做完 %llu 调 present %llu；%s；主屏睡眠=%d\n",
         name, ticket, waited, o->callbacks, o->platformTime, o->sampledTime, production, o->drawableID, o->acquired, CACurrentMediaTime(),
+        (unsigned long long)pp[0], (unsigned long long)pp[1], (unsigned long long)pp[2], (unsigned long long)pp[3], (unsigned long long)pp[4], (unsigned long long)pp[5],
         win.UTF8String, CGDisplayIsAsleep(CGMainDisplayID()));
 }
 
