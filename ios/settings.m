@@ -387,12 +387,15 @@ void s2a_ios_apply_graphics_settings(NSUserDefaults *defaults) {
             fprintf(stderr, "[S2A 画面设置] %s=%s（启动环境）\n", options[i].env, explicit);
             continue;
         }
-        id value = [defaults objectForKey:options[i].key] ?: options[i].initial;
+        // 只写玩家选过的（11-27 逐款缺省）：没选过不写，宿主按「逐款缺省 → 定义表缺省」定（runtime/src/caps.c s2a_game_defaults_apply，未设才写）。
+        //   原先没选过也把初始值写成显式值，宿主分不清是玩家选的还是缺省，逐款缺省盖不过它；宿主各处未设时的缺省与这里的初始值相同（nvn_present_aa.inc / nvn_rscale.inc / nvn_fps.c）
+        id value = [defaults objectForKey:options[i].key];
+        if (!value) { fprintf(stderr, "[S2A 画面设置] %s 没选过：不写，按逐款缺省 / 缺省 %s\n", options[i].env, options[i].initial.UTF8String); continue; }
         if (![value isKindOfClass:NSString.class] || ![options[i].values containsObject:value]) {
-            fprintf(stderr, "[S2A 画面设置] 【红】%s=%s 无效，清除保存值并使用默认值 %s\n",
-                options[i].key.UTF8String, [[value description] UTF8String], options[i].initial.UTF8String);
+            fprintf(stderr, "[S2A 画面设置] 【红】%s=%s 无效，清除保存值、按没选过走\n",
+                options[i].key.UTF8String, [[value description] UTF8String]);
             [defaults removeObjectForKey:options[i].key];
-            value = options[i].initial;
+            continue;
         }
         apply_environment(options[i].env, value);
         fprintf(stderr, "[S2A 画面设置] %s=%s（本 App 设置）\n", options[i].env, [value UTF8String]);
@@ -430,15 +433,16 @@ void s2a_ios_apply_graphics_settings(NSUserDefaults *defaults) {
     // Switch 档位：与服务层 Host.Docked、直连 dm_opmode 和宽屏表共用；缺省掌机，下次启动生效。
     const char *docked = getenv("S2A_DOCKED");
     if (docked) fprintf(stderr, "[S2A 画面设置] S2A_DOCKED=%s（启动环境）\n", docked);
-    else {
+    else if ([defaults objectForKey:@"S2ADockedMode"]) {   // 只写选过的（同上面各项）：没选过交宿主按逐款缺省 / 缺省掌机
         docked = [defaults boolForKey:@"S2ADockedMode"] ? "1" : "0";
         apply_environment("S2A_DOCKED", @(docked));
         fprintf(stderr, "[S2A 画面设置] S2A_DOCKED=%s（本 App 设置）\n", docked);
-    }
+    } else fprintf(stderr, "[S2A 画面设置] S2A_DOCKED 没选过：不写，按逐款缺省 / 缺省掌机\n");
     // 帧率档位（11-13 维护者：60 / 120 帧补丁都带进去，玩家自己选）：存 S2AFpsPick（0 = 自动：不超过 60 帧的最高一档），运行时 runtime/src/cpatch.c fps_pick 读
     if (!getenv("S2A_FPS_PICK")) {
         NSInteger pick = [defaults integerForKey:@"S2AFpsPick"];
-        if (pick > 0) { apply_environment("S2A_FPS_PICK", [NSString stringWithFormat:@"%ld", (long)pick]); fprintf(stderr, "[S2A 画面设置] S2A_FPS_PICK=%ld（本 App 设置）\n", (long)pick); }
+        // 选过就写（0 = 明确选自动，宿主 cpatch.c 仍按屏幕挑）：没选过交宿主按逐款缺省
+        if ([defaults objectForKey:@"S2AFpsPick"]) { apply_environment("S2A_FPS_PICK", [NSString stringWithFormat:@"%ld", (long)pick]); fprintf(stderr, "[S2A 画面设置] S2A_FPS_PICK=%ld（本 App 设置）\n", (long)pick); }
     }
     // 游戏语言（按款，11-13）：选了哪种就交宿主枚举名给 S2A_SYSTEM_LANGUAGE（Host.cs PickLanguage 优先用它）；跟随系统不设，服务层读本 App 首选语言。
     //   游戏按语言整套换字体，从 Switch 导入的存档里玩家起的名字要和当时 Switch 的语言对上才显示得出来

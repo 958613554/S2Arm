@@ -666,8 +666,11 @@ def launch_env(c, gid, existing=None):
         env["DM_PRESENT_FI"] = "1"
     elif s.get("fps60") is False:
         env["DM_PRESENT_FI"] = "0"
-    if str(s.get("fpsPick") or "0") not in ("", "0"):
-        env["S2A_FPS_PICK"] = str(s["fpsPick"])
+    # 帧率档位 / 画质 / 渲染分辨率 / 帧率上限 / 档位：选过就写，值等于全局缺省也写（11-27 逐款缺省）——宿主对没选过的项按「逐款缺省 → 定义表缺省」定
+    #   （runtime/src/caps.c s2a_game_defaults_apply，未设才写）。原先只写和全局缺省不同的值：玩家明确选回「标准 / 1× / 不限 / 自动」时不写，
+    #   这一项会被这款的逐款缺省盖掉，玩家的选择不算数
+    if "fpsPick" in s:
+        env["S2A_FPS_PICK"] = str(s["fpsPick"])   # "0" = 自动（宿主 cpatch.c fps_pick：0 按屏幕挑）
     # 满屏（11-13 合并「宽屏」与「宽屏强制启用」，同 iPhone settings.m）：明确开 = 没验证过也铺满（画面被拉伸会自动退回 16:9）；明确关 = 16:9；
     #   没选过 = 清单 widen 1 或包里有我方验过的自适应满屏补丁才开。有自适应满屏补丁的款由补丁铺满（下面写进 S2A_CPATCH_ON，S2Arm 满屏让开）；
     #   清单原因「强信号」= 判过坏，一律不开
@@ -689,13 +692,13 @@ def launch_env(c, gid, existing=None):
         if any(k.startswith(("widescreen:", "wsauto:")) for k in on):
             env["S2A_WIDESCREEN"] = "0"   # 开着社区宽屏 / 画幅补丁：游戏自己画宽画面，S2Arm 的满屏（图形层加宽渲染目标）让开，不拉宽两次；关掉补丁恢复
     # 画质提升（11-15，同 iPhone S2AScalingFilter）：2D 游戏专用 = 最近邻；锐利放大 = 直连上屏 MetalFX 空间放大（graphics/nvn/gfx/nvn/nvn_present_fx.inc），没走直连不设
-    if s.get("quality") == "Nearest" or (s.get("quality") in ("MetalFX", "Fsr") and caps.get("direct") == "1"):
+    if s.get("quality") in ("Bilinear", "Nearest") or (s.get("quality") in ("MetalFX", "Fsr") and caps.get("direct") == "1"):
         env["S2A_SCALING_FILTER"] = s["quality"]
     # 渲染分辨率 / 帧率上限（11-17，同 iPhone S2AResolutionScale / S2AFrameRateLimit，ios/settings.m）：缺省 1× / 不限不写，宿主照旧；
     #   其余照选的值设 S2A_RES_SCALE（graphics/nvn/gfx/nvn/nvn_rscale.inc）、S2A_FPS（graphics/loop/RenderLoop.cs、nvn_fps.c）
-    if str(s.get("resolutionScale") or "1") != "1":
+    if "resolutionScale" in s:
         env["S2A_RES_SCALE"] = str(s["resolutionScale"])
-    if str(s.get("fpsLimit") or "0") != "0":
+    if "fpsLimit" in s:
         env["S2A_FPS"] = str(s["fpsLimit"])
     # 即时快照（0.6.0，同 iPhone S2ASnapshot，ios/settings.m）：宿主苹果端缺省开（runtime/src/snapsw.c），只有玩家明确关才写 0；没选过不写
     if s.get("snapshot") is False:
