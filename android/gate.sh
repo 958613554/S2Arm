@@ -10,7 +10,7 @@
 #   · 新图形层 NDK 交叉链接：android/native/gfx_plat/gate.sh；
 #   · 安卓 APK 单库链接核对：tests/android_apk_link_test.sh；Linux runtime CTest：android/linux_ctest.sh（要 aarch64 Linux / colima）；
 #   · nvn_gpu_* Vulkan 后端契约用例：tests/android_vk_test.sh。
-# 门禁预算：--budget → 1800 秒（11-20 本机整套 1464 秒，基线 c11c831ed；整套串行时用。按子项键拆开后 9 键并行时最长键 Linux 门禁机实测约 6 分钟）
+# 门禁预算：--budget → 1800 秒（11-20 本机整套 1464 秒，基线 c11c831ed；整套串行时用。按子项键拆开后：逐步计时累加最长键约 6 分钟；与他线负载同机 9 键并行实测最长 784 秒）
 [ "${1:-}" = --budget ] && { echo 1800; exit 0; }
 set -euo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)"   # 仓库根
