@@ -708,3 +708,4 @@
 20261127-1853-audio-nodestates-pinned.patch
 20261127-0530-snap-domain-id-taken-log.patch
 20261127-2342-audio-depth-drain.patch
+20261127-1257-libpack-ssbo-window-mask.patch

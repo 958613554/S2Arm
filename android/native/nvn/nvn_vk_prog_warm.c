@@ -52,6 +52,7 @@ enum {
     REC_KEYS = 36,
     REC_C1_OK = REC_KEYS + NVK_PROG_REC_STAGES * 8,
     REC_LP_OK = REC_C1_OK + 1,
+    REC_LP_SSBO_WINDOW = REC_LP_OK + 1,
     REC_C1_LEN = REC_C1_OK + 4,
     REC_USES = REC_C1_LEN + NVK_PROG_REC_STAGES * 4,
     REC_LAST_USE = REC_USES + 4,
@@ -169,6 +170,7 @@ static int rec_well_formed(const struct nvk_prog_rec *r) {
     if (!r || identity_zero(r->identity)) return 0;
     const uint32_t slots = r->stage_mask == 32u ? 1u : r->stage_mask;   // CS 仍用记录槽 0
     if ((r->stage_mask != 32u && !s2a_direct_graphics_stage_span(slots)) || (r->c1_ok & ~slots)) return 0;
+    if (r->lp_ssbo_window && (r->lp_ssbo_window != 1 || r->lp_ok != 2)) return 0;
     for (int st = 0; st < NVK_PROG_REC_STAGES; st++)
         if ((r->c1_ok & (1u << st)) && (!r->c1[st] || r->c1_len[st] < NVK_PROG_REC_C1_MIN || r->c1_len[st] > NVK_PROG_REC_C1_MAX)) return 0;
     return 1;
@@ -556,6 +558,7 @@ int nvk_prog_warm_load(void) {
         memcpy(s.rec.keys, e + REC_KEYS, sizeof s.rec.keys);
         s.rec.c1_ok = e[REC_C1_OK];
         s.rec.lp_ok = e[REC_LP_OK];   // 2 = 按含「存储缓冲不对齐」的规则判可用；旧清单里的 1 当不可用
+        s.rec.lp_ssbo_window = e[REC_LP_SSBO_WINDOW];   // 旧 v3 的保留字节为 0。
         for (int st = 0; st < NVK_PROG_REC_STAGES; st++) {
             if (!(s.rec.c1_ok & (1u << st))) continue;
             s.rec.c1_len[st] = get_u32(e + REC_C1_LEN + 4 * st); s.rec.c1[st] = buf + eoff; eoff += pad4(s.rec.c1_len[st]);
@@ -681,6 +684,7 @@ void nvk_prog_warm_note(const struct nvk_prog_rec *rec_in) {
         if (s->rec.uses != 0xFFFFFFFFu) s->rec.uses++;
         s->last_use_rank = rank;
         s->rec.stage_mask = rec->stage_mask; s->rec.lp_ok = rec->lp_ok;   // 同身份即同状态：旧清单读来的 0 在这里刷新
+        s->rec.lp_ssbo_window = rec->lp_ssbo_window;
         memcpy(s->rec.keys, rec->keys, sizeof s->rec.keys);
         // c1 只在这次快照确实带回来时才覆盖（真实 resolve 有视图；清单加载来的记录没有新视图）。
         for (int st = 0; st < NVK_PROG_REC_STAGES; st++)
@@ -838,7 +842,7 @@ void nvk_prog_warm_save(void) {
             memcpy(p, s->rec.identity, 32); p += 32;
             put_u32(&p, s->rec.stage_mask);
             memcpy(p, s->rec.keys, sizeof s->rec.keys); p += sizeof s->rec.keys;
-            put_u8(&p, s->rec.c1_ok); put_u8(&p, s->rec.lp_ok); put_u8(&p, 0); put_u8(&p, 0);   // 保留
+            put_u8(&p, s->rec.c1_ok); put_u8(&p, s->rec.lp_ok); put_u8(&p, s->rec.lp_ssbo_window); put_u8(&p, 0);
             for (int st = 0; st < NVK_PROG_REC_STAGES; st++) put_u32(&p, (s->rec.c1_ok & (1u << st)) ? s->rec.c1_len[st] : 0);
             put_u32(&p, s->rec.uses);
             put_u64(&p, s->last_use_rank);

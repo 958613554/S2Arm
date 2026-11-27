@@ -117,11 +117,13 @@ static prog_t gs_program;
 static uint8_t gs_keys[6][8], gs_stages[6], gs_keys_ok;
 #define CHECK(c, ...) do { checks++; if (!(c)) { failures++; fprintf(stderr, "FAIL: "); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
+static int fixture_ssbo_window = -1;
 void nvn_plat_safepoint(void) {}
 // 宿主夹具没有跨局缓存目录：程序预热清单不落盘（nvk_prog_warm 只读平台目录，不读环境变量）。
 const char *nvn_plat_dir(int which) { return which == NVN_PLAT_DIR_CACHE ? getenv("S2A_PW_TEST_DIR") : NULL; }
 static int fixture_warm_nowindow, fixture_warm_capture, fixture_no_libpack;
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_libpack_ssbo_window") && fixture_ssbo_window >= 0) return fixture_ssbo_window;
     if (!strcmp(name, "no_libpack") && fixture_no_libpack) return 1;
     if (!strcmp(name, "nvk_warm_capture")) return fixture_warm_capture;
     if (!strcmp(name, "nvk_warm_nowindow")) return fixture_warm_nowindow;
@@ -2430,6 +2432,7 @@ static int cs_libpack_test(void) {
     CHECK(rp_shader_resolve_compute(&p) == 0 && p && compiler_calls == 0 && cs_loads == 1,
           "aligned CS storage hits the library, compiler not called (calls=%d red=%s)", compiler_calls, last_red);
     CHECK(lp_unref_lines == 0, "aligned library hit does not log the unaligned-refuse line (got %d)", lp_unref_lines);
+    fixture_ssbo_window = 0;   // 显式验证关闭窗口合同后的旧闸。
     int calls = compiler_calls, unref0 = lp_unref_lines;
     rp_S.ssbo[5][0].addr = 0x10001;   // 同键同绑定、只有对齐实况变：16 非对齐
     p = NULL;
@@ -2453,6 +2456,30 @@ static int cs_libpack_test(void) {
     CHECK(rp_shader_resolve_compute(&p) == 0 && p && compiler_calls == calls,
           "realigned CS storage uses the library again (calls=%d)", compiler_calls);
     CHECK(nvk_shader_cs_lib_note(rp_S.skey[5]) == NULL, "a library hit clears the remembered reason");
+    fixture_ssbo_window = -1;
+    // A compute stage that certifies it needs no storage compensation must
+    // still be usable when its guest binds an unrelated non-aligned slot.
+    char window_root[256], window_json[512];
+    snprintf(window_json, sizeof window_json,
+             "{\"stage\":\"cs\",\"dm_ctl\":\"%s\",\"ssbo_window_abi\":1,\"bindings\":["
+             "{\"msl_name\":\"cp_c0\",\"kind\":\"drvcb\",\"bank\":0,\"arg_id\":0}]}", khex);
+    const uint8_t *window_data[2] = { (const uint8_t *)window_json, (const uint8_t *)csspv };
+    const size_t window_lengths[2] = { strlen(window_json), sizeof csspv };
+    CHECK(cs_lib_root(window_root, ck, ckind, window_data, window_lengths, 2) == 0,
+          "window CS library container written");
+    for (unsigned remainder = 0; remainder < 16; remainder += 4) {
+        rp_shader_reset();
+        rp_S.ssbo[5][0].addr = 0x10000 + remainder;
+        p = NULL;
+        calls = compiler_calls;
+        const int rc = rp_shader_resolve_compute(&p);
+        CHECK(rc == 0 && p && p->lib_sourced && compiler_calls == calls,
+              "window CS resolves from LibPack (remainder=%u rc=%d live compiles=%d)",
+              remainder, rc, compiler_calls - calls);
+    }
+    cs_lib_root_rm(window_root);
+    setenv("S2A_SHADER_REVISION_ROOT", root, 1);
+    rp_S.ssbo[5][0].addr = 0x10000;
     // 共享内存闸：同一键换一份 spill 库件（Workgroup 45056 > 本机上限）→ 出库拒，备忘写「共享内存超设备上限」；库里没有这一键 → 「库里没有这一键」
     {   static const uint32_t wgspv[] = {
             0x07230203u, 0x00010000u, 0u, 7u, 0u,
@@ -2519,6 +2546,7 @@ static int cs_libpack_test(void) {
               "library piece that cannot be built falls back to live compile (calls=%d)", compiler_calls);
         note = nvk_shader_cs_lib_note(rp_S.skey[5]);
         CHECK(note && strstr(note, "build 失败"), "a marked-bad library program is remembered as a build failure: %s", note ? note : "(none)");
+        fixture_ssbo_window = 0;
         // 现在把备忘换成别的状态（非对齐闸拒查）：命中记坏表时必须改回「build 失败」，而不是留着「非对齐」或空
         rp_S.ssbo[5][0].addr = 0x10001;
         rp_shader_reset(); p = NULL; (void)rp_shader_resolve_compute(&p);
@@ -2528,6 +2556,7 @@ static int cs_libpack_test(void) {
         rp_shader_reset(); p = NULL; (void)rp_shader_resolve_compute(&p);
         note = nvk_shader_cs_lib_note(rp_S.skey[5]);
         CHECK(note && strstr(note, "build 失败"), "a bad-table hit is reported as a build failure, not as a stale reason or as no record: %s", note ? note : "(none)");
+        fixture_ssbo_window = -1;
         cs_lib_root_rm(broot); setenv("S2A_SHADER_REVISION_ROOT", root, 1); }
     unsetenv("S2A_SHADER_REVISION_ROOT");
     char path[700];
@@ -2866,16 +2895,14 @@ static int lp_gate_test(void) {
         CHECK(hits >= 12, "ssbo readout line: cache hits cover every new program (hits=%llu)", hits);
         CHECK(ms * 1000 + us > 0, "ssbo readout line: library read time is recorded (%llu.%03llu ms)", ms, us);
     }
-    // 探测只读：库自己的命中 / 没有 / 坏三个计数只来自真正的取程序（命中 8 = 基准 1 + 没用到的槽非对齐 2 + 用到的槽对齐 1 + 别的阶段 1 + 同阶段别的槽 1
-    //   + 两段交叉 1 + 带按地址访问内存的能力但绑定全对齐 1；没有 3 = 库里没有 VS 键的那两份 + 顶点键库里没有但顶点段全对齐的那份；被挡下的一份都没查过库，
-    //   库里没有 VS 键又非对齐的那份、带按地址访问内存的能力又非对齐的那份也被挡在查库之前）。
-    //   命中 8 里同一组阶段键的重取由库件结果备忘接住（nvk_shader.c lp_memo_*），不再读库：库自己的命中 + 备忘命中 = 8。
+    // 8 次正常命中（含备忘），3 次原有 miss。另有 7 个仅需窗口的旧件
+    // 实际经过查库并被拒为缺少可用窗口版本；只读探测不增加任何合成计数。
     {
         extern void nvk_shader_test_tally_line(char *out, size_t n);
         char tl[640]; nvk_shader_test_tally_line(tl, sizeof tl);
         const char *mh = strstr(tl, "库件备忘 命中 ");
         const unsigned long long memo = mh ? strtoull(mh + strlen("库件备忘 命中 "), NULL, 10) : 0;
-        CHECK(mh && s2a_libpack_hits() + memo == 8 && s2a_libpack_misses() == 3 && s2a_libpack_rejects() == 0,
+        CHECK(mh && s2a_libpack_hits() + memo == 8 && s2a_libpack_misses() == 10 && s2a_libpack_rejects() == 0,
               "gate probe leaves the library counters alone (hits=%llu + memo=%llu, misses=%llu rejects=%llu)",
               (unsigned long long)s2a_libpack_hits(), memo, (unsigned long long)s2a_libpack_misses(), (unsigned long long)s2a_libpack_rejects());
     }
