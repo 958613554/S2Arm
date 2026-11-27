@@ -14,7 +14,7 @@ free() { if [ -n "${S2A_PACKS_FREE_CMD:-}" ]; then bash -c "$S2A_PACKS_FREE_CMD"
 a=$(free); [ $(( a - NEED )) -ge "$FLOOR" ] && exit 0
 busy=" "; for l in ../jobs/*/pack; do [ -L "$l" ] && busy="$busy$(basename "$(readlink "$l")") "; done
 lst=; for g in *; do [ -d "$g" ] && [ "$g" != "$G" ] || continue; case $busy in *" $g "*) continue;; esac   # case 不放进 $( )：macOS 自带 bash 3.2 解析不了
-  lst="$lst$(stat -f %m ".used_$g" 2> /dev/null || stat -f %m "$g") $g
+  lst="$lst$(stat -c %Y ".used_$g" 2> /dev/null || stat -f %m ".used_$g" 2> /dev/null || stat -c %Y "$g" 2> /dev/null || stat -f %m "$g") $g
 "; done
 order=$(printf '%s' "$lst" | sort -n | awk '{print $2}')
 out=
