@@ -27,7 +27,7 @@
 static unsigned checks, fails;
 #define REQUIRE(x) do { if (!(x)) { fprintf(stderr, "FAIL setup %s:%d %s\n", __FILE__, __LINE__, #x); exit(2); } } while (0)
 #define VERIFY(c, ...) do { checks++; int ok_ = !!(c); if (!ok_) fails++; printf("%s ", ok_ ? "PASS" : "FAIL"); printf(__VA_ARGS__); putchar('\n'); fflush(stdout); } while (0)
-enum { MEM = 160 << 20, IO_OFF = 0x1000 };
+enum { MEM = 256 << 20, IO_OFF = 0x1000 };   // ⑲ 再要约 67 MB
 static uint8_t *memory; static pool_t *pool; static size_t mem_next = 0x100000;
 static tex_t texs[400];
 
@@ -495,6 +495,23 @@ int main(void) { @autoreleasepool {
                    (unsigned long long)(r_live >> 20), (unsigned long long)(r_spent >> 20), (unsigned long long)r_full,
                    (unsigned long long)r_gpu_hi, (unsigned long long)(floor >> 20), (unsigned long long)(floor_off >> 20), (unsigned long long)r_ios_mid, (unsigned long long)r_ios_lo,
                    (unsigned long long)(r_ios_ok >> 20), (unsigned long long)e164, (unsigned long long)dum);
+        }
+        // ⑲ 额度留下的贴图按留下的先后建（#2269：从小到大时，源源不断的小贴图把每帧额度用光，14 MB 的大贴图一直轮不到、等着色器读到才建，读到占位一帧）
+        //   本帧额度花满时登记：A 14 MB、C 33 MB（超过一整帧 32 MB，永远放不下）、B1–B4 各 5 MB，全进额度队列。手算下一帧（额度 32 MB）：
+        //   A 14 → 剩 18；C 放不下一整帧，跳过、不挡后面；B1 5 → 13、B2 5 → 8、B3 5 → 3；B4 5 > 3 → 这一帧停、留到下一帧；再下一帧 B4 建，C 仍不建。
+        //   原先从小到大：5 + 5 + 5 + 5 = 20、再加 A 14 = 34 > 32 → 只建到 5 MB 的，A 这一帧不建
+        {
+            atomic_fetch_add(&g_cur_frame, 1); pool_walk_frame(); g_walk_spent = POOL_FRAME_BYTES;   // 本帧预建额度已花满
+            texture(380, W, 14 * MB / (W * 4), 0); texture(381, W, 33 * MB / (W * 4), 0);
+            for (int k = 382; k <= 385; k++) texture(k, W, 5 * MB / (W * 4), 0);
+            table_entry(3, 0, NULL);
+            int queued = 1; for (int k = 380; k <= 385; k++) queued &= !made(k) && (g_pleft.bits[(uint32_t)k >> 5] >> (k & 31) & 1);
+            atomic_fetch_add(&g_cur_frame, 1); table_entry(3, 0, NULL);
+            int a = made(380), c = made(381), b1 = made(382), b2 = made(383), b3 = made(384), b4 = made(385);
+            atomic_fetch_add(&g_cur_frame, 1); table_entry(3, 0, NULL);
+            VERIFY(queued && a && !c && b1 && b2 && b3 && !b4 && made(385) && !made(381),
+                   "⑲ 额度队列先进先出：花满那帧全排队 %d（期望 1）；下一帧 A %d、C %d、B1–B4 %d%d%d%d（期望 1、0、1110）；再下一帧 B4 %d、C %d（期望 1、0）",
+                   queued, a, c, b1, b2, b3, b4, made(385), made(381));
         }
     }
     printf("%s t_nvn_pool_tex：%u 项，%u 项失败（追不到槽的句柄按编号读池：池表 + 已读位图 + 未写渲染目标不建 + 小贴图预建 + 表复用）\n", fails ? "✗" : "✓", checks, fails);
