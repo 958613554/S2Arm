@@ -19165,40 +19165,25 @@ static int disp_hits(const disp_rng *rg) {
 static void dw_put(uint64_t *lo, uint64_t *hi, int *n, uint64_t a, uint64_t b) { for (int k = 0; k < *n; k++) if (lo[k] == a && hi[k] == b) return; if (*n >= DW_MAX) return; lo[*n] = a; hi[(*n)++] = b; }   // 同一段不重记：粒子系统共用它们的表
 static void disp_note(const disp_rng *rg) {   // 记下这次派发的读写范围（屏障之后表是空的，放得下）
     if (disp_mode() == 2) {
-        if (!(g_dw_n == 1 && g_dw_lo[0] == 0 && g_dw_hi[0] == ~0ull)) {
-            for (int i = 0; i < rg->nw; i++) dw_put(g_dw_lo, g_dw_hi, &g_dw_n, rg->wlo[i], rg->whi[i]);
-            for (int i = 0; i < rg->nr; i++) dw_put(g_dr_lo, g_dr_hi, &g_dr_n, rg->rlo[i], rg->rhi[i]);
-        }
+        for (int i = 0; i < rg->nw; i++) dw_put(g_dw_lo, g_dw_hi, &g_dw_n, rg->wlo[i], rg->whi[i]);
+        for (int i = 0; i < rg->nr; i++) dw_put(g_dr_lo, g_dr_hi, &g_dr_n, rg->rlo[i], rg->rhi[i]);
         g_blit_ops++; return;
     }
     for (int i = 0; i < rg->nw; i++) { g_bw_lo[g_bw_n] = rg->wlo[i]; g_bw_hi[g_bw_n++] = rg->whi[i]; }
     for (int i = 0; i < rg->nr; i++) { g_br_lo[g_br_n] = rg->rlo[i]; g_br_hi[g_br_n++] = rg->rhi[i]; }
     g_blit_ops++;
 }
-static int disp_need_barrier(const disp_rng *rg) {
-    if (!g_blit_ops) return 0;
-    if (rg) return disp_hits(rg);
-    if (disp_mode() == 2) {
-        if (g_dsp_game_bar) { g_disp_gbar++; return 1; }
-        return g_bw_n > 0 || g_br_n > 0;
-    }
-    return 1;
-}
 static id<MTL4ComputeCommandEncoder> dispatch_enc(const disp_rng *rg) {
     blit_open_k(1);   // Metal 3: a compute encoder (blit_open_k)
     if ((g_disp_ranged + g_disp_full) && !((g_disp_ranged + g_disp_full) % 20000)) MLOG("compute dispatches: read / write ranges known for %llu (no barrier before %llu of them, a barrier of the game's before %llu), not known for %llu (barrier before each)", (unsigned long long)g_disp_ranged, (unsigned long long)g_disp_nobar, (unsigned long long)g_disp_gbar, (unsigned long long)g_disp_full);
     if (rg) {
         g_disp_ranged++;
-        if (disp_need_barrier(rg)) blit_barrier(); else if (g_blit_ops) g_disp_nobar++;
+        if (g_blit_ops && disp_hits(rg)) blit_barrier(); else if (g_blit_ops) g_disp_nobar++;
         disp_note(rg);
     } else {
-        g_disp_full++;
-        if (disp_need_barrier(NULL)) blit_barrier(); else if (g_blit_ops) g_disp_nobar++;
-        if (disp_mode() == 2) {
-            g_dw_lo[0] = 0; g_dw_hi[0] = ~0ull; g_dw_n = 1; g_dr_n = 0; g_blit_ops = 1;
-        } else {
-            g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1;   // recorded as "everything written": the next copy or dispatch gets a barrier
-        }
+    g_disp_full++;
+    if (g_blit_ops) blit_barrier();
+    g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1;   // recorded as "everything written": the next copy or dispatch gets a barrier
     }
     g_dsp_game_bar = 0;   // 游戏屏障只管到下一次派发
     if (!g_blit_ct) { enc_c_table(g_blit, g_ct); g_blit_ct = 1; }
