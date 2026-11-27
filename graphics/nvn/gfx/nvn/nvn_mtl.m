@@ -12874,6 +12874,12 @@ static uint64_t g_psnap_gen = 1;   // bumped when a table's address changes (mad
 static uint64_t g_pool_walks, g_pool_made, g_pool_upd_dirty, g_pool_upd_ret, g_pool_upd_seen, g_pool_upd_left, g_pool_calls; static double g_pool_ms, g_pool_walk_ms;
 // Made only when a shader read it (pool_seen_word): that submission read the dummy (a one-frame black flash, #2269), counted whole run and since the last pool tables line
 static uint64_t g_pool_seen_late, g_pool_seen_late_last;
+// How each texture ID's last lookup for a table ended (pool_tex_obj), for the case lines above: why one a shader read was not made before
+enum { PM_NEVER, PM_STORAGE, PM_FAILED, PM_LEFT, PM_UNWRITTEN, PM_MADE, PM_DIRTY };
+static uint8_t g_pool_miss[1u << 20];
+static const char *const k_pool_miss[] = {"never looked up", "storage not live at its last lookup", "making it failed at its last lookup", "left out by the budget at its last lookup",
+                                          "an unwritten target at its last lookup", "made before (since dropped)", "registered, not looked up since"};
+static void pool_miss_set(int id_, int why) { if (id_ > 0 && id_ < (1 << 20)) g_pool_miss[id_] = (uint8_t)why; }
 // Whether a registered texture's storage still exists before a walk makes a texture no draw has bound: a game leaves IDs registered after it is done with their textures, and upstream's
 // first pool walk crashed on a finalized pool's garbage storage (its GitHub issue #934). So: not marked gone (its pool was finalized, treg_drop_pool_views), the pool object is live
 // (nvnMemoryPoolFinalize clears the magic) and an ordinary pool's storage lies in a pool the host maps (otherwise the upload would read the guest address on the CPU)
@@ -13071,13 +13077,14 @@ static void *pool_tex_obj(int id_, uint64_t limit, int *left, uint64_t *rid, int
     *left = 0;
     if (id_ <= 0 || id_ >= g_ntreg || !g_treg[id_].ok) return NULL;
     treg_t *r = &g_treg[id_];
-    if (!r->view && !tex_storage_live(r)) return NULL;
-    if (!r->view && !write && pool_unwritten_target(&r->t)) { *left = 2; return NULL; }   // a target: the dummy until a pass writes it (tracked in g_punwritten so the next pool_gpu after the pass populates it immediately, #674)
+    if (!r->view && !tex_storage_live(r)) { pool_miss_set(id_, PM_STORAGE); return NULL; }
+    if (!r->view && !write && pool_unwritten_target(&r->t)) { *left = 2; pool_miss_set(id_, PM_UNWRITTEN); return NULL; }   // a target: the dummy until a pass writes it (tracked in g_punwritten so the next pool_gpu after the pass populates it immediately, #674)
     int made = r->view || tex_get(r->t.serial);
-    if (!made && pool_tex_size(&r->t) > limit && !(pool_seen(id_) && g_walk_req < POOL_REQ_BYTES)) { *left = 1; return NULL; }
+    if (!made && pool_tex_size(&r->t) > limit && !(pool_seen(id_) && g_walk_req < POOL_REQ_BYTES)) { *left = 1; pool_miss_set(id_, PM_LEFT); return NULL; }
     void *tv = NULL; uint64_t tr = tex_fast_rid(id_, &tv);
     if (!made && tv) { g_walk_spent += pool_tex_size(&r->t); if (pool_seen(id_)) g_walk_req += pool_tex_size(&r->t); }
-    if (!tv || !tr) return NULL;
+    if (!tv || !tr) { pool_miss_set(id_, PM_FAILED); return NULL; }
+    pool_miss_set(id_, PM_MADE);
     r->tt1 = (uint8_t)((__bridge id<MTLTexture>)tv).textureType + 1;
     *rid = tr; return tv;
 }
@@ -13151,7 +13158,7 @@ static void pool_dset_add(pool_dset *d, int id_) {
     d->bits[w] |= b; d->list[d->n++] = (uint32_t)id_;
 }
 static void pool_dset_clear(pool_dset *d) { for (uint32_t j = 0; j < d->n; j++) d->bits[d->list[j] >> 5] &= ~(1u << (d->list[j] & 31)); d->n = 0; }
-static void pool_dirty(int samp, int id_) { if (atomic_load_explicit(&g_ptab_any, memory_order_relaxed)) pool_dset_add(&g_pdirty[samp != 0], id_); }
+static void pool_dirty(int samp, int id_) { if (atomic_load_explicit(&g_ptab_any, memory_order_relaxed)) { pool_dset_add(&g_pdirty[samp != 0], id_); if (!samp) pool_miss_set(id_, PM_DIRTY); } }
 // At most once a submission: the bits the shaders set since go into g_seen_done, and their textures are made (up to POOL_REQ_BYTES a frame; the rest, and targets not yet written, wait in
 // g_seen_todo) and put into the tables. The IDs shaders read are looked up again when a texture changed somewhere (g_ser_gen: storage swapped or taken over, a shared texture replaced
 // while its old one stays alive elsewhere, a target first written) or guest memory did (a CPU-written texture is checked against guest writes only when it is looked up, tex_by_id
@@ -13166,14 +13173,14 @@ static void pool_seen_word(unsigned i, int recheck, int sg_chg, uint64_t sg) {
         g_seen_todo[i] &= ~(1u << b);
         int unmade = !g_treg[id_].view && !tex_get(g_treg[id_].t.serial);
         int in_left = g_pleft.bits && (g_pleft.bits[(uint32_t)id_ >> 5] >> (id_ & 31) & 1);   // left out by the up-front budget (pool_left_scan's queue) vs never looked up since it registered
-        uint64_t spent = g_walk_spent;
+        uint64_t spent = g_walk_spent; int why = id_ < (1 << 20) ? g_pool_miss[id_] : PM_NEVER;
         pool_tex_update(id_, 0); g_pool_upd_seen++;
         if (unmade && (g_treg[id_].view || tex_get(g_treg[id_].t.serial))) {
             g_pool_seen_late++;
             // The first cases one by one (#2269): which way each was missed — waiting in the budget queue, or not there (a registration path that never looked it up)
-            if (g_pool_seen_late <= 32) MLOG("pool tables: made only once a shader read the dummy, case %llu: ID %d %ux%u format %#x %llu KB, %s; made this frame so far %llu MB (up-front budget %u MB), frame %llu",
+            if (g_pool_seen_late <= 32) MLOG("pool tables: made only once a shader read the dummy, case %llu: ID %d %ux%u format %#x %llu KB, %s (%s); made this frame so far %llu MB (up-front budget %u MB), frame %llu",
                 (unsigned long long)g_pool_seen_late, id_, g_treg[id_].t.d.width, g_treg[id_].t.d.height, g_treg[id_].t.d.format,
-                (unsigned long long)(pool_tex_size(&g_treg[id_].t) >> 10), in_left ? "waiting in the budget queue" : "not in the budget queue",
+                (unsigned long long)(pool_tex_size(&g_treg[id_].t) >> 10), in_left ? "waiting in the budget queue" : "not in the budget queue", k_pool_miss[why],
                 (unsigned long long)(spent >> 20), POOL_FRAME_BYTES >> 20, (unsigned long long)atomic_load(&g_cur_frame));
         }
     }
