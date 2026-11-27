@@ -31,13 +31,26 @@ static uint64_t producerValue;
 static CAMetalLayer *layer;
 static NSString *outputDirectory;
 static pthread_mutex_t drawableMutex = PTHREAD_MUTEX_INITIALIZER;
+enum { ASYNC_FRAMES = 6, MAX_OBSERVATIONS = 32 };
 static id<CAMetalDrawable> observedDrawable;
+// 读回只读「呈现之前拷出的那一份」（11-27）：原先 present 之后才调 drawable.texture 读回——CoreAnimation 接口误用（系统日志每格一次
+//   「should not be called after already presenting this drawable」），且图层只有 3 个 drawable 循环复用（同一对象第 8、11 帧各用一次），
+//   持有引用也挡不住它被后面的帧重画：异步批偶发整块 stale/cross-frame 像素即此。现在在生产把这张 drawable 交出去之前，同一队列上先拷到
+//   测试自己的贴图（Metal 3：同一条命令缓冲 presentDrawable 前编一笔拷贝；Metal 4：signalDrawable 前在同一队列上插一笔拷贝并等它），读回读拷贝
+static id<MTLTexture> observedTexture;   // 拿到 drawable 时取的贴图引用：只用来核尺寸、核拷贝不是它本身
+static id<MTLTexture> preCopies[MAX_OBSERVATIONS];   // 第 k 次拿到的 drawable 在呈现前拷出的那一份（under drawableMutex）
+static BOOL preCopyPending[MAX_OBSERVATIONS];   // 这一序号的拷贝已在建（under drawableMutex）
+static unsigned preCopyCount, preCopyMiss;
+static pthread_cond_t preCopyCond = PTHREAD_COND_INITIALIZER;   // preCopies 登记了一份（读回在等它）
+static IMP originalPresentDrawable, originalPresentDrawableAfter, originalSignalDrawable;
+static id<MTLSharedEvent> copyEvent; static uint64_t copyValue;
 static IMP originalNextDrawable;
 static uint64_t drawableCount;
 static uint64_t lastTicket, asyncDrawableBase;
 static BOOL observeAsync;
-enum { ASYNC_FRAMES = 6, MAX_OBSERVATIONS = 32 };
 static id<CAMetalDrawable> asyncDrawables[ASYNC_FRAMES];
+static BOOL asyncCopied[ASYNC_FRAMES];   // 异步批第 i 帧读的是呈现前的独立拷贝（消费线程写、主线程等完再 CHECK）
+static id<MTLTexture> asyncTextures[ASYNC_FRAMES];   // 同 observedTexture：拿到时的贴图引用，只核尺寸 / 身份
 typedef struct {
     uint64_t sequence, ticket, drawableID;
     uintptr_t address;
@@ -71,15 +84,16 @@ static void notePresentation(const char *event, uint64_t sequence, uint64_t tick
 
 static id<CAMetalDrawable> observeDrawable(id object, SEL selector) {
     id<CAMetalDrawable> drawable = ((id<CAMetalDrawable> (*)(id, SEL))originalNextDrawable)(object, selector);
+    id<MTLTexture> texture = drawable.texture;   // 生产还没往里画、更没呈现
     pthread_mutex_lock(&drawableMutex);
-    observedDrawable = drawable; drawableCount++;
+    observedDrawable = drawable; observedTexture = texture; drawableCount++;
     uint64_t sequence = drawableCount;
     if (sequence > MAX_OBSERVATIONS) { fprintf(stderr, "drawable observation capacity exceeded\n"); exit(1); }
     observations[sequence - 1] = (PresentObservation){ .sequence = sequence, .drawableID = drawable.drawableID,
         .address = (uintptr_t)(__bridge void *)drawable, .acquired = CACurrentMediaTime() };
     logPresentationLocked("acquired", &observations[sequence - 1]);
     if (observeAsync && drawableCount > asyncDrawableBase && drawableCount <= asyncDrawableBase + ASYNC_FRAMES)
-        asyncDrawables[drawableCount - asyncDrawableBase - 1] = drawable;
+        { asyncDrawables[drawableCount - asyncDrawableBase - 1] = drawable; asyncTextures[drawableCount - asyncDrawableBase - 1] = texture; }
     pthread_mutex_unlock(&drawableMutex);
     // 在生产 present_note 注册之前，独立观察同一个真实 drawable 的平台回调。
     // Observe the real platform callback independently of the production ring.
@@ -93,6 +107,75 @@ static id<CAMetalDrawable> observeDrawable(id object, SEL selector) {
         pthread_mutex_unlock(&drawableMutex);
     }];
     return drawable;
+}
+
+static NSData *readTexture(id<MTLTexture> texture);
+// 生产要交出 drawable d（Metal 3 presentDrawable / Metal 4 signalDrawable）之前调：给它最近一次拿到的那一序号建一张同尺寸同格式的测试贴图，
+//   返回拷贝的目的贴图（源 = 此刻还没呈现的 d.texture）、*seq = 那一序号；不是本测观察到的 drawable、或这一序号已拷过，返回 nil。
+//   拷贝编好 / 交了之后再 publishPreCopy 登记：Metal 4 生产先 commit 再 signalDrawable，读回线程等到的「这一帧 GPU 做完」可能早于这里，
+//   登记早了读回会在拷贝交给 GPU 之前就去读（11-27 第一版 mtl4 格 10 轮红 3 格：读回时还没有拷贝）
+static void publishPreCopy(long k, id<MTLTexture> copy) {
+    pthread_mutex_lock(&drawableMutex); preCopies[k] = copy; preCopyCount++; pthread_cond_broadcast(&preCopyCond); pthread_mutex_unlock(&drawableMutex);
+}
+static id<MTLTexture> preCopyTarget(id<CAMetalDrawable> d, id<MTLTexture> *src, long *seq) {
+    pthread_mutex_lock(&drawableMutex);
+    long k = -1;
+    for (long i = (long)drawableCount - 1; i >= 0; i--) if (observations[i].address == (uintptr_t)(__bridge void *)d) { k = i; break; }   // 同一对象循环复用：取最近一次
+    BOOL taken = k >= 0 && (preCopies[k] != nil || preCopyPending[k]);
+    if (k >= 0 && !taken) preCopyPending[k] = YES;
+    pthread_mutex_unlock(&drawableMutex);
+    if (k < 0 || taken) { if (k < 0) __atomic_fetch_add(&preCopyMiss, 1, __ATOMIC_RELAXED); return nil; }
+    id<MTLTexture> t = d.texture;   // 呈现之前
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:t.pixelFormat width:t.width height:t.height mipmapped:NO];
+    desc.usage = MTLTextureUsageShaderRead; desc.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> copy = [device newTextureWithDescriptor:desc];
+    if (!copy) { fprintf(stderr, "pre-present copy texture allocation failed\n"); exit(1); }
+    *src = t; *seq = k; return copy;
+}
+static void encodePreCopy(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst) {
+    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    [b copyFromTexture:src toTexture:dst]; [b endEncoding];
+}
+// Metal 3：生产在自己的命令缓冲上 presentDrawable，拷贝编在同一条命令缓冲里、排在呈现之前
+static void presentDrawableCopied(id self, SEL sel, id<MTLDrawable> d) {
+    id<MTLTexture> src; long k; id<MTLTexture> dst = [(id)d conformsToProtocol:@protocol(CAMetalDrawable)] ? preCopyTarget((id<CAMetalDrawable>)d, &src, &k) : nil;
+    if (dst) { encodePreCopy(self, src, dst); publishPreCopy(k, dst); }   // 同一条命令缓冲：读回等的「这一帧 GPU 做完」在拷贝之后
+    ((void (*)(id, SEL, id))originalPresentDrawable)(self, sel, d);
+}
+static void presentDrawableAfterCopied(id self, SEL sel, id<MTLDrawable> d, CFTimeInterval duration) {
+    id<MTLTexture> src; long k; id<MTLTexture> dst = [(id)d conformsToProtocol:@protocol(CAMetalDrawable)] ? preCopyTarget((id<CAMetalDrawable>)d, &src, &k) : nil;
+    if (dst) { encodePreCopy(self, src, dst); publishPreCopy(k, dst); }   // 同一条命令缓冲：读回等的「这一帧 GPU 做完」在拷贝之后
+    ((void (*)(id, SEL, id, CFTimeInterval))originalPresentDrawableAfter)(self, sel, d, duration);
+}
+// Metal 4：生产 commit 之后 signalDrawable 之前。同一队列先发信号 v（生产这一帧的 GPU 工作之后），测试队列等 v、拷贝、发 v+1，
+//   生产队列等 v+1 再放 drawable 去呈现——全程只排 GPU 顺序，不阻塞生产线程（异步批要求入队不等生产者事件）
+static void signalDrawableCopied(id self, SEL sel, id<MTLDrawable> d) {
+    id<MTLTexture> src; long k; id<MTLTexture> dst = [(id)d conformsToProtocol:@protocol(CAMetalDrawable)] ? preCopyTarget((id<CAMetalDrawable>)d, &src, &k) : nil;
+    if (dst) {
+        uint64_t v = __atomic_add_fetch(&copyValue, 2, __ATOMIC_RELAXED);
+        [self signalEvent:copyEvent value:v - 1];
+        id<MTLCommandBuffer> cb = [producer commandBuffer];
+        [cb encodeWaitForEvent:copyEvent value:v - 1];
+        encodePreCopy(cb, src, dst);
+        [cb encodeSignalEvent:copyEvent value:v];
+        [cb commit];
+        publishPreCopy(k, dst);   // 拷贝已交给测试队列：读回在同一队列上排在它后面
+        [self waitForEvent:copyEvent value:v];
+    }
+    ((void (*)(id, SEL, id))originalSignalDrawable)(self, sel, d);
+}
+// 读回第 sequence 次拿到的 drawable 呈现前那份拷贝。*ok = 有拷贝、不是 drawable 自己的贴图、尺寸一致（调用方在主线程 CHECK；没拷贝时返回 nil）
+static NSData *readPreCopy(uint64_t sequence, id<MTLTexture> drawableTexture, BOOL *ok) {
+    id<MTLTexture> copy = nil;
+    if (sequence >= 1 && sequence <= MAX_OBSERVATIONS) {   // 等钩子登记（Metal 4 在 commit 之后才走到 signalDrawable）；兜底 10 秒，等不到判红
+        struct timespec until; clock_gettime(CLOCK_REALTIME, &until); until.tv_sec += 10;
+        pthread_mutex_lock(&drawableMutex);
+        while (!preCopies[sequence - 1] && pthread_cond_timedwait(&preCopyCond, &drawableMutex, &until) == 0) {}
+        copy = preCopies[sequence - 1];
+        pthread_mutex_unlock(&drawableMutex);
+    }
+    *ok = copy && copy != drawableTexture && copy.width == drawableTexture.width && copy.height == drawableTexture.height;
+    return *ok ? readTexture(copy) : nil;
 }
 
 static BOOL presentationConsistent(const PresentObservation *o, double production) {
@@ -274,7 +357,7 @@ static NSData *capture(id<MTLTexture> source, const int crop[4], BOOL flip, int 
     //   等它清零再登记（同 t_nvn_m3 / t_nvn_present_init / t_nvn_rscale；11-20 门禁主机负载 68 时 mtl3 两格卡到 60 秒闹钟就是这个）
     while (mtl_grab_inflight()) sched_yield();
     nvn_be_set_origin_lower_left(flip);
-    pthread_mutex_lock(&drawableMutex); observedDrawable = nil; uint64_t before = drawableCount; pthread_mutex_unlock(&drawableMutex);
+    pthread_mutex_lock(&drawableMutex); observedDrawable = nil; observedTexture = nil; uint64_t before = drawableCount; pthread_mutex_unlock(&drawableMutex);
     dispatch_semaphore_t captured = dispatch_semaphore_create(0);
     __block NSData *grab;
     __block size_t grabWidth, grabHeight;
@@ -294,12 +377,14 @@ static NSData *capture(id<MTLTexture> source, const int crop[4], BOOL flip, int 
     // actual GPU feedback; no display-link drop can advance it (DM_PRESENT_LINK=0).
     nvn_be_present_wait(ticket);
     pthread_mutex_lock(&drawableMutex);
-    id<CAMetalDrawable> drawable = observedDrawable; uint64_t after = drawableCount;
+    id<CAMetalDrawable> drawable = observedDrawable; id<MTLTexture> texture = observedTexture; uint64_t after = drawableCount;
     pthread_mutex_unlock(&drawableMutex);
-    CHECK(drawable && after == before + 1 && drawable.texture.width == (NSUInteger)width && drawable.texture.height == (NSUInteger)height,
+    CHECK(drawable && texture && after == before + 1 && texture.width == (NSUInteger)width && texture.height == (NSUInteger)height,
         "%s observed real CAMetalLayer drawable (%llu -> %llu)", name.UTF8String, before, after);
-    if (!drawable || after != before + 1) exit(1);
-    NSData *actual = readTexture(drawable.texture);
+    if (!drawable || !texture || after != before + 1) exit(1);
+    BOOL copied; NSData *actual = readPreCopy(after, texture, &copied);
+    CHECK(copied, "%s readback from a separate copy made before present (drawable %llu), not the drawable's own texture", name.UTF8String, after);
+    if (!copied) exit(1);
     int maximum, different = pixelDifference(actual, grab, 1, &maximum);
     BOOL fsr = !strcmp(getenv("S2A_SCALING_FILTER") ?: "", "Fsr");
     if (fsr) { fsrDrawable = actual; fsrChanged += different; }
@@ -362,7 +447,7 @@ static void asynchronousBatch(void) {
     uint64_t firstTicket=lastTicket+1, delayedValue=++producerValue;
     pthread_mutex_lock(&drawableMutex);
     asyncDrawableBase=drawableCount; observeAsync=YES;
-    for(int i=0;i<ASYNC_FRAMES;i++) asyncDrawables[i]=nil;
+    for(int i=0;i<ASYNC_FRAMES;i++) { asyncDrawables[i]=nil; asyncTextures[i]=nil; asyncCopied[i]=NO; }
     pthread_mutex_unlock(&drawableMutex);
     dispatch_semaphore_t copied=dispatch_semaphore_create(0);
     NSMutableArray<NSData *> *pixels=[NSMutableArray array];
@@ -374,13 +459,14 @@ static void asynchronousBatch(void) {
                 // pool can make progress. It never blocks the enqueue loop.
                 nvn_be_present_wait(firstTicket+i);
                 pthread_mutex_lock(&drawableMutex);
-                id<CAMetalDrawable> drawable=asyncDrawables[i]; asyncDrawables[i]=nil;
+                id<CAMetalDrawable> drawable=asyncDrawables[i]; id<MTLTexture> texture=asyncTextures[i]; asyncDrawables[i]=nil; asyncTextures[i]=nil;
                 pthread_mutex_unlock(&drawableMutex);
-                if(!drawable) break;
-                NSData *image=readTexture(drawable.texture);
+                if(!drawable || !texture) break;
+                BOOL ok; NSData *image=readPreCopy(asyncDrawableBase+i+1, texture, &ok);
+                asyncCopied[i]=ok; if(!ok) break;
                 notePresentation("async-readback", asyncDrawableBase+i+1, firstTicket+i, drawable);
                 [pixels addObject:image];
-                saveImage(image,drawable.texture.width,drawable.texture.height,[NSString stringWithFormat:@"async-%d",i]);
+                saveImage(image,texture.width,texture.height,[NSString stringWithFormat:@"async-%d",i]);
             }
             dispatch_semaphore_signal(copied);
         }
@@ -401,6 +487,8 @@ static void asynchronousBatch(void) {
     nvn_be_drain();
     BOOL complete=dispatch_semaphore_wait(copied,dispatch_time(DISPATCH_TIME_NOW,30*NSEC_PER_SEC))==0;   // 兜底 30 秒（原 5 秒）
     CHECK(complete && pixels.count==ASYNC_FRAMES,"async true completion/drain and real drawable readback: %lu/6",(unsigned long)pixels.count);
+    int nCopied=0; for(int i=0;i<ASYNC_FRAMES;i++) nCopied+=complete && asyncCopied[i];
+    CHECK(nCopied==ASYNC_FRAMES,"async readback from separate copies made before present (not the drawables' own textures): %d/6",nCopied);
     int actualShown=0;
     for(int i=0;i<ASYNC_FRAMES && complete && i<(int)pixels.count;i++) {
         NSData *image=pixels[i]; const uint8_t *p=image.bytes; int errors=0;
@@ -423,7 +511,25 @@ static void run(void) {
     @autoreleasepool {
         device = (__bridge id<MTLDevice>)mtl_device();
         CHECK(device != nil, "real Metal device: %s", device.name.UTF8String);
-        producer = [device newCommandQueue]; producerEvent = [device newSharedEvent];
+        producer = [device newCommandQueue]; producerEvent = [device newSharedEvent]; copyEvent = [device newSharedEvent];
+        // 呈现前拷贝的钩子（见 preCopies）：换掉这台设备的命令缓冲类的 presentDrawable、Metal 4 队列类的 signalDrawable。生产的队列与这里建的同属一台设备、同一个类；
+        //   没接上时读回判红（「readback from a separate copy made before present」），不会悄悄退回读 drawable 本身
+        {
+            Class cbc = object_getClass([producer commandBuffer]);
+            originalPresentDrawable = method_getImplementation(class_getInstanceMethod(cbc, @selector(presentDrawable:)));
+            originalPresentDrawableAfter = method_getImplementation(class_getInstanceMethod(cbc, @selector(presentDrawable:afterMinimumDuration:)));
+            CHECK(originalPresentDrawable && originalPresentDrawableAfter, "Metal 3 presentDrawable hook installed on %s", class_getName(cbc));
+            if (!originalPresentDrawable || !originalPresentDrawableAfter) exit(1);
+            class_replaceMethod(cbc, @selector(presentDrawable:), (IMP)presentDrawableCopied, "v@:@");
+            class_replaceMethod(cbc, @selector(presentDrawable:afterMinimumDuration:), (IMP)presentDrawableAfterCopied, "v@:@d");
+            if (@available(macOS 26.0, *)) {
+                id<MTL4CommandQueue> q4 = [device newMTL4CommandQueue];
+                Class qc = q4 ? object_getClass(q4) : Nil;
+                originalSignalDrawable = qc ? method_getImplementation(class_getInstanceMethod(qc, @selector(signalDrawable:))) : NULL;
+                if (originalSignalDrawable) class_replaceMethod(qc, @selector(signalDrawable:), (IMP)signalDrawableCopied, "v@:@");
+                printf("Metal 4 signalDrawable hook: %s\n", originalSignalDrawable ? class_getName(qc) : "not installed (no Metal 4 queue)");
+            }
+        }
         NSString *msl = @"#include <metal_stdlib>\nusing namespace metal;\n"
             "vertex float4 vs(uint i [[vertex_id]]) { float2 u=float2((i<<1)&2,i&2); return float4(u*float2(2,-2)+float2(-1,1),0,1); }\n"
             "struct P { int kind,ox,oy,w,h,flip; };\n"
