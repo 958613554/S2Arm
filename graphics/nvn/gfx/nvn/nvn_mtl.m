@@ -6928,7 +6928,9 @@ void nvn_be_tex_release(tex_t *t) {
     nvn_hm_del(&g_snap_texaddr, &t->serial);
     if (held) {   // a pool registration still names it: it stays (g_pool_held), released when the last registration goes (pool_held_check)
         nvn_hm_put(&g_pool_held, &t->serial, (void *)1);
+        g_ser_gen++;   // as a finalize always did: the IDs' cached views resolve again (tex_by_id view_ser), so a remapped sparse texture is checked against its page table
         pthread_mutex_unlock(&g_smu);
+        mtl_vc_drop(t->serial);   //   (pkg_sparse_clean) instead of reading what its old mapping held (t_nvn_tex_finalize remap: 73, read 255); the texture itself stays
         t->serial = 0;
         return;
     }   // 即时存档的「序号 → 对象地址」表跟着删：原先只增不删，随游玩时长涨，存档时逐项查可读（每项一次系统调用）越来越慢
@@ -13460,11 +13462,18 @@ static uint64_t pool_gpu(int samp, int dtt, int dpf, int rw, int base, __unsafe_
     if (!(g_pool_calls & 0x3fff)) {   // how the tables stand: whole walks, buffers, entries looked up again by cause, time in all
         unsigned nseen = 0; uint64_t bseen = 0; for (int id_ = 1; id_ < g_ntreg; id_++) if (g_treg[id_].ok && pool_seen(id_)) { nseen++; bseen += pool_tex_size(&g_treg[id_].t); }
         unsigned hn_ = 0; uint64_t hb_ = 0;   // pool-held serials and what their textures made now take (#2269: is it bounded)
+        typedef struct { uintptr_t p; uint64_t b; } held_tex;
         pthread_mutex_lock(&g_smu);
+        held_tex *ht = g_pool_held.n ? malloc(g_pool_held.n * sizeof *ht) : NULL; uint32_t nht = 0;
         for (uint32_t i = 0; i < g_pool_held.cap; i++) { if (!g_pool_held.vals[i]) continue; hn_++; uint64_t k; memcpy(&k, g_pool_held.keys + (size_t)i * 8, 8);
             __unsafe_unretained id o = hm_get_id(&g_by_serial, &k); id<MTLTexture> x = [o isKindOfClass:[NvPkg class]] ? ((NvPkg *)o)->tex : [o conformsToProtocol:@protocol(MTLTexture)] ? (id<MTLTexture>)o : nil;
-            if (x && !x.buffer && !x.parentTexture) hb_ += x.allocatedSize; }   // own storage only: a texture over a (zero-copy) buffer or a view reports the whole of what it sits on, counted over and over
+            // own storage only, once per texture: one over a (zero-copy) buffer or a view reports the whole of what it sits on, and serials sharing a texture (the sharing table)
+            //   name the same one — summed per serial it read 14 GB against 6 GB allocated on the whole device
+            if (x && !x.buffer && !x.parentTexture && ht && nht < g_pool_held.n) ht[nht++] = (held_tex){(uintptr_t)(__bridge void *)x, x.allocatedSize}; }
         pthread_mutex_unlock(&g_smu);
+        if (ht) qsort_b(ht, nht, sizeof *ht, ^int(const void *a, const void *b) { uintptr_t x = ((const held_tex *)a)->p, y = ((const held_tex *)b)->p; return x < y ? -1 : x > y; });
+        for (uint32_t i = 0; i < nht; i++) if (!i || ht[i].p != ht[i - 1].p) hb_ += ht[i].b;
+        free(ht);
         MLOG("pool tables: %llu calls, whole walks %llu (%.0f ms), buffers %llu; entries looked up again: registrations %llu, retired %llu (late, deferred behind the unpinning submission %llu), read by a shader %llu, left out %llu; %.0f ms in all; %u IDs read by a shader (%llu MB), %u left out, allocated %llu MB; made only once a shader read the dummy %llu (+%llu since the last line); pool-held (finalized, a registration still names them) %u, %llu MB of own storage made now, %llu let go by idle reclaim (%llu MB) so far",
              (unsigned long long)g_pool_calls, (unsigned long long)g_pool_walks, g_pool_walk_ms, (unsigned long long)g_pool_made, (unsigned long long)g_pool_upd_dirty, (unsigned long long)g_pool_upd_ret, (unsigned long long)atomic_load(&g_unpin_late),
              (unsigned long long)g_pool_upd_seen, (unsigned long long)g_pool_upd_left, g_pool_ms, nseen, (unsigned long long)(bseen >> 20), g_pleft.n, (unsigned long long)(g_dev.currentAllocatedSize >> 20),
