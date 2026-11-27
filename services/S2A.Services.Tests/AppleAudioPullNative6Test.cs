@@ -13,7 +13,7 @@ namespace S2A.Services.Tests
     // #2157 只留一种传输：native 6ch（无折叠、真 5.1 设备）直通进拉取——v1 的拉取档在 6ch 无折叠时红字拒收、整会话退 AudioQueue
     //   （v1 ApplePullHardwareDeviceSession 构造里直接 throw）；v2 删掉拒收分支，器件 StreamFormat 按设备声道（6ch）+ 声明 5.1 布局
     //   （MPEG_5_1_A，不声明时系统隐式 6→2 只复制 FL/FR、中置与环绕整段丢失）+ 12 B/帧的帧域环寻址（字节域掩码在 12 B/帧上必错位）。
-    //   2ch 测试机上该路径 = AUHAL 客户端 6ch 格式 + 设备 2ch、系统隐式下混（与 AudioQueue 6ch 队列同语义）；真 5.1 设备读数待维护方设备矩阵。
+    //   2ch 设备上该路径 = AUHAL 客户端 6ch 格式 + 设备 2ch、系统隐式下混（与 AudioQueue 6ch 队列同语义）；真 5.1 设备读数待维护方设备矩阵。
     //   期望按语义手算：
     // ① 会话类型 = ApplePullHardwareDeviceSession（不再拒收、不退 AudioQueue）
     // ② 开播后放回照常：播完帧数涨到 ≥ 4800（0.1 秒声音；排着 4 秒声音，不缺数据；10 秒为卡死上限）
