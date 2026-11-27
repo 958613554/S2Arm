@@ -9,6 +9,7 @@
 #import "bundle_icon.h"
 #include "s2a_loadprog.h"
 #include "native.h"   // LOG（测试开关 S2A_LOADPAGE_SKIP 的日志行）
+#import "loadpage_title.h"   // 加载页游戏名的取法（#502）
 uint64_t now_ns(void);
 
 // 剩余时间小字：档位同 runtime/src/loadprog.c s2a_load_eta_text（<0 估算中 / <5 秒 / 逐秒 / 分秒 / 整分），文字按 App 语言取字符串表（#316），中文值与那份 C 原句逐字相同
@@ -26,14 +27,12 @@ static NSString *game_data_dir(void) {
     if (gd && *gd) return @(gd);
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/资源包"];
 }
-// NACP 标题：16 种语言各 0x300 字节（名称 0x200 + 发行商 0x100）；简体中文 14、繁体中文 13、日文 2、美式英文 0，先到先得，都没有取第一个非空
+// 游戏名：壳交来的封面名（S2A_GAME_NAME）优先，没有按系统语言取 control.nacp（ios/loadpage_title.h），都没有用 App 显示名
 static NSString *nacp_title(void) {
+    const char *shown = getenv("S2A_GAME_NAME");
     NSData *d = [NSData dataWithContentsOfFile:[game_data_dir() stringByAppendingPathComponent:@"ctl/control.nacp"]];
-    if (d.length >= 0x3000) {
-        const char *p = d.bytes; int order[] = {14, 13, 2, 0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15};
-        for (int i = 0; i < 16; i++) { const char *s = p + order[i] * 0x300; size_t n = strnlen(s, 0x200);
-            if (n) { NSString *t = [[NSString alloc] initWithBytes:s length:n encoding:NSUTF8StringEncoding]; if (t.length) return t; } }
-    }
+    NSString *t = s2a_loadpage_title(shown ? @(shown) : nil, d, NSLocale.preferredLanguages);
+    if (t) return t;
     return [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleDisplayName"] ?: [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleName"] ?: @"";
 }
 static UIImage *game_icon(void) {
