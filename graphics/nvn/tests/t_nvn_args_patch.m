@@ -137,8 +137,8 @@ int main(void) { @autoreleasepool {
     // ⑩ pool_gpu_settled 逐条：pool_gpu 开头每一步有活时都判「没安定」，复原后又安定
     {
         VERIFY(pool_gpu_settled(), "⑩ 前置：安定");
-        int k = 0; while (k < POOL_TABS && !g_ptab[k].used) k++; REQUIRE(k < POOL_TABS && g_ptab[k].n > 0);
-        uint32_t n0 = g_ptab[k].n; g_ptab[k].n = n0 - 1; int grow = pool_gpu_settled(); g_ptab[k].n = n0;
+        int k = 0; while (k < POOL_TABS && !g_ptab[k].used) k++; REQUIRE(k < POOL_TABS);
+        int *cnt = g_ptab[k].samp ? &g_nsreg : &g_ntreg, c0 = *cnt; *cnt = g_ptab[k].base + (int)g_ptab[k].n + 1; int grow = pool_gpu_settled(); *cnt = c0;   // 登记数超过表长 = 要补长（只拨计数、不碰登记表）
         uint64_t sd = g_seen_dirty; g_seen_dirty = sd + 1; int seen_dirty = pool_gpu_settled(); g_seen_dirty = sd;
         uint64_t ss = g_seen_sub; g_seen_sub = ss + 1; int seen_sub = pool_gpu_settled(); g_seen_sub = ss;
         uint64_t sg = g_seen_ser; g_seen_ser = sg + 1; int seen_ser = pool_gpu_settled(); g_seen_ser = sg;
