@@ -75,10 +75,20 @@ def main():
             rc |= result.returncode
         return rc
 
-    live_modes = ('--live-compile-default', '--live-compile-thread', '--live-compile-pending',
+    live_modes = ('--tess-request', '--live-compile-default', '--live-compile-thread', '--live-compile-pending',
                   '--live-compile-stop', '--cs-libpack', '--lp-gate', '--lp-numeric')
     if len(sys.argv) == 2 and sys.argv[1] in live_modes:
         result = run(sys.argv[1][2:], original, args=(sys.argv[1],))
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        return result.returncode
+
+    if len(sys.argv) == 5 and sys.argv[1] in ('--emit-tess', '--execute-tess'):
+        with tempfile.TemporaryDirectory(prefix='tess-warm-', dir=out) as td:
+            manifest = Path(td) / 'manifest'; manifest.mkdir()
+            cache = Path(td) / 'cache'; cache.mkdir()
+            env = dict(os.environ, S2A_PW_TEST_DIR=str(manifest), S2A_DIRECT_CACHE_DIR=str(cache))
+            result = run(sys.argv[1][2:], original, args=sys.argv[1:], env=env)
         sys.stdout.write(result.stdout)
         sys.stderr.write(result.stderr)
         return result.returncode
@@ -140,8 +150,8 @@ def main():
              '    rec.lp_ok = unaligned ? 0 : 2;\n    (void)rec;', '--compute-warm', 'compute program must be recorded in warm manifest'),
             ('wrong-stage', 'memcpy(rec.identity, p->identity, 32); rec.stage_mask = 32;',
              'memcpy(rec.identity, p->identity, 32); rec.stage_mask = 1;', '--compute-warm', 'persisted compute manifest retains identity'),
-            ('wrong-build', 'struct entry *e = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0], 0) : build(bytes, len, views, nst, rec->identity, 0);',
-             'struct entry *e = build(bytes, len, views, nst, rec->identity, 0);', '--compute-warm', 'compute program warm builds from prior cache'),
+            ('wrong-build', 'struct entry *e = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0], 0) : build(bytes, len, views, rec->stage_mask, rec->identity, 0);',
+             'struct entry *e = build(bytes, len, views, rec->stage_mask, rec->identity, 0);', '--compute-warm', 'compute program warm builds from prior cache'),
             ('flag-ignored', 'if (!nvn_plat_flag("nvk_compute_warm", 0)) return;',
              '(void)nvn_plat_flag("nvk_compute_warm", 0);', '--compute-warm-off', 'compute warm off must not record programs'),
         ]

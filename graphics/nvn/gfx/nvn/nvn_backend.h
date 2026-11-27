@@ -142,7 +142,7 @@ typedef struct {
     uint32_t storage_stages;       // 允许存储缓冲 / 存储图像写的 NVN 阶段位（1 << nvn_gpu_stage）(vertexPipelineStoresAndAtomics / fragmentStoresAndAtomics)
     uint32_t atomic_stages;        // 允许图像原子的 NVN 阶段位；具体格式再看 NVN_GPU_FMT_ATOMIC
     uint32_t display_max_hz;       // 有窗口时屏幕最高刷新率，没窗口 0（来自平台层的窗口；nvn_be_display_hz 的来源）
-    uint32_t max_patch_size;       // v26：曲面细分每片控制点数上限 (maxTessellationPatchSize；未启用 NVN_GPU_CAP_TESSELLATION 时为 0)
+    uint32_t max_patch_size;       // v27：曲面细分每片控制点数上限 (maxTessellationPatchSize；未启用 NVN_GPU_CAP_TESSELLATION 时为 0)
 } nvn_gpu_caps;
 // 每个 NVN 格式在本设备上的用法位（来源：格式属性 optimalTilingFeatures / Metal 格式能力表）
 enum {

@@ -109,6 +109,7 @@ int g_s2a_logfd = 2, s2a_nvn_rast_flip;
 enum { GUEST_BYTES = 0x20000, VBUF_TRI_OFF = 0x0000, VBUF_QUAD_OFF = 0x1000, TCS_UBO_OFF = 0x2000, TES_UBO_OFF = 0x3000 };
 static alignas(4096) unsigned char guest[GUEST_BYTES];
 static struct rp_prog prog;
+static struct rp_tess_layout tess_layout[RP_PROG_STAGES - RP_PROG_INLINE_STAGES];
 static p_set_rt target;
 static tex_t target_tex;
 static nvn_gpu_view target_view;
@@ -400,10 +401,11 @@ static void run_normal_arm(struct s2a_vk_device *device, const char *dir) {
     prog.sh[NVN_GPU_SH_FS] = sh_fs;
     prog.sh[NVN_GPU_SH_TCS] = sh_tri_tcs;
     prog.sh[NVN_GPU_SH_TES] = sh_tri_tes;
+    prog.tess = tess_layout;
     prog.nent[NVN_GPU_SH_TCS] = 1;
-    prog.ent[NVN_GPU_SH_TCS][0] = tcs_ent;
+    tess_layout[NVN_GPU_SH_TCS - RP_PROG_INLINE_STAGES].ent[0] = tcs_ent;
     prog.nent[NVN_GPU_SH_TES] = 1;
-    prog.ent[NVN_GPU_SH_TES][0] = tes_ent;
+    tess_layout[NVN_GPU_SH_TES - RP_PROG_INLINE_STAGES].ent[0] = tes_ent;
     prog.attr_mask = 1;
     prog.color_out_mask = 15;
 

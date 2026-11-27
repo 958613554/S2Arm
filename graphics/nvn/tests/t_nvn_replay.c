@@ -3169,7 +3169,7 @@ static void t_report_position(void) {
 // 最小的可画环境：一个不带属性、不带绑定的程序，一张 64x36 的颜色目标
 static tex_t g_qrt;
 static void q_env(stream *s) {
-    memset(&g_fprog, 0, sizeof g_fprog); for (int st = 0; st < RP_PROG_STAGES; ++st) for (int i = 0; i < RP_PROG_ENT_MAX; ++i) g_fprog.ent[st][i].src_reg2 = UINT16_MAX; g_fprog.sh[0] = &g_fsh[0]; g_fprog.sh[1] = &g_fsh[1]; g_fprog.color_out_mask = 0xffffffffu;
+    memset(&g_fprog, 0, sizeof g_fprog); for (int st = 0; st < RP_PROG_INLINE_STAGES; ++st) for (int i = 0; i < RP_PROG_ENT_MAX; ++i) g_fprog.ent[st][i].src_reg2 = UINT16_MAX; g_fprog.sh[0] = &g_fsh[0]; g_fprog.sh[1] = &g_fsh[1]; g_fprog.color_out_mask = 0xffffffffu;
     g_qrt = mk_tex(91, 0, NVN_FORMAT_RGBA8, 64, 36, 1, 0);
     put_set_rt(s, &g_qrt, NULL);
     p_viewports *vp = put(s, OP_VIEWPORTS, sizeof *vp); vp->n = 1; vp->v[0][2] = 64; vp->v[0][3] = 36;
@@ -3880,8 +3880,13 @@ static void t_tessellation(void) {
     g_caps_extra = NVN_GPU_CAP_TESSELLATION; g_caps_max_patch = 32;
     g_fprog.sh[NVN_GPU_SH_TCS] = &g_fsh[NVN_GPU_SH_TCS];
     g_fprog.sh[NVN_GPU_SH_TES] = &g_fsh[NVN_GPU_SH_TES];
-    g_fprog.nent[NVN_GPU_SH_TCS] = 1; g_fprog.ent[NVN_GPU_SH_TCS][0].cls = NVN_GPU_RES_UBO; g_fprog.ent[NVN_GPU_SH_TCS][0].src_kind = NVN_RB_CBUF;
-    g_fprog.nent[NVN_GPU_SH_TES] = 1; g_fprog.ent[NVN_GPU_SH_TES][0].cls = NVN_GPU_RES_UBO; g_fprog.ent[NVN_GPU_SH_TES][0].src_kind = NVN_RB_CBUF;
+    struct rp_tess_layout tess_layout[RP_PROG_STAGES - RP_PROG_INLINE_STAGES] = {0};
+    g_fprog.tess = tess_layout;
+    for (int st = NVN_GPU_SH_TCS; st <= NVN_GPU_SH_TES; st++) {
+        g_fprog.nent[st] = 1;
+        tess_layout[st - RP_PROG_INLINE_STAGES].ent[0].cls = NVN_GPU_RES_UBO;
+        tess_layout[st - RP_PROG_INLINE_STAGES].ent[0].src_kind = NVN_RB_CBUF;
+    }
     { stream s = {0};
       p_set_patch_size *ps = put(&s, OP_SET_PATCH_SIZE, sizeof *ps); ps->size = 4;
       p_bind_buf *ub = put(&s, OP_BIND_UBO, sizeof *ub); ub->stage = NVN_GPU_SH_TCS; ub->index = 0; ub->addr = base + PG; ub->size = 64;
@@ -7065,7 +7070,7 @@ static void t_draw(void) {   // 绘制：状态在绘制时才变成后端的管
     pass_fresh(); memset(g_pg_gen, 0, sizeof g_pg_gen); g_pg_tracked = 1; g_dirty_now = 100; memset(g_pmem, 0, sizeof g_pmem); g_arena_used = 0;
     g_pipe_gets = g_set_pipes = g_set_dyns = g_gdraws = g_nvb = g_resolves = g_resolve_rc = 0; memset(g_nfb, 0, sizeof g_nfb);
     uint64_t base = (uint64_t)(uintptr_t)g_pmem; nvn_be_pool_add(g_pmem, sizeof g_pmem);
-    memset(&g_fprog, 0, sizeof g_fprog); for (int st = 0; st < RP_PROG_STAGES; ++st) for (int i = 0; i < RP_PROG_ENT_MAX; ++i) g_fprog.ent[st][i].src_reg2 = UINT16_MAX; g_fprog.sh[0] = &g_fsh[0]; g_fprog.sh[1] = &g_fsh[1]; g_fprog.support_bytes = 2608; g_fprog.attr_mask = 1; g_fprog.color_out_mask = 0xffffffffu;
+    memset(&g_fprog, 0, sizeof g_fprog); for (int st = 0; st < RP_PROG_INLINE_STAGES; ++st) for (int i = 0; i < RP_PROG_ENT_MAX; ++i) g_fprog.ent[st][i].src_reg2 = UINT16_MAX; g_fprog.sh[0] = &g_fsh[0]; g_fprog.sh[1] = &g_fsh[1]; g_fprog.support_bytes = 2608; g_fprog.attr_mask = 1; g_fprog.color_out_mask = 0xffffffffu;
     g_fprog.nent[0] = 2; g_fprog.ent[0][0].cls = NVN_GPU_RES_UBO; g_fprog.ent[0][0].src_kind = NVN_RB_SUPPORT;
     g_fprog.ent[0][1].cls = NVN_GPU_RES_UBO; g_fprog.ent[0][1].src_kind = NVN_RB_CBUF; g_fprog.ent[0][1].src_reg = 2;
     g_fprog.nent[1] = 1; g_fprog.ent[1][0].cls = NVN_GPU_RES_TEX_SAMP; g_fprog.ent[1][0].src_kind = NVN_RB_TEX; g_fprog.ent[1][0].src_reg = 5;
@@ -7256,7 +7261,7 @@ static void t_bind_reuse(void) {   // 按脏位少发绑定：没变的阶段不
     pass_fresh(); memset(g_pg_gen, 0, sizeof g_pg_gen); g_pg_tracked = 1; g_dirty_now = 100; memset(g_pmem, 0, sizeof g_pmem); g_arena_used = 0;
     g_gdraws = g_resolve_rc = 0; memset(g_nfb, 0, sizeof g_nfb);
     uint64_t base = (uint64_t)(uintptr_t)g_pmem; nvn_be_pool_add(g_pmem, sizeof g_pmem);
-    memset(&g_fprog, 0, sizeof g_fprog); for (int st = 0; st < RP_PROG_STAGES; ++st) for (int i = 0; i < RP_PROG_ENT_MAX; ++i) g_fprog.ent[st][i].src_reg2 = UINT16_MAX; g_fprog.sh[0] = &g_fsh[0]; g_fprog.sh[1] = &g_fsh[1]; g_fprog.support_bytes = 2608; g_fprog.attr_mask = 1; g_fprog.color_out_mask = 0xffffffffu;
+    memset(&g_fprog, 0, sizeof g_fprog); for (int st = 0; st < RP_PROG_INLINE_STAGES; ++st) for (int i = 0; i < RP_PROG_ENT_MAX; ++i) g_fprog.ent[st][i].src_reg2 = UINT16_MAX; g_fprog.sh[0] = &g_fsh[0]; g_fprog.sh[1] = &g_fsh[1]; g_fprog.support_bytes = 2608; g_fprog.attr_mask = 1; g_fprog.color_out_mask = 0xffffffffu;
     g_fprog.nent[0] = 2; g_fprog.ent[0][0].cls = NVN_GPU_RES_UBO; g_fprog.ent[0][0].src_kind = NVN_RB_SUPPORT;
     g_fprog.ent[0][1].cls = NVN_GPU_RES_UBO; g_fprog.ent[0][1].src_kind = NVN_RB_CBUF; g_fprog.ent[0][1].src_reg = 2;
     g_fprog.nent[1] = 1; g_fprog.ent[1][0].cls = NVN_GPU_RES_TEX_SAMP; g_fprog.ent[1][0].src_kind = NVN_RB_TEX; g_fprog.ent[1][0].src_reg = 5;
