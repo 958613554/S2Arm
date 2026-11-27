@@ -2667,7 +2667,7 @@ static int shader_resolve_graphics(const struct rp_shader_req *q, const struct r
         if (stages & 0x18u) {
             if (!(caps.caps & NVN_GPU_CAP_TESSELLATION)) { nvn_unimpl("shader", "tessellation_not_enabled", NULL); return -1; }
             if (q->prim != NVN_DRAW_PRIMITIVE_PATCHES) { nvn_unimpl("shader", "tessellation_without_patches_topology", NULL); return -1; }
-        } else if (q->prim != 0 && q->prim != 1 && q->prim != 4) {
+        } else if (q->prim >= NVN_DRAW_PRIMITIVE_PATCHES || !topology(q->prim)) {
             nvn_unimpl("shader", "geometry_topology_unimplemented", NULL); return -1;
         }
     }

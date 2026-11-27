@@ -4564,8 +4564,7 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
     const int is_patch = d->prim == NVN_DRAW_PRIMITIVE_PATCHES;
     if (d->st[NVN_GPU_SH_GS].sh && !(g.caps.caps & NVN_GPU_CAP_GEOMETRY))
         return fail(err, NVN_GPU_E_UNSUPPORTED, "GS 未启用或探测未通过");
-    if (d->st[NVN_GPU_SH_GS].sh && d->prim != 0 && d->prim != 1 && d->prim != 4 && !(has_tcs && has_tes && is_patch))
-        return fail(err, NVN_GPU_E_UNSUPPORTED, "GS 非原生图元未实现");
+    // 回放按 #696 展开需要客体顶点顺序的直接绘制；间接绘制使用合法的 Vulkan 原生拓扑。
     if (has_tcs || has_tes || is_patch) {
         if (!(g.caps.caps & NVN_GPU_CAP_TESSELLATION))
             return fail(err, NVN_GPU_E_UNSUPPORTED, "细分着色器未启用或设备不支持 tessellationShader");
