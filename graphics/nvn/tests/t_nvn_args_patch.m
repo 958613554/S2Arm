@@ -8,6 +8,8 @@
 //   ④ 对照：同一状态强制整块重编（args_dirty_all），参数 0 与界长表与 ② 补出来的逐位相同
 //   ⑤ 白名单外的着色器（多一项 TEXU：句柄从统一缓冲里读）换 cb0：整块 +1、打补丁 +0
 //   ⑥ 换 cb0 的同时换了贴图绑定（g_args_dirty）：整块 +1、打补丁 +0
+//   ⑦ DRV0 / DRV2 缓存；⑧ PUSH 同值去重仍打补丁、改值整块；⑨ TEXP 池表安定时打补丁，池快照代号 / 渲染写代号前进、钉住条目待回查时整块；
+//   ⑩ pool_gpu_settled 逐条（pool_gpu 开头每一步有活都判没安定）
 // 反证：args_ubo_patchable 恒返回 0 → ② 打补丁 +0、整块 +1（红）；补丁不重算界长表 → ② 界长表仍 256（红）
 #include "../gfx/nvn/nvn_mtl.m"
 #include <sys/mman.h>
@@ -125,5 +127,30 @@ int main(void) { @autoreleasepool {
            "⑨c TEXP 在 g_ser_gen 前进后换 cb0：不跳过 pool_gpu（整块 +%llu、打补丁 +%llu，期望 1 / 0）",
            (unsigned long long)(g_stat_args_enc - e0), (unsigned long long)(g_stat_args_patch - p0));
   }
+    // ⑨d 钉住时退役的条目待回查（g_pin_has_new）时换 cb0：pool_gpu 有活要做，不能走打补丁跳过它（整块 +1、打补丁 +0）
+    VERIFY(pool_gpu_settled(), "⑨d 前置：⑨c 整块重编后池表已安定");
+    atomic_store(&g_pin_has_new, 1);
+    e0 = g_stat_args_enc; p0 = g_stat_args_patch;
+    bind_cb0((uint64_t)(uintptr_t)pool + 16384, 512); encode_args(nil, tp, 1, 0);
+    VERIFY(g_stat_args_enc == e0 + 1 && g_stat_args_patch == p0 && !atomic_load(&g_pin_has_new),
+           "⑨d 钉住条目待回查时换 cb0：整块 +%llu、打补丁 +%llu（期望 1 / 0），pool_gpu 已处理（标记清零）",
+           (unsigned long long)(g_stat_args_enc - e0), (unsigned long long)(g_stat_args_patch - p0));
+    // ⑩ pool_gpu_settled 逐条：pool_gpu 开头每一步有活时都判「没安定」，复原后又安定
+    {
+        VERIFY(pool_gpu_settled(), "⑩ 前置：安定");
+        int k = 0; while (k < POOL_TABS && !g_ptab[k].used) k++; REQUIRE(k < POOL_TABS && g_ptab[k].n > 0);
+        uint32_t n0 = g_ptab[k].n; g_ptab[k].n = n0 - 1; int grow = pool_gpu_settled(); g_ptab[k].n = n0;
+        uint64_t sd = g_seen_dirty; g_seen_dirty = sd + 1; int seen_dirty = pool_gpu_settled(); g_seen_dirty = sd;
+        uint64_t ss = g_seen_sub; g_seen_sub = ss + 1; int seen_sub = pool_gpu_settled(); g_seen_sub = ss;
+        uint64_t sg = g_seen_ser; g_seen_ser = sg + 1; int seen_ser = pool_gpu_settled(); g_seen_ser = sg;
+        uint32_t ln = g_pleft.n; uint64_t lf = g_left_frame; g_pleft.n = 1; g_left_frame = atomic_load(&g_cur_frame) + 1; int left = pool_gpu_settled();
+        g_left_frame = atomic_load(&g_cur_frame); int left_same_frame = pool_gpu_settled(); g_pleft.n = ln; g_left_frame = lf;
+        uint32_t un = g_punwritten.n; uint64_t us = g_punwritten_ser; g_punwritten.n = 1; g_punwritten_ser = g_ser_gen + 1; int unw = pool_gpu_settled();
+        g_punwritten_ser = g_ser_gen; int unw_same = pool_gpu_settled(); g_punwritten.n = un; g_punwritten_ser = us;
+        uint32_t dn = g_pdirty[1].n; g_pdirty[1].n = 1; int dirty = pool_gpu_settled(); g_pdirty[1].n = dn;
+        VERIFY(!grow && !seen_dirty && !seen_sub && !seen_ser && !left && left_same_frame && !unw && unw_same && !dirty && pool_gpu_settled(),
+               "⑩ 表要补长 %d / 脏页代号变 %d / 换提交 %d / 渲染写代号变 %d / 挡下的条目换帧 %d（同帧 %d）/ 未写目标代号变 %d（未变 %d）/ 脏条目 %d / 复原 %d（期望 0/0/0/0/0（1）/0（1）/0/1）",
+               grow, seen_dirty, seen_sub, seen_ser, left, left_same_frame, unw, unw_same, dirty, pool_gpu_settled());
+    }
     printf("%s t_nvn_args_patch：%u 项，失败 %u\n", failures ? "✗" : "✓", checks, failures); return failures ? 1 : 0;
 }
