@@ -12682,11 +12682,13 @@ static int prepare_workers(void) {
     if (n <= 0) { size_t sz = sizeof n; if (sysctlbyname("hw.activecpu", &n, &sz, NULL, 0) || n < 2) n = 2; }
     return n;
 }
-// The first submission waits for the whole list (S2Arm 10-30, 维护者: the loading page shows the progress, nvn_warm.h), no longer at most 15 s. It hands back to the host, the rest going on in
-//   the background as before, when the player taps "play now" (s2a_warm_play_now), when no line has finished for DM_PSO_PREPARE_STALL_MS (default 20000) or after DM_PSO_PREPARE_MAX_MS
-//   (default 30000 since 11-06, 维护者: 15000 since 11-05 left cold first runs half compiled; see prepare_on; 11-22 #502: only without a front end — with one, only the player or the front end's no-progress guard ends the wait; 0 = none). Both are set from device measurements of whole lists (Monster Hunter Rise 10-26: 17625 seed lines, 77 s in all).
+// The first submission waits for the start of the list only (11-27 维护者: wait for the opening stretch, build the rest in the background, draw what is not built yet with the base
+//   version; a cold start's 90,000-line cloud seed used to hold the first frame 12–13 minutes): the list is in first-use order, so what is built by the cut is what the opening uses.
+//   It hands back to the host, the rest going on in the background, when the player taps "play now" (s2a_warm_play_now), when no line has finished for DM_PSO_PREPARE_STALL_MS
+//   (default 20000), or at the cut: with a front end its own (a later start at once, a first one after S2A_LOAD_FIRST_S, runtime/src/loadprog.c), without one DM_PSO_PREPARE_MAX_MS
+//   (default 12000, the same cut; 0 = none). Both are set from device measurements of whole lists (Monster Hunter Rise 10-26: 17625 seed lines, 77 s in all).
 //   Returns 1 when everything was built before it returned, 0 when the rest goes on in the background (warm_finish runs when they end)
-static int prepare_max_ms(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PSO_PREPARE_MAX_MS"); v = e ? atoi(e) : 30000; } return v; }   // 11-06 维护者：30 s（原 11-05 定 15 s，冷装首玩编不完；8 s 后可「先开始玩」照旧）
+static int prepare_max_ms(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PSO_PREPARE_MAX_MS"); v = e ? atoi(e) : 12000; } return v; }   // 11-27：12 s，同加载页首装截断 S2A_LOAD_FIRST_S（只等开局那一段，其余转后台）；原 30 s（11-06）
 static int prepare_stall_ms(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PSO_PREPARE_STALL_MS"); v = e ? atoi(e) : 20000; } return v; }
 // The progress the host reads (nvn_warm.h): phase / why / total are written by the prewarm, done is g_warm_done, the rate comes from a small ring sampled by whoever reads (under g_wp_mu)
 static pthread_mutex_t g_wp_mu = PTHREAD_MUTEX_INITIALIZER; static warm_ring g_wp_ring;
@@ -12729,7 +12731,7 @@ static int warm_prepare(NSArray<WarmTask *> *tasks, long lines) {
         if (front) s2a_front_warm_compiled(compiled);
         if (front) why = s2a_front_warm_tick(done, lines) == 1 || atomic_load(&g_wp_play) ? WARM_WHY_PLAYER : WARM_WHY_NONE;   // the front end owns the page, its estimate and its guards
         else why = warm_hold_why(el, now - moved, atomic_load(&g_wp_play), lim, stall);
-        if (!why && !front && lim && el >= lim) why = WARM_WHY_LIMIT;   // 上限只管没有前端的宿主（11-22 #502：有加载页时编译还在进展就继续等，玩家可随时点「先开始玩」）
+        if (!why && !front && lim && el >= lim) why = WARM_WHY_LIMIT;   // 上限只管没有前端的宿主；有加载页时由前端按首装截断 S2A_LOAD_FIRST_S 放行（同 12 s）
         // 11-06（异度3 测试设备1 再启动局：归档 2048 / 2048 全命中，首帧仍等满 15 s，12523 行剩 26 行）：清单每一行都已有工人领走、只剩在编的几条时不再挡首帧——
         //   再等也不会让任何一条更早开编；游戏真用到其中一条时，首遇路径按同键等那一条在编的（不重编），用不到的不该拖住进局。在编的照常在满核工人上编完
         if (!why && atomic_load(&next) >= n) why = WARM_WHY_TAIL;
