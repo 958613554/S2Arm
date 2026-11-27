@@ -15,7 +15,7 @@ namespace S2A.Services.Tests
     public static unsafe partial class Program
     {
         [DynamicDependency(DynamicallyAccessedMemberTypes.NonPublicFields,
-            "Ryujinx.Audio.Backends.Apple.ApplePullHardwareDeviceSession", "Ryujinx.Audio.Backends.Apple")]
+            "Ryujinx.Audio.Backends.Apple.ApplePullHardwareDeviceSession", "Ryujinx.Audio.Backends.Apple")]   // 平台例外：测试点名 Apple 后端类型（#2157）
         internal static int AppleAudioDispose()
         {
             try

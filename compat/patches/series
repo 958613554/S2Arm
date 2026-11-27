@@ -701,3 +701,4 @@
 20261126-0316-audio-render-lock-split.patch
 20261125-0021-audio-thaw-restart-ios.patch
 20261125-1727-audio-commit-wave-slot-shared.patch
+20261126-1619-audio-pull-platform-exempt.patch
