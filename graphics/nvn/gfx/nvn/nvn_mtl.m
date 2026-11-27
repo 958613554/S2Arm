@@ -3503,6 +3503,14 @@ static __unsafe_unretained id hm_get_id(const nvn_hmap *m, const void *k) { retu
 static void hm_put_id(nvn_hmap *m, const void *k, id o) { void *old = nvn_hm_put(m, k, (void *)CFBridgingRetain(o)); if (old) CFRelease(old); }
 static void hm_del_id(nvn_hmap *m, const void *k) { void *old = nvn_hm_del(m, k); if (old) CFRelease(old); }
 static nvn_hmap g_by_serial = {.klen = 8};     // Serial → MTLTexture / NvPkg / NvProg
+// Finalized texture serials a texture pool registration still names (#2269): on the console a registered descriptor stays valid whatever becomes of the texture object
+//   (0400486024DEC000 registers its streamed textures, finalizes the objects and reads them through the pool for minutes). Kept in g_by_serial as live ones are, not in the
+//   bounded ring of finalized ones (g_ghost) that let them go a few hundred textures later and left the table entry the dummy until a shader read rebuilt it, over and over.
+//   Held only by the pool: idle reclaim may let them go (tex_idle_reclaim, alias_dead_views), so the footprint stays under the reclaim policy. Released for good when no live
+//   registration names the serial any more (pool_held_check: re-registered, unregistered, pool storage finalized). Under g_smu
+static nvn_hmap g_pool_held = {.klen = 8};
+static void pool_held_check(uint64_t ser);   // below treg_ser_unlink
+static int serial_pool_named(uint64_t ser);
 // Why a serial left g_by_serial, the last DROP_RING of them (#2269: a texture a pool table had made, gone when a shader read its ID, with no table lookup since —
 //   which path dropped it). Written under g_smu; the pool case lines (pool_seen_word) read it
 enum { DR_OTHER = 1, DR_SRGB_STALE, DR_FINALIZED, DR_TAKEOVER, DR_RECLAIM, DROP_RING = 4096 };
@@ -3615,6 +3623,7 @@ static int serial_holds(nvn_hmap *m, id o) { for (uint32_t i = 0; i < m->cap; i+
 //   runs zeroed as for any texture whose storage another GPU write covered (tex_init_fill)
 static uint64_t g_alias_dead;   // live objects' textures dropped as overwritten (alias_take_over)
 static uint64_t *g_alias_dead_ser; static uint32_t g_alias_dead_n, g_alias_dead_cap;   // their serials, under g_smu, until alias_dead_views
+static uint64_t *g_held_dead_ser; static uint32_t g_held_dead_n, g_held_dead_cap;   // pool-held serials idle reclaim let go this submission (alias_dead_views)
 static int alias_overwritten(const alias_key *a, int64_t lo, int64_t hi, uint64_t seen) {   // caller holds g_smu
     for (uint32_t i = 0; i < g_alias_wrote.cap; i++) {
         if (!g_alias_wrote.vals[i]) continue;
@@ -3833,7 +3842,7 @@ static __unsafe_unretained id tex_get(uint64_t k) {
 }
 static void tex_put_locked(uint64_t k, id o) {   // caller owns g_smu
     // Serials from 2^62 up are external textures, never initialized by the game.
-    int live = k >= (1ull << 62) || nvn_hm_get(&g_tex_live, &k);
+    int live = k >= (1ull << 62) || nvn_hm_get(&g_tex_live, &k) || nvn_hm_get(&g_pool_held, &k);
     id active = live ? nil : hm_get_id(&g_ghost_active, &k);
     nvn_hmap *m = live ? &g_by_serial : active && !hm_get_id(&g_ghost, &k) ? &g_ghost_active : &g_ghost;   // evicted from the ring earlier in this submission: replaced where it is held
     id old = hm_get_id(m, &k);
@@ -6908,12 +6917,20 @@ void nvn_be_tex_tick(uint64_t frame) {
     pi = i; pr = r;
 }
 void mtl_vc_drop(uint64_t ser);
+static void tex_final_drop(uint64_t ser) { serial_del_why(ser, DR_FINALIZED); mtl_vc_drop(ser); gpw_forget(ser); wd_release(ser); }   // a finalized texture nothing names any more
 void nvn_be_tex_release(tex_t *t) {
     if (!t->serial) return;
     atomic_fetch_add(&g_tex_rel_n, 1);
+    os_unfair_lock_lock(&g_rmu); int held = serial_pool_named(t->serial); os_unfair_lock_unlock(&g_rmu);   // g_rmu before g_smu, as everywhere
     pthread_mutex_lock(&g_smu);
     nvn_hm_del(&g_tex_live, &t->serial);
-    nvn_hm_del(&g_snap_texaddr, &t->serial);   // 即时存档的「序号 → 对象地址」表跟着删：原先只增不删，随游玩时长涨，存档时逐项查可读（每项一次系统调用）越来越慢
+    nvn_hm_del(&g_snap_texaddr, &t->serial);
+    if (held) {   // a pool registration still names it: it stays (g_pool_held), released when the last registration goes (pool_held_check)
+        nvn_hm_put(&g_pool_held, &t->serial, (void *)1);
+        pthread_mutex_unlock(&g_smu);
+        t->serial = 0;
+        return;
+    }   // 即时存档的「序号 → 对象地址」表跟着删：原先只增不删，随游玩时长涨，存档时逐项查可读（每项一次系统调用）越来越慢
     id holder = hm_get_id(&g_by_serial, &t->serial);
     if ([holder isKindOfClass:[NvPkg class]]) {
         // #778 (reporter shengyifan's minimal repro): a texture the GPU wrote (NvPkg) is finalized while recorded commands still sample it by this serial
@@ -6923,10 +6940,7 @@ void nvn_be_tex_release(tex_t *t) {
         hm_del_id(&g_by_serial, &t->serial); drop_note(t->serial, DR_FINALIZED);   // borrow-safe: the ghost ring keeps holder (tex_put_locked above), so a replay borrowing it this submission still has it
     }
     pthread_mutex_unlock(&g_smu);
-    serial_del_why(t->serial, DR_FINALIZED);
-    mtl_vc_drop(t->serial);
-    gpw_forget(t->serial);
-    wd_release(t->serial);
+    tex_final_drop(t->serial);
     // Idempotent: nvnTextureFinalize clears magic but NOT serial, so a repeated Finalize used to walk this whole path a second time
     //   (release counter inflated until "live" went negative). Zeroing the serial makes the second call return at the line above.
     t->serial = 0;
@@ -9327,6 +9341,19 @@ static void treg_ser_unlink(int id_) {
     else nvn_hm_del(&g_treg_ser, &s);
     r->ser_next = r->ser_prev = 0;
 }
+static int serial_pool_named(uint64_t ser) {   // g_rmu held: a live registration (storage not finalized, gone = 0) names this serial
+    for (int h = (int)(uintptr_t)nvn_hm_get(&g_treg_ser, &ser); h; h = g_treg[h - 1].ser_next) if (!g_treg[h - 1].gone) return 1;
+    return 0;
+}
+static void pool_held_check(uint64_t ser) {   // no lock held: a pool-held finalized serial no live registration names any more goes for good
+    if (!ser) return;
+    pthread_mutex_lock(&g_smu); int held = nvn_hm_get(&g_pool_held, &ser) != NULL; pthread_mutex_unlock(&g_smu);
+    if (!held) return;
+    os_unfair_lock_lock(&g_rmu); int named = serial_pool_named(ser); os_unfair_lock_unlock(&g_rmu);
+    if (named) return;
+    pthread_mutex_lock(&g_smu); nvn_hm_del(&g_pool_held, &ser); pthread_mutex_unlock(&g_smu);
+    tex_final_drop(ser);
+}
 // Lock-free copy of texture ID → serial (the replay hot path only needs the serial: store lookahead index, binding set of the clear-only hoist): texture IDs are 20 bits, fixed 1M entries (BSS, only touched pages are used),
 // release write at registration, relaxed atomic read on the reader side, without entering g_rmu (the former h_ser locked and unlocked on every lookup, thousands of times per frame in the camp)
 static _Atomic uint64_t g_tser[1 << 20];
@@ -9597,7 +9624,17 @@ void mtl_tb2_stats(uint64_t *binds, uint64_t *made, uint64_t *fail, uint64_t *ta
 // Textures dropped as overwritten (alias_take_over) are still retained by the texture-ID views made from them (each view retains its base): drop those views and the serial's
 //   view-cache set, so the memory goes once the GPU is done (11-05 Ocarina of Time Mac run: without this 597 MB of evicted depth textures stayed alive through views alone).
 //   The IDs resolve again on their next use (g_ser_gen moved at the eviction). Submit thread, at the end of the submission; takes g_rmu then g_smu as everywhere else
+static void pool_evict_id(int id_); static void pool_seen_clear(int id_);   // pool tables below
 static void alias_dead_views(void) {
+    pthread_mutex_lock(&g_smu); uint32_t hn = g_held_dead_n; uint64_t *held = hn ? malloc(hn * sizeof *held) : NULL; if (held) memcpy(held, g_held_dead_ser, hn * sizeof *held); else hn = 0; g_held_dead_n = 0; pthread_mutex_unlock(&g_smu);
+    if (hn) {   // pool-held textures idle reclaim let go: their IDs read the dummy until a shader reads one again (the read bit cleared, pool_seen_word then makes it anew)
+        os_unfair_lock_lock(&g_rmu);
+        for (uint32_t k = 0; k < hn; k++) { vc_set *v = nvn_hm_get(&g_vc, &held[k]); if (v) { nvn_hm_del(&g_vc, &held[k]); vc_set_free(v); } }
+        for (uint32_t k = 0; k < hn; k++)
+            for (int h = (int)(uintptr_t)nvn_hm_get(&g_treg_ser, &held[k]); h; h = g_treg[h - 1].ser_next) { g_treg_ser_walk++; treg_drop_views(&g_treg[h - 1]); pool_seen_clear(h - 1); pool_evict_id(h - 1); }
+        os_unfair_lock_unlock(&g_rmu);
+        free(held);
+    }
     pthread_mutex_lock(&g_smu); uint32_t n = g_alias_dead_n; uint64_t *ser = n ? malloc(n * sizeof *ser) : NULL; if (ser) memcpy(ser, g_alias_dead_ser, n * sizeof *ser); else n = 0; g_alias_dead_n = 0; pthread_mutex_unlock(&g_smu);
     if (!n) return;
     os_unfair_lock_lock(&g_rmu);
@@ -9630,8 +9667,10 @@ static void tex_idle_reclaim(void) {
     for (uint32_t i = 0; i < g_by_serial.cap; i++) {
         void *v = g_by_serial.vals[i]; if (!v) continue;
         __unsafe_unretained id o = (__bridge id)v; id<MTLTexture> tx = [o isKindOfClass:[NvPkg class]] ? ((NvPkg *)o)->tex : [o conformsToProtocol:@protocol(MTLTexture)] ? (id<MTLTexture>)o : nil;
-        if (!tx || tx.buffer || tex_pinned((__bridge void *)tx)) continue;
         uint64_t ser; memcpy(&ser, g_by_serial.keys + (size_t)i * g_by_serial.klen, sizeof ser);
+        // a pool table names it (pinned): the GPU may read it any frame. Unless only the pool holds it (finalized, g_pool_held): then it goes as the others do and its
+        //   table entries become the dummy (alias_dead_views, pool_evict_id), a shader's next read making it again — the footprint stays under this policy (#2269)
+        if (!tx || tx.buffer || (tex_pinned((__bridge void *)tx) && !nvn_hm_get(&g_pool_held, &ser))) continue;
         int h = (int)(uintptr_t)nvn_hm_get(&g_treg_ser, &ser); if (!h) continue;   // no registered ID: nothing tells when it was used
         const tex_t *t = &g_treg[h - 1].t; uint64_t used = 0;
         if (!t->mem || !t->L.size || (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE))) continue;
@@ -9654,8 +9693,13 @@ static void tex_idle_reclaim(void) {
         id o = hm_get_id(&g_by_serial, &x.ser); if ((__bridge void *)o != x.o) continue;   // replaced or finalized meanwhile
         if (alias_has(o)) defer_obj_unref(o); else defer_obj_release(o); hm_del_id(&g_by_serial, &x.ser); drop_note(x.ser, DR_RECLAIM);   // as serial_del (deferred, borrow-safe): a shared texture stays in the sharing table (unreferenced now, alias_orphan_pass)
         freed += x.bytes; cnt++;
+        if (nvn_hm_get(&g_pool_held, &x.ser)) {   // pool-held: its table entries go to the dummy at the end of the submission, not looked up again (that made it again at once)
+            if (g_held_dead_n == g_held_dead_cap) { uint32_t cc = g_held_dead_cap ? 2 * g_held_dead_cap : 64; uint64_t *q = realloc(g_held_dead_ser, cc * sizeof *q); if (q) { g_held_dead_ser = q; g_held_dead_cap = cc; } }
+            if (g_held_dead_n < g_held_dead_cap) g_held_dead_ser[g_held_dead_n++] = x.ser;
+        } else {
         if (g_alias_dead_n == g_alias_dead_cap) { uint32_t cc = g_alias_dead_cap ? 2 * g_alias_dead_cap : 64; uint64_t *q = realloc(g_alias_dead_ser, cc * sizeof *q); if (q) { g_alias_dead_ser = q; g_alias_dead_cap = cc; } }
         if (g_alias_dead_n < g_alias_dead_cap) g_alias_dead_ser[g_alias_dead_n++] = x.ser;
+        }
     }
     if (cnt) { g_ser_gen++; g_reclaim_n += cnt; g_reclaim_b += freed; g_reclaim_runs++; }
     pthread_mutex_unlock(&g_smu);
@@ -9667,9 +9711,14 @@ static void tex_idle_reclaim(void) {
 static void treg_drop_pool_views(const void *pool) {
     os_unfair_lock_lock(&g_rmu);
     vc_drop_pool(pool);
+    uint64_t *olds = NULL; int nolds = 0, cap = 0;   // a gone registration holds nothing: pool-held serials it named may go (pool_held_check)
     for (int i = 0; i < g_ntreg; i++)
-        if (g_treg[i].ok && (const void *)g_treg[i].t.pool == pool) { treg_drop_views(&g_treg[i]); g_treg[i].gone = 1; pool_dirty(0, i); }   // nothing may make its texture until the ID is registered again (pool_tex_obj)
+        if (g_treg[i].ok && (const void *)g_treg[i].t.pool == pool) { treg_drop_views(&g_treg[i]); g_treg[i].gone = 1; pool_dirty(0, i);   // nothing may make its texture until the ID is registered again (pool_tex_obj)
+            if (nolds == cap) { int c = cap ? 2 * cap : 64; uint64_t *q = realloc(olds, (size_t)c * sizeof *q); if (!q) continue; olds = q; cap = c; }
+            olds[nolds++] = g_treg[i].t.serial; }
     os_unfair_lock_unlock(&g_rmu);
+    for (int i = 0; i < nolds; i++) pool_held_check(olds[i]);
+    free(olds);
 }
 // Texture ID 0 with nothing registered there: the zero handle a slot holds until the game binds it (a shader declares the slot, the game never binds it). Hardware reads the
 // pool's first descriptor; Ryujinx finds it empty (address 0: TexturePool.GetInternal makes no texture) and the backend binds its all-zero dummy, with no error. So it reads 0 here
@@ -9695,11 +9744,15 @@ void nvn_be_unreg_tex_range(int base, int n) {
     if (base < 0 || n <= 0) return;
     os_unfair_lock_lock(&g_rmu);
     int end = base + n < g_ntreg ? base + n : g_ntreg, any = 0;
+    uint64_t *olds = end > base ? malloc((size_t)(end - base) * sizeof *olds) : NULL; int nolds = 0;   // serials that may have lost their last registration (pool_held_check)
     for (int id_ = base; id_ < end; id_++) { treg_t *rr = &g_treg[id_]; if (!rr->ok && !rr->view && !rr->alt && !rr->ar && !rr->im) continue;
+        if (rr->ok && olds) olds[nolds++] = rr->t.serial;
         treg_drop_views(rr); if (rr->ok) treg_ser_unlink(id_); rr->ok = 0; rr->tt1 = rr->gone = 0; pool_seen_clear(id_); pool_dirty(0, id_); any = 1;
         if (id_ < (1 << 20)) atomic_store_explicit(&g_tser[id_], 0, memory_order_release); }
     if (any) g_reg_gen++;
     os_unfair_lock_unlock(&g_rmu);
+    for (int i = 0; i < nolds; i++) pool_held_check(olds[i]);
+    free(olds);
 }
 void nvn_be_reg_tex(int tid, const tex_t *t, const view_t *v) {
     int id_ = tid; if (id_ < 0) return;
@@ -9713,15 +9766,17 @@ void nvn_be_reg_tex(int tid, const tex_t *t, const view_t *v) {
     treg_t *rr = &g_treg[id_];
     int same = t && rr->ok && rr->has_v == (v != NULL) && !memcmp(&rr->t, t, sizeof *t) && (!v || !memcmp(&rr->v, v, sizeof *v));
     if (rr->gone) { rr->gone = 0; g_reg_gen++; pool_dirty(0, id_); }   // registered again (pool storage made anew), even with the same data
+    uint64_t olds = 0;   // the serial this ID named before, if it changes: maybe its last registration (pool_held_check, below)
     if (!same) {
         g_reg_gen++; pool_seen_clear(id_); pool_dirty(0, id_); rr->tt1 = 0;
         treg_drop_views(rr);
-        if (rr->ok) treg_ser_unlink(id_);
+        if (rr->ok) { olds = rr->t.serial; treg_ser_unlink(id_); }
         rr->ok = t != NULL; if (t) rr->t = *t; rr->has_v = v != NULL; if (v) rr->v = *v;
         if (rr->ok) { treg_ser_link(id_); rr->used = g_fence + 1; }   // registering counts as a use: a texture made for it is not idle at once (tex_idle_reclaim)
         if (id_ < (1 << 20)) atomic_store_explicit(&g_tser[id_], t ? t->serial : 0, memory_order_release);
     }
     os_unfair_lock_unlock(&g_rmu);
+    if (olds && (!t || t->serial != olds)) pool_held_check(olds);
     if (null_reads) MLOG("texture ID 0 registered (frame %llu) after %llu reads as an empty slot: those read 0, as hardware's first descriptor before it was written",
                          (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)null_reads);
     {   // DM_NVN_TREG_ID=n logs every registration of texture ID n: what it holds from then on, and when (the frame being recorded)
@@ -13091,6 +13146,9 @@ static void pool_ent_put(int ti, uint32_t i, void *o, uint64_t rid) {
 }
 // ----- What an ID names
 static int pool_covers(const pool_tab *t, int id_) { return t->used && id_ >= t->base && (uint32_t)(id_ - t->base) < t->n; }
+static void pool_evict_id(int id_) {   // every table entry for texture ID id_ to the dummy (g_rmu held, submit thread): a pool-held texture reclaim let go (alias_dead_views)
+    for (int k = 0; k < POOL_TABS; k++) { const pool_tab *t = &g_ptab[k]; if (t->used && !t->samp && pool_covers(t, id_)) pool_ent_put(k, (uint32_t)(id_ - t->base), NULL, 0); }
+}
 // The texture ID id_ names, made if the budget allows (limit: the largest texture made up front; a texture a shader read is made up to POOL_REQ_BYTES a frame). NULL: the dummy;
 //   *left: registered and left out by the budget (pool_left_scan makes it later). write: for an image table, which writes it: a render target no pass has written yet is made too
 //   (as an image slot makes it), else a target only shaders write through a pool stays the dummy for good

@@ -528,6 +528,38 @@ int main(void) { @autoreleasepool {
                    (unsigned long long)(r0 >> 20), (unsigned long long)(r100 >> 20), made(387), made(388), made(389));
         }
     }
+        // ⑳–㉒ 池持有、可回收（#2269：游戏登记后释放贴图对象、只经池读；主机上池描述符照样有效）。手算：
+        //   ⑳ 390 经池读过、建好后游戏释放对象 → 仍在序号表、不在已释放环、记为池持有；再读得 390.50
+        //   ㉑ 余量 100 MB、只有它闲置 → 被回收（序号表没了），池表那格是占位、下一次取表不建回来；之后第一次读得 0（占位）、第二次重建得 390.50
+        //   ㉒ 编号 390 改登记别的贴图 → 旧序号不再池持有、不在序号表（真正放了）
+        if (cs) {
+            atomic_fetch_add(&g_cur_frame, 1); pool_walk_frame(); g_walk_spent = 0;
+            texture(390, 4, 4, 0);
+            read4(cs, 390u | 1u << 20, 3u | 1u << 20, 3u | 1u << 20, 3u | 1u << 20); read4(cs, 390u | 1u << 20, 3u | 1u << 20, 3u | 1u << 20, 3u | 1u << 20);
+            uint64_t ser = texs[390].serial; REQUIRE(ser && made(390));
+            nvn_be_tex_release(&texs[390]);
+            pthread_mutex_lock(&g_smu); int in_tab = hm_get_id(&g_by_serial, &ser) != nil, in_ghost = hm_get_id(&g_ghost, &ser) != nil, held = nvn_hm_get(&g_pool_held, &ser) != NULL; pthread_mutex_unlock(&g_smu);
+            read4(cs, 390u | 1u << 20, 3u | 1u << 20, 3u | 1u << 20, 3u | 1u << 20); float r0 = out4[0];
+            VERIFY(in_tab && !in_ghost && held && near(r0, 390.5f), "⑳ 池持有：释放对象后在序号表 %d、在已释放环 %d、池持有 %d（期望 1、0、1）；读得 %.2f（期望 390.50）", in_tab, in_ghost, held, r0);
+            empty_sub(); empty_sub(); empty_sub();
+            g_tex_idle_subs = 2;
+            os_unfair_lock_lock(&g_rmu);
+            for (int i = 0; i < g_ntreg; i++) if (g_treg[i].ok) g_treg[i].used = g_fence + 1;
+            g_treg[390].used = 1;
+            os_unfair_lock_unlock(&g_rmu);
+            atomic_store(&g_mem_avail_fake, (int64_t)100 << 20); g_reclaim_next = 0; empty_sub();
+            atomic_store(&g_mem_avail_fake, -1); g_tex_idle_subs = TEX_IDLE_SUBS;
+            pthread_mutex_lock(&g_smu); int gone = hm_get_id(&g_by_serial, &ser) == nil; pthread_mutex_unlock(&g_smu);
+            uint64_t e = table_entry(390, 0, NULL); int dummy = e == g_ptab[0].dummy;
+            pthread_mutex_lock(&g_smu); int still_gone = hm_get_id(&g_by_serial, &ser) == nil; pthread_mutex_unlock(&g_smu);
+            read4(cs, 390u | 1u << 20, 3u | 1u << 20, 3u | 1u << 20, 3u | 1u << 20); float r1 = out4[0];
+            read4(cs, 390u | 1u << 20, 3u | 1u << 20, 3u | 1u << 20, 3u | 1u << 20); float r2 = out4[0];
+            VERIFY(gone && dummy && still_gone && near(r1, 0.0f) && near(r2, 390.5f),
+                   "㉑ 池持有的可回收：回收后不在序号表 %d、池表那格是占位 %d、取表后仍没建 %d（期望 1、1、1）；读到 %.2f、再读 %.2f（期望 0.00、390.50）", gone, dummy, still_gone, r1, r2);
+            texture(390, 4, 4, 0);
+            pthread_mutex_lock(&g_smu); int held2 = nvn_hm_get(&g_pool_held, &ser) != NULL, in_tab2 = hm_get_id(&g_by_serial, &ser) != nil; pthread_mutex_unlock(&g_smu);
+            VERIFY(!held2 && !in_tab2, "㉒ 登记换掉后旧序号真正放了：池持有 %d、在序号表 %d（期望 0、0）", held2, in_tab2);
+        }
     printf("%s t_nvn_pool_tex：%u 项，%u 项失败（追不到槽的句柄按编号读池：池表 + 已读位图 + 未写渲染目标不建 + 小贴图预建 + 表复用）\n", fails ? "✗" : "✓", checks, fails);
     return fails != 0;
 } }
