@@ -3623,7 +3623,8 @@ static int serial_holds(nvn_hmap *m, id o) { for (uint32_t i = 0; i < m->cap; i+
 //   runs zeroed as for any texture whose storage another GPU write covered (tex_init_fill)
 static uint64_t g_alias_dead;   // live objects' textures dropped as overwritten (alias_take_over)
 static uint64_t *g_alias_dead_ser; static uint32_t g_alias_dead_n, g_alias_dead_cap;   // their serials, under g_smu, until alias_dead_views
-static uint64_t *g_held_dead_ser; static uint32_t g_held_dead_n, g_held_dead_cap;   // pool-held serials idle reclaim let go this submission (alias_dead_views)
+static uint64_t *g_held_dead_ser; static uint32_t g_held_dead_n, g_held_dead_cap;
+static uint64_t g_held_reclaim_n, g_held_reclaim_b;   // pool-held textures idle reclaim let go, and their bytes (pool tables stat line)   // pool-held serials idle reclaim let go this submission (alias_dead_views)
 static int alias_overwritten(const alias_key *a, int64_t lo, int64_t hi, uint64_t seen) {   // caller holds g_smu
     for (uint32_t i = 0; i < g_alias_wrote.cap; i++) {
         if (!g_alias_wrote.vals[i]) continue;
@@ -9696,6 +9697,7 @@ static void tex_idle_reclaim(void) {
         if (nvn_hm_get(&g_pool_held, &x.ser)) {   // pool-held: its table entries go to the dummy at the end of the submission, not looked up again (that made it again at once)
             if (g_held_dead_n == g_held_dead_cap) { uint32_t cc = g_held_dead_cap ? 2 * g_held_dead_cap : 64; uint64_t *q = realloc(g_held_dead_ser, cc * sizeof *q); if (q) { g_held_dead_ser = q; g_held_dead_cap = cc; } }
             if (g_held_dead_n < g_held_dead_cap) g_held_dead_ser[g_held_dead_n++] = x.ser;
+            g_held_reclaim_n++; g_held_reclaim_b += x.bytes;
         } else {
         if (g_alias_dead_n == g_alias_dead_cap) { uint32_t cc = g_alias_dead_cap ? 2 * g_alias_dead_cap : 64; uint64_t *q = realloc(g_alias_dead_ser, cc * sizeof *q); if (q) { g_alias_dead_ser = q; g_alias_dead_cap = cc; } }
         if (g_alias_dead_n < g_alias_dead_cap) g_alias_dead_ser[g_alias_dead_n++] = x.ser;
@@ -13444,10 +13446,17 @@ static uint64_t pool_gpu(int samp, int dtt, int dpf, int rw, int base, __unsafe_
     g_pool_ms += (double)(mach_absolute_time() - t0) * tb.numer / tb.denom / 1e6;
     if (!(g_pool_calls & 0x3fff)) {   // how the tables stand: whole walks, buffers, entries looked up again by cause, time in all
         unsigned nseen = 0; uint64_t bseen = 0; for (int id_ = 1; id_ < g_ntreg; id_++) if (g_treg[id_].ok && pool_seen(id_)) { nseen++; bseen += pool_tex_size(&g_treg[id_].t); }
-        MLOG("pool tables: %llu calls, whole walks %llu (%.0f ms), buffers %llu; entries looked up again: registrations %llu, retired %llu (late, deferred behind the unpinning submission %llu), read by a shader %llu, left out %llu; %.0f ms in all; %u IDs read by a shader (%llu MB), %u left out, allocated %llu MB; made only once a shader read the dummy %llu (+%llu since the last line)",
+        unsigned hn_ = 0; uint64_t hb_ = 0;   // pool-held serials and what their textures made now take (#2269: is it bounded)
+        pthread_mutex_lock(&g_smu);
+        for (uint32_t i = 0; i < g_pool_held.cap; i++) { if (!g_pool_held.vals[i]) continue; hn_++; uint64_t k; memcpy(&k, g_pool_held.keys + (size_t)i * 8, 8);
+            __unsafe_unretained id o = hm_get_id(&g_by_serial, &k); id<MTLTexture> x = [o isKindOfClass:[NvPkg class]] ? ((NvPkg *)o)->tex : [o conformsToProtocol:@protocol(MTLTexture)] ? (id<MTLTexture>)o : nil;
+            if (x) hb_ += x.allocatedSize; }
+        pthread_mutex_unlock(&g_smu);
+        MLOG("pool tables: %llu calls, whole walks %llu (%.0f ms), buffers %llu; entries looked up again: registrations %llu, retired %llu (late, deferred behind the unpinning submission %llu), read by a shader %llu, left out %llu; %.0f ms in all; %u IDs read by a shader (%llu MB), %u left out, allocated %llu MB; made only once a shader read the dummy %llu (+%llu since the last line); pool-held (finalized, a registration still names them) %u, %llu MB made now, %llu let go by idle reclaim (%llu MB) so far",
              (unsigned long long)g_pool_calls, (unsigned long long)g_pool_walks, g_pool_walk_ms, (unsigned long long)g_pool_made, (unsigned long long)g_pool_upd_dirty, (unsigned long long)g_pool_upd_ret, (unsigned long long)atomic_load(&g_unpin_late),
              (unsigned long long)g_pool_upd_seen, (unsigned long long)g_pool_upd_left, g_pool_ms, nseen, (unsigned long long)(bseen >> 20), g_pleft.n, (unsigned long long)(g_dev.currentAllocatedSize >> 20),
-             (unsigned long long)g_pool_seen_late, (unsigned long long)(g_pool_seen_late - g_pool_seen_late_last)); g_pool_seen_late_last = g_pool_seen_late; }
+             (unsigned long long)g_pool_seen_late, (unsigned long long)(g_pool_seen_late - g_pool_seen_late_last),
+             hn_, (unsigned long long)(hb_ >> 20), (unsigned long long)g_held_reclaim_n, (unsigned long long)(g_held_reclaim_b >> 20)); g_pool_seen_late_last = g_pool_seen_late; }
     if (ti < 0) { *out = dummy_buf(); return dummy_buf_gpu(); }
     g_ptab[ti].bound_fence = g_fence + 1;
     *out = g_ptab[ti].buf; return g_ptab[ti].gpu;
