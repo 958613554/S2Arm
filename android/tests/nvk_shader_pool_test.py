@@ -146,8 +146,8 @@ def main():
     if sys.argv[1:] == ['--compute-warm-mutants']:
         text = original.read_text()
         mutants = [
-            ('no-record', '    rec.lp_ok = unaligned ? 0 : 2;\n    nvk_prog_warm_note(&rec);',
-             '    rec.lp_ok = unaligned ? 0 : 2;\n    (void)rec;', '--compute-warm', 'compute program must be recorded in warm manifest'),
+            ('no-record', '    libpack_note_state(&rec, unaligned ? LIBPACK_SSBO_WINDOW : LIBPACK_ALIGNED, p);\n    nvk_prog_warm_note(&rec);',
+             '    libpack_note_state(&rec, unaligned ? LIBPACK_SSBO_WINDOW : LIBPACK_ALIGNED, p);', '--compute-warm', 'compute program must be recorded in warm manifest'),
             ('wrong-stage', 'memcpy(rec.identity, p->identity, 32); rec.stage_mask = 32;',
              'memcpy(rec.identity, p->identity, 32); rec.stage_mask = 1;', '--compute-warm', 'persisted compute manifest retains identity'),
             ('wrong-build', 'struct entry *e = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0], 0) : build(bytes, len, views, rec->stage_mask, rec->identity, 0);',
@@ -209,8 +209,7 @@ def main():
         for name, old, new, expected in (
             ('mask-0x3', 'lrc = s2a_libpack_program_v1(lp, keys, stages, &g,', 'lrc = s2a_libpack_program_v1(lp, keys, 0x3, &g,',
              'hit from the library, compiler not called'),
-            ('no-topology', 'const struct s2a_libpack_gfx g = { topology, pc->profile_json, pc->profile_bytes };',
-             'const struct s2a_libpack_gfx g = { NULL, pc->profile_json, pc->profile_bytes }; (void)topology;',
+            ('no-topology', '.topology = topology,', '.topology = ((void)topology, NULL),',
              'hit from the library, compiler not called'),
             # 取库入口的闸（nvk_shader.c libpack_fetch）：放 0x1 / 0x3 / 0x7。去掉 0x7u：三段（含几何）程序被挡在库外，必须红；
             #   去掉 0x1u：只有顶点的深度程序被挡在库外，必须红在 VS-only 那一例
@@ -261,8 +260,8 @@ def main():
         cases += [
             ('snap-not-counted', '    atomic_fetch_add_explicit(&g_lp_gate_snap[s->lp_gate], 1, memory_order_relaxed);\n', '', 'gate readout line'),
             ('live-not-counted', '        atomic_fetch_add_explicit(&g_lp_gate_live[s->lp_gate], 1, memory_order_relaxed);\n', '', 'gate readout line'),
-            ('gate-not-on-snapshot', '    s->lp_gate = libpack_gate_mask(&s->f.gfx); s->lp_ok = s->lp_gate == 0;',
-             '    s->lp_gate = 0; s->lp_ok = 1;', "library not used"),
+            ('gate-not-on-snapshot', '    s->lp_gate = libpack_gate_mask(&s->f.gfx);',
+             '    s->lp_gate = 0;', "library not used"),
             ('ties-pick-larger-mask', 'for (unsigned m = 1; m < (1u << LPG_N); m++) if (v[m] > v[best]) best = m;',
              'for (unsigned m = 1; m < (1u << LPG_N); m++) if (v[m] >= v[best] && v[m]) best = m;', 'gate readout line'),
             # 「放开闸会怎样」的只读探测：缺省关、两样记录都要在、没有的不算有、探过的份数要记，各撤一处，探测读数那一行红。
@@ -303,6 +302,9 @@ def main():
             ('ssbo-default-on',   # 属性没设时读生产缺省（关 = 旧口径，玩家包就是这样）：缺省改回开，「属性没设」那一行放行、命中库而红
              'nvn_plat_flag("nvk_lp_used_slots", 0) != 0', 'nvn_plat_flag("nvk_lp_used_slots", 1) != 0',
              "gate case 'unaligned storage, property not set (production default)' #0: library not used"),
+            ('window-memo-shared',
+             '    memcpy(k + 52, &state, 4);', '    (void)state; memset(k + 52, 0, 4);',
+             'quick path: used slot turning unaligned'),
             ('ssbo-quick-path-blind',
              'MIX(any); MIX(un | (unused << 1)); MIX(pc->storage_buffer_offset_alignment);',
              'MIX(any); MIX(unused << 1); MIX(pc->storage_buffer_offset_alignment);',
@@ -376,8 +378,8 @@ def main():
             assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
             print(f'{name}: expected assertion failure: {expected}', flush=True)
         # 正控：把 why 文本清空（模拟改了报错文案 / 文案消失）备忘仍归对类——分类读的是码，不是文本
-        text_gone = code.replace('pc->translator_closure, pf.max_shared, bytes, len, lw, sizeof lw, &lwhy);',
-                                 'pc->translator_closure, pf.max_shared, bytes, len, lw, sizeof lw, &lwhy); lw[0] = 0;')
+        text_gone = code.replace('pc->translator_closure, pf.max_shared, &g, bytes, len, lw, sizeof lw, &lwhy);',
+                                 'pc->translator_closure, pf.max_shared, &g, bytes, len, lw, sizeof lw, &lwhy); lw[0] = 0;')
         assert text_gone != code, 'text-independence anchor'
         path = out / 'cs-libpack-text-gone.c'
         path.write_text(text_gone)

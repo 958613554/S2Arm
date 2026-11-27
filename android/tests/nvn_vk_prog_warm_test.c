@@ -188,16 +188,52 @@ int main(void) {
         struct nvk_prog_rec g1, g2;
         CHECK(nvk_prog_warm_take(&g1) == 1 && nvk_prog_warm_take(&g2) == 1, "both lp_ok records are taken");
         struct nvk_prog_rec *ga = rec_is(&g1, 1) ? &g1 : &g2, *gb = rec_is(&g1, 1) ? &g2 : &g1;
-        CHECK(rec_is(ga, 1) && ga->lp_ok == 1 && rec_is(gb, 2) && gb->lp_ok == 0, "lp_ok round-trips per record (%u, %u)", (unsigned)ga->lp_ok, (unsigned)gb->lp_ok);
-        b.lp_ok = 1; nvk_prog_warm_note(&b);           // 旧清单读来的 0：真实 resolve 再记时刷新
+        CHECK(rec_is(ga, 1) && ga->lp_ok == 1 && !ga->lp_ssbo_window && rec_is(gb, 2) && gb->lp_ok == 0 && !gb->lp_ssbo_window, "lp_ok round-trips per record (%u, %u)", (unsigned)ga->lp_ok, (unsigned)gb->lp_ok);
+        b.lp_ok = 2;
+        b.lp_ssbo_window = 1;
+        nvk_prog_warm_note(&b);   // 实际命中带补偿的库件后刷新。
         nvk_prog_warm_save();
         nvk_prog_warm_reset();
         CHECK(load_now() == 2, "records survive the lp_ok refresh");
         CHECK(nvk_prog_warm_take(&g1) == 1 && nvk_prog_warm_take(&g2) == 1, "refreshed records are taken");
         gb = rec_is(&g1, 2) ? &g1 : &g2;
-        CHECK(rec_is(gb, 2) && gb->lp_ok == 1, "a later note refreshes lp_ok (got %u)", (unsigned)gb->lp_ok);
+        CHECK(rec_is(gb, 2) && gb->lp_ok == 2 && gb->lp_ssbo_window == 1, "a later note round-trips the required SSBO window");
     }
 
+
+    // v3 的头长 60 字节、记录头长 112 字节。独立核对 LP_OK 后一个字节，
+    // 再用正确校验和模拟旧 v3 清单和窗口字节非法的清单。
+    {
+        enum { HEADER = 60, ENTRY = 112, LP = HEADER + 77, WINDOW = HEADER + 78 };
+        dir_reset();
+        struct nvk_prog_rec r = mkrec(19, 3);
+        r.lp_ok = 2;
+        r.lp_ssbo_window = 1;
+        nvk_prog_warm_note(&r);
+        nvk_prog_warm_save();
+        uint8_t *wire = NULL;
+        size_t size = 0;
+        const int readable = read_file(file, &wire, &size) == 0 && size == HEADER + ENTRY + 2 * 256 + 8;
+        CHECK(readable, "v3 record header and both c1 blocks keep their size");
+        if (readable) {
+            CHECK(wire[4] == 3 && wire[8] == ENTRY && wire[LP] == 2 && wire[WINDOW] == 1 &&
+                  wire[WINDOW + 1] == 0, "v3 window immediately follows LP_OK and keeps the remaining pad byte");
+            for (unsigned bad = 0; bad <= 1; bad++) {
+                wire[WINDOW] = bad ? 2 : 0;
+                uint64_t sum = 1469598103934665603ull;
+                for (size_t k = 0; k < size - 8; k++) { sum ^= wire[k]; sum *= 1099511628211ull; }
+                for (unsigned k = 0; k < 8; k++) wire[size - 8 + k] = (uint8_t)(sum >> (8 * k));
+                CHECK(write_file(file, wire, size) == 0, "v3 compatibility fixture written");
+                nvk_prog_warm_reset();
+                struct nvk_prog_rec got = {0};
+                if (bad) CHECK(load_now() == 0 && nvk_prog_warm_take(&got) == 0, "invalid v3 window value is filtered");
+                else CHECK(load_now() == 1 && nvk_prog_warm_take(&got) == 1 && rec_is(&got, 19) &&
+                           got.lp_ok == 2 && !got.lp_ssbo_window && got.c1_ok == 3 &&
+                           got.c1[1][255] == 58, "older v3 zero pad loads aligned and preserves c1");
+            }
+        }
+        free(wire);
+    }
 
     // 2b) 无 c1 的 note：真实 draw 命中「已发布」的程序时没有源快照（只有身份与阶段键），这种 note
     //     不得抹掉记录里已有的 c1（预热产品必须与真实解析逐位一致，c1 缺了 rp_draw 会跳过绘制），

@@ -1254,7 +1254,7 @@ static int depth_clip_cap(void) {   // 1 = 有；能力还没取到时按没有�
     if (c < 0) { nvn_gpu_caps cp; nvn_gpu_caps_get(&cp); c = (cp.caps & NVN_GPU_CAP_DEPTH_CLIP_CTL) != 0; if (!cp.caps) return 0; atomic_store(&v, c); }
     return c;
 }
-// 状态闸：每条闸一位，0 = 全部放行。拆成位集合只为读数（见下面 lp_gate_*）：放不放行仍只看「集合是否为空」。
+// 状态闸：每条闸一位。非对齐若是唯一条件，可以尝试带 SSBO 窗口合同的库件。
 enum { LPG_DEPTH = 1, LPG_ORIGIN = 2, LPG_ALPHA = 4, LPG_A2C = 8, LPG_DUAL = 16, LPG_UNALIGNED = 32, LPG_N = 6 };
 static unsigned libpack_gate_mask(const struct s2a_compile_graphics_src *g) {
     unsigned m = 0;
@@ -1266,7 +1266,17 @@ static unsigned libpack_gate_mask(const struct s2a_compile_graphics_src *g) {
     if (g->has_unaligned_ssbo && g->unaligned_ssbo) m |= LPG_UNALIGNED;   // 预编库按 Metal 翻译、存储缓冲一律当对齐：Vulkan 绑定要往下对齐到 minStorageBufferOffsetAlignment，偏差只有现编（读 c0 的偏移）会补
     return m;
 }
-static int libpack_state_ok(const struct s2a_compile_graphics_src *g) { return libpack_gate_mask(g) == 0; }
+enum libpack_state { LIBPACK_OTHER_STATE, LIBPACK_ALIGNED, LIBPACK_SSBO_WINDOW };
+
+static enum libpack_state libpack_state_for_gate(unsigned gate) {
+    if (!gate) return LIBPACK_ALIGNED;
+    return gate == LPG_UNALIGNED ? LIBPACK_SSBO_WINDOW : LIBPACK_OTHER_STATE;
+}
+
+static void libpack_note_state(struct nvk_prog_rec *rec, enum libpack_state state, const struct rp_prog *prog) {
+    rec->lp_ssbo_window = state == LIBPACK_SSBO_WINDOW && prog->lib_sourced;
+    rec->lp_ok = state == LIBPACK_ALIGNED || rec->lp_ssbo_window ? 2 : 0;
+}
 // 状态闸读数（只读，不改任何取程序决定）。取库在 state_ok 假时无声返回，「程序累计」里命中 / 没有 / 坏 / 不可用四个数都看不到这部分程序：
 // 只知道现场编译很多、不知道是库里没有还是根本没问库。下标 = 被挡下的闸位集合（0 = 放行）；
 // snap = 每份进入取程序的新快照一次（不论最后从哪来），live = 其中真走了现场编译的（与「现场编」同口径，同一处累加）。
@@ -1361,8 +1371,7 @@ struct work_snap {
     struct s2a_direct_compile_context pc;    // profile_json / closure / profile_hash 指向本结构内的私有副本
     struct s2a_source_entry_view views[RP_PROG_STAGES];   // acquire 的 pin；build() 从这里逐字节拷 c1
     int acquired;
-    int lp_ok;                               // libpack_state_ok（快照时按事实算好：工作线程不碰 rp_S）
-    unsigned lp_gate;                        // 被挡下的状态闸位集合（libpack_gate_mask；lp_ok == (lp_gate == 0)），只给读数用
+    unsigned lp_gate;                        // 快照保存的状态闸位，兼作归因读数
     char *profile_json, *closure, *profile_hash;
 };
 static void snap_free(struct work_snap *s) {
@@ -1385,7 +1394,7 @@ static struct work_snap *snap_capture(const struct facts *f, const struct s2a_in
         s->f.tex[i].format = s->f.tfmt[i];
     }
     s->stages = stages; s->nst = nst;
-    s->lp_gate = libpack_gate_mask(&s->f.gfx); s->lp_ok = s->lp_gate == 0;
+    s->lp_gate = libpack_gate_mask(&s->f.gfx);
     atomic_fetch_add_explicit(&g_lp_gate_snap[s->lp_gate], 1, memory_order_relaxed);
     memcpy(s->identity, sha, 32);
     for (int st = 0; st < nst; st++)
@@ -1504,13 +1513,19 @@ static struct s2a_libpack *libpack_for_locked(const char *root) {
 //   每次都重读库件、整份核 JSON、把 SPIR-V 转 base64 再合成，是回放线程第一大项。改为按键备忘合成好的字节，命中拷一份
 //   （调用方照旧 free）。本局常量逐字比对，不一致按没备忘走原路并替换；库句柄换了整表清空。总量封顶 LP_MEMO_CAP，
 //   满了不再新记（照走原路，结果不变）。只记命中：没有 / 坏照旧每次如实取。几何程序（0x7）按输入图元挑变体，不进备忘。
-enum { LP_MEMO_KLEN = 52, LP_MEMO_CAP = 64u << 20 };
+enum { LP_MEMO_KLEN = 60, LP_MEMO_CAP = 64u << 20 };
 struct lp_memo { uint8_t *json; size_t n; uint32_t abi; char *profile_hash, *closure; };
 static nvn_hmap g_lp_memo; static int g_lp_memo_init; static const struct s2a_libpack *g_lp_memo_lp; static size_t g_lp_memo_bytes;
 static _Atomic uint64_t g_n_lp_memo_hit, g_n_lp_memo_full;
 static void lp_memo_free(void *v) { struct lp_memo *m = v; free(m->json); free(m->profile_hash); free(m->closure); free(m); }
 static int lp_streq(const char *a, const char *b) { return !strcmp(a ? a : "", b ? b : ""); }
-static void lp_memo_key(uint8_t k[LP_MEMO_KLEN], const uint8_t keys[6][8], uint32_t stages) { memcpy(k, keys, 48); memcpy(k + 48, &stages, 4); }
+static void lp_memo_key(uint8_t k[LP_MEMO_KLEN], const uint8_t keys[6][8], uint32_t stages,
+                        uint32_t state, uint32_t storage_alignment) {
+    memcpy(k, keys, 48);
+    memcpy(k + 48, &stages, 4);
+    memcpy(k + 52, &state, 4);
+    memcpy(k + 56, &storage_alignment, 4);
+}
 static struct lp_memo *lp_memo_get_locked(const struct s2a_libpack *lp, const uint8_t k[LP_MEMO_KLEN], const struct s2a_direct_compile_context *pc) {
     if (!g_lp_memo_init) { nvn_hm_init(&g_lp_memo, LP_MEMO_KLEN); g_lp_memo_init = 1; }
     if (g_lp_memo_lp != lp) { nvn_hm_clear(&g_lp_memo, lp_memo_free); g_lp_memo_bytes = 0; g_lp_memo_lp = lp; }
@@ -1534,12 +1549,12 @@ static void lp_memo_put_locked(const uint8_t k[LP_MEMO_KLEN], const struct s2a_d
 // 取一份（图形：stages 是只有 vs 0x1、vs+fs 0x3 或 vs+fs+gs 0x7，keys 按 NVN 位序紧排 vs / fs / gs；计算：ckey 非空）。1 = 取到（*bytes 归调用方 free）
 //   topology：本笔绘制的输入图元名（fill_facts 的 topology()，快照里已算好——工作线程不碰 rp_S）；几何程序按它挑离线库里同图元那份，
 //   没有来源（NULL）几何程序 miss。本局 profile 的 geometryShader 没开时 libpack 照旧 miss（与现编同一字段）
-static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], uint32_t stages, const uint8_t *ckey, int state_ok,
+static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], uint32_t stages, const uint8_t *ckey, enum libpack_state state_ok,
                          const char *topology, const struct s2a_direct_compile_context *pc, uint8_t **bytes, size_t *len) {
     const char *root = getenv("S2A_SHADER_REVISION_ROOT");
-    // state_ok 对计算同样生效：ckey 路径传 !unaligned（慢路）/ rec->lp_ok==2（暖路径），含义同图形 lp_ok。库件只有
-    //   对齐变体（libpack_vk.c 恒写 hasUnalignedStorageBuffer:false，c0 钳制补偿只有现编能出），非对齐 sbuf 绑定下
-    //   出库 = 无钳制的对齐码跑非对齐缓冲 → 设备越界丢局（9000 日包 DeviceLost 元凶 = cs 50c91227a1082f2c 库版此机制）。
+    // 窗口 ABI 必须经过库件校验。关闭时，计算走原对齐拒查与具名诊断。
+    if (state_ok == LIBPACK_SSBO_WINDOW && !nvn_plat_flag("nvk_libpack_ssbo_window", 1))
+        state_ok = LIBPACK_OTHER_STATE;
     if (!root || !state_ok || (!ckey && stages != 0x1u && stages != 0x3u && stages != 0x7u) || nvn_plat_flag("no_libpack", 0)) {
         // 计算侧对齐闸的拒查有界具名（程序键 + 原因）：库根在、ckey 非空、state_ok 假 = 非对齐 sbuf 拒查，
         //   真机直接看到闸生效。每次取程序都可能撞上：一行一个事件只打前 8 条防日志洪泛，之后只累计。
@@ -1573,6 +1588,15 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
     if (bad && ckey) cs_note_set(ckey, (uintptr_t)bad == LPBAD_BUILD ? CSN_BUILD : CSN_REJECT);
     struct s2a_libpack *lp = bad ? NULL : libpack_for_locked(root);
     if (lp) {
+        nvn_gpu_caps caps;
+        nvn_gpu_caps_get(&caps);
+        const struct s2a_libpack_gfx g = {
+            .topology = topology,
+            .profile_json = pc->profile_json,
+            .profile_bytes = pc->profile_bytes,
+            .storage_alignment = caps.min_ssbo_align,
+            .require_ssbo_window = state_ok == LIBPACK_SSBO_WINDOW,
+        };
         if (ckey) {
             // 出库共享内存闸要设备 maxComputeSharedMemorySize 真值：取本局 provider profile（现编同一来源）；
             //   profile 解不出来按 REJECT 记账，不猜上限放行。
@@ -1582,20 +1606,19 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
                 lrc = S2A_LIBPACK_REJECT; lwhy = S2A_LIBPACK_WHY_OTHER;
             } else {
                 lrc = s2a_libpack_compute_v1(lp, ckey, (uint32_t)pc->direct_abi, pc->profile_hash,
-                                             pc->translator_closure, pf.max_shared, bytes, len, lw, sizeof lw, &lwhy);
+                                             pc->translator_closure, pf.max_shared, &g, bytes, len, lw, sizeof lw, &lwhy);
             }
         }
         else {
             uint8_t keys[6][8]; memset(keys, 0, sizeof keys);
             for (int st = 0; st < (stages == 0x7u ? 3 : stages == 0x3u ? 2 : 1); st++) memcpy(keys[st], gkeys[st], 8);
             const int memo_ok = stages != 0x7u;   // 几何程序按输入图元挑变体，不进备忘
-            uint8_t mk[LP_MEMO_KLEN]; lp_memo_key(mk, (const uint8_t (*)[8])keys, stages);
+            uint8_t mk[LP_MEMO_KLEN]; lp_memo_key(mk, (const uint8_t (*)[8])keys, stages, state_ok, g.storage_alignment);
             const struct lp_memo *m = memo_ok ? lp_memo_get_locked(lp, mk, pc) : NULL;
             if (m && (*bytes = malloc(m->n ? m->n : 1))) {
                 memcpy(*bytes, m->json, m->n); *len = m->n; lrc = S2A_LIBPACK_HIT;
                 atomic_fetch_add_explicit(&g_n_lp_memo_hit, 1, memory_order_relaxed);
             } else {
-                const struct s2a_libpack_gfx g = { topology, pc->profile_json, pc->profile_bytes };
                 lrc = s2a_libpack_program_v1(lp, keys, stages, &g, (uint32_t)pc->direct_abi, pc->profile_hash, pc->translator_closure, bytes, len, lw, sizeof lw);
                 if (lrc == S2A_LIBPACK_HIT && memo_ok) lp_memo_put_locked(mk, pc, *bytes, *len);
             }
@@ -1625,7 +1648,16 @@ static void libpack_mark_bad(const uint8_t identity[32], const uint8_t *ckey) {
     if (n <= 4) { char b[200]; snprintf(b, sizeof b, "出包预编程序不可用、退回现编（第 %llu 个，身份 %02x%02x%02x%02x…）", (unsigned long long)n,
         identity[0], identity[1], identity[2], identity[3]); nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", b); }
 }
-static void libpack_note_hit(void) { atomic_fetch_add(&g_n_libpack, 1); }
+static void libpack_note_hit(const uint8_t identity[32], const char *route, enum libpack_state state) {
+    atomic_fetch_add(&g_n_libpack, 1);
+    if (state != LIBPACK_SSBO_WINDOW || !nvn_plat_flag("nvk_hitch_log", 0)) return;
+    static _Atomic unsigned noted;
+    if (atomic_fetch_add_explicit(&noted, 1, memory_order_relaxed) >= 128) return;
+    char ident[65], line[128];
+    s2a_sha256_hex(identity, ident);
+    snprintf(line, sizeof line, "libpack_ssbo_window_hit route=%s identity=%s", route, ident);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", line);
+}
 // 只读探测（见 g_lp_probe_*）：只看库里有没有这几段，不合成程序、不动「程序累计」的命中 / 没有 / 坏，不改取程序的任何决定。
 // 几何程序（0x7）按输入图元挑变体，不在探测范围。
 static void lp_gate_probe(const struct work_snap *s) {
@@ -2177,11 +2209,11 @@ static struct entry *work_run(const struct work_snap *s, const struct rp_shader_
         atomic_fetch_add_explicit(&g_n_cache, 1, memory_order_relaxed);
         have_res = 1;
     }
-    if (!bytes && libpack_fetch(s->identity, (const uint8_t (*)[8])s->keys, s->stages, NULL, s->lp_ok, s->f.gfx.topology, &s->pc, &bytes, &len)) {
+    if (!bytes && libpack_fetch(s->identity, (const uint8_t (*)[8])s->keys, s->stages, NULL, libpack_state_for_gate(s->lp_gate), s->f.gfx.topology, &s->pc, &bytes, &len)) {
         struct entry *le = build(bytes, len, s->views, s->stages, s->identity, 1);
         if (le) { le->prog.z_raw = 1; le->prog.lib_sourced = 1; }
         free(bytes); bytes = NULL; len = 0;
-        if (le && !le->failed && lib_outputs_ok(le, &s->f) && lib_sampled_numeric_ok(le, &s->f)) { libpack_note_hit(); return le; }
+        if (le && !le->failed && lib_outputs_ok(le, &s->f) && lib_sampled_numeric_ok(le, &s->f)) { libpack_note_hit(s->identity, "gfx", libpack_state_for_gate(s->lp_gate)); return le; }
         if (le) entry_free(le);
         libpack_mark_bad(s->identity, NULL);
     }
@@ -2360,13 +2392,15 @@ static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
         views[st].key = rec->keys[st];   // 拒收 / 合规核对行要靠它打程序键
         if (rec->c1_ok & (1u << st)) { views[st].c1 = rec->c1[st]; views[st].c1_bytes = rec->c1_len[st]; }
     }
+    const enum libpack_state lib_state = rec->lp_ok != 2 ? LIBPACK_OTHER_STATE :
+        rec->lp_ssbo_window ? LIBPACK_SSBO_WINDOW : LIBPACK_ALIGNED;
     // 预热清单不记绘制图元：几何程序这里取不到（topology 传 NULL → miss），等提交线程按本笔图元取
     if (!bytes && libpack_fetch(rec->identity, compute ? NULL : (const uint8_t (*)[8])rec->keys,
-                                compute ? 0 : rec->stage_mask, compute ? rec->keys[0] : NULL, rec->lp_ok == 2, NULL, &pc, &bytes, &len)) {
+                                compute ? 0 : rec->stage_mask, compute ? rec->keys[0] : NULL, lib_state, NULL, &pc, &bytes, &len)) {
         struct entry *le = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0], 1) : build(bytes, len, views, rec->stage_mask, rec->identity, 1);
         if (le) { if (!compute) le->prog.z_raw = 1; le->prog.lib_sourced = 1; }
         free(bytes); bytes = NULL; len = 0;
-        if (le && !le->failed) { libpack_note_hit(); return le; }
+        if (le && !le->failed) { libpack_note_hit(rec->identity, compute ? "warm-cs" : "warm-gfx", lib_state); return le; }
         if (le) entry_free(le);
         libpack_mark_bad(rec->identity, compute ? rec->keys[0] : NULL);
     }
@@ -2716,7 +2750,8 @@ static struct entry *alias_try_fg(const uint8_t sha[32], const struct s2a_input_
 // （火把/粒子等用 BRX 跳表的着色器）直接跳过 → 光消失、画面发黑。程序对象里就有 c1，直接抄过来即可。
 // 「已发布命中」与「结果合并命中」（#1355）共用这一份。
 static void prog_note_use(const uint8_t sha[32], uint32_t stages, int nst, const struct s2a_input_identity *id, const struct rp_prog *prog) {
-    struct nvk_prog_rec rec; memset(&rec, 0, sizeof rec); memcpy(rec.identity, sha, 32); rec.stage_mask = stages; rec.lp_ok = libpack_state_ok(id->gfx) ? 2 : 0;
+    struct nvk_prog_rec rec; memset(&rec, 0, sizeof rec); memcpy(rec.identity, sha, 32); rec.stage_mask = stages;
+    libpack_note_state(&rec, libpack_state_for_gate(libpack_gate_mask(id->gfx)), prog);
     for (int st = 0; st < nst; st++)
         if (stages & (1u << st)) memcpy(rec.keys[st], id->keys[identity_stage_index(stages, st)], 8);
     for (int st = 0; st < nst; st++)
@@ -2868,7 +2903,8 @@ static int resolve_candidate(const struct rp_shader_req *q, const struct rp_prog
         if (win->failed) return -1;
         *out = &win->prog;   // 预建对象的采用计数在 await_inflight 的锁内记（每份一次）
         // 同一处的 c1 记账（原因见 prog_note_use）：预建对象里有 c1 就记进清单。
-        { struct nvk_prog_rec rec; memset(&rec, 0, sizeof rec); memcpy(rec.identity, sha, 32); rec.stage_mask = stages; rec.lp_ok = libpack_state_ok(&f->gfx) ? 2 : 0;
+        { struct nvk_prog_rec rec; memset(&rec, 0, sizeof rec); memcpy(rec.identity, sha, 32); rec.stage_mask = stages;
+          libpack_note_state(&rec, libpack_state_for_gate(libpack_gate_mask(&f->gfx)), &win->prog);
           for (int st = 0; st < nst; st++)
               if (stages & (1u << st)) memcpy(rec.keys[st], id.keys[identity_stage_index(stages, st)], 8);
           for (int st = 0; st < nst; st++)
@@ -2908,7 +2944,7 @@ static int resolve_candidate(const struct rp_shader_req *q, const struct rp_prog
     struct nvk_prog_rec rec;
     memset(&rec, 0, sizeof rec);
     memcpy(rec.identity, sha, 32);
-    rec.stage_mask = stages; rec.lp_ok = libpack_state_ok(&f->gfx) ? 2 : 0;
+    rec.stage_mask = stages;
     for (int st = 0; st < nst; st++)
         if (stages & (1u << st)) memcpy(rec.keys[st], id.keys[identity_stage_index(stages, st)], 8);
     struct entry *ne = NULL;
@@ -2956,6 +2992,7 @@ static int resolve_candidate(const struct rp_shader_req *q, const struct rp_prog
     //   预热产品必须与这次真实解析的程序逐位一致（rp_draw 对 c1 不齐直接跳过绘制）。
     for (int st = 0; st < nst; st++)
         if (use->prog.c1_ok & (1u << st)) (void)rec_c1_put(&rec, st, use->prog.c1[st], use->prog.c1_len[st]);
+    libpack_note_state(&rec, libpack_state_for_gate(libpack_gate_mask(&f->gfx)), &use->prog);
     nvk_prog_warm_note(&rec);   // 真实 resolve 成功：记身份 + uses（含 c1 整段）
     prog_tally_log();
     return 0;
@@ -3089,7 +3126,7 @@ static void compute_warm_note(const struct rp_prog *p, const struct s2a_direct_c
     for (int i = 0; i < 16; i++)
         if (rp_S.ssbo[5][i].addr && pc->storage_buffer_offset_alignment &&
             rp_S.ssbo[5][i].addr % pc->storage_buffer_offset_alignment) unaligned = 1;
-    rec.lp_ok = unaligned ? 0 : 2;
+    libpack_note_state(&rec, unaligned ? LIBPACK_SSBO_WINDOW : LIBPACK_ALIGNED, p);
     nvk_prog_warm_note(&rec);
 }
 static int shader_resolve_compute(const struct rp_prog **out) {   // 快路在内层；外层 rp_shader_resolve_compute 做停局准入登记（#907）
@@ -3196,10 +3233,10 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
         if (!bytes && cdir && !nvn_plat_flag("no_disk_cache", 0) && s2a_program_cache_load(cdir, rq.identity, &bytes, &len, NULL, why, sizeof why) == 0) atomic_fetch_add_explicit(&g_n_cache, 1, memory_order_relaxed);
         // 出包预编库：口径同图形那条（跨局缓存之后、现编之前；同一句柄、同一张不可用表）。键 = 计算阶段 8 字节控制键 rp_S.skey[5]
         struct entry *lpe = NULL;
-        if (!bytes && libpack_fetch(rq.identity, NULL, 0, rp_S.skey[5], !unaligned, NULL, &pc, &bytes, &len)) {
+        if (!bytes && libpack_fetch(rq.identity, NULL, 0, rp_S.skey[5], unaligned ? LIBPACK_SSBO_WINDOW : LIBPACK_ALIGNED, NULL, &pc, &bytes, &len)) {
             lpe = build_compute(bytes, len, &rq.source, rq.identity, rp_S.skey[5], 1);
             free(bytes); bytes = NULL; len = 0;
-            if (lpe && !lpe->failed) { lpe->prog.lib_sourced = 1; libpack_note_hit(); }
+            if (lpe && !lpe->failed) { lpe->prog.lib_sourced = 1; libpack_note_hit(rq.identity, "cs", unaligned ? LIBPACK_SSBO_WINDOW : LIBPACK_ALIGNED); }
             else { entry_free(lpe); lpe = NULL; libpack_mark_bad(rq.identity, rp_S.skey[5]); }
         }
         if (!bytes && !lpe) {
