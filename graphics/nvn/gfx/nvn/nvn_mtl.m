@@ -9735,11 +9735,12 @@ enum { POOL_SEEN_WORDS = (1u << 20) / 32 };
 static __strong id<MTLBuffer> g_seen_buf; static uint32_t g_seen_done[POOL_SEEN_WORDS], g_seen_todo[POOL_SEEN_WORDS]; static uint64_t g_seen_sub = ~0ull;
 static uint16_t g_seen_words[POOL_SEEN_WORDS]; static uint32_t g_seen_listed[POOL_SEEN_WORDS / 32], g_nseen_words;   // compact list of non-zero g_seen_done words for fast recheck scans
 static inline int pool_seen(int id_) { return id_ >= 0 && id_ < (int)(POOL_SEEN_WORDS * 32) && (g_seen_done[(unsigned)id_ >> 5] >> (id_ & 31) & 1); }
+static void pool_seen_clear_slices(int id_);   // pool tables below
 static void pool_seen_clear(int id_) {   // an ID given another texture has not been read as that texture
     if (id_ < 0 || id_ >= (int)(POOL_SEEN_WORDS * 32)) return;
     uint32_t b = 1u << (id_ & 31);
     g_seen_done[(unsigned)id_ >> 5] &= ~b; g_seen_todo[(unsigned)id_ >> 5] &= ~b;
-    if (g_seen_buf) atomic_fetch_and((_Atomic uint32_t *)g_seen_buf.contents + ((unsigned)id_ >> 5), ~b);
+    if (g_seen_buf) { atomic_fetch_and((_Atomic uint32_t *)g_seen_buf.contents + ((unsigned)id_ >> 5), ~b); pool_seen_clear_slices(id_); }
 }
 // 贴图池销毁时清它那段编号的登记（hle_nvn.c dpool_finalize）：只动已登记的项（不扩表），同 nvn_be_reg_tex(id, NULL, NULL) 的清法——丢缓存的视图、记登记代号
 void nvn_be_unreg_tex_range(int base, int n) {
@@ -12940,6 +12941,10 @@ typedef struct {
     uint64_t bound_fence;   // g_fence + 1 when pool_gpu last handed buf to a draw/dispatch; > pin_done() means GPU may still read buf
 } pool_tab;
 static pool_tab g_ptab[POOL_TABS]; static unsigned g_ptab_next; static _Atomic int g_ptab_any;
+static void pool_seen_clear_slices(int id_) {   // id_'s bit in the slices of tables at a non-zero base too (pool_seen_gpu)
+    for (int k = 0; k < POOL_TABS; k++) { const pool_tab *t = &g_ptab[k]; if (!t->used || t->samp || !t->base || id_ < t->base || (uint32_t)(id_ - t->base) >= POOL_SEEN_WORDS * 32) continue;
+        uint32_t l = (uint32_t)(id_ - t->base); atomic_fetch_and((_Atomic uint32_t *)g_seen_buf.contents + (size_t)(1 + k) * POOL_SEEN_WORDS + (l >> 5), ~(1u << (l & 31))); }
+}
 static uint64_t g_psnap_gen = 1;   // bumped when a table's address changes (made, grown, dropped): an argument block holding a pool address is not reused past it (encode_args_ ab_pgen)
 // Counters (t_nvn_pool_tex reads them): whole walks, buffers made, entries looked up again by cause
 static uint64_t g_pool_walks, g_pool_made, g_pool_upd_dirty, g_pool_upd_ret, g_pool_upd_seen, g_pool_upd_left, g_pool_calls; static double g_pool_ms, g_pool_walk_ms;
@@ -12974,14 +12979,14 @@ static int tex_storage_live(const treg_t *r) {
 // nocopy_buf): in play it was over that twentieth always (player diagnostics: 0.7–6.8 GB against a few hundred MB), nothing was made up front, and each newly streamed texture
 // showed the dummy for a frame before the seen scan made it
 enum { POOL_FRAME_BYTES = 32u << 20, POOL_REQ_BYTES = 128u << 20 };
-static uint64_t g_walk_frame = ~0ull, g_walk_spent, g_walk_req;
+static uint64_t g_walk_frame = ~0ull, g_walk_spent, g_walk_req, g_live_spent;   // g_live_spent: what the registration batches made this frame (pool_room_live)
 static uint64_t pool_tex_size(const tex_t *t) { return t->L.size ? t->L.size : 1; }
 uint64_t s2a_gpu_alloc_bytes(void) {   // 浮层「GPU 已分配」（runtime/src/hud.c 弱定义）：设备总量减去零拷贝缓冲（游戏内存，已在进程实占里；nocopy_buf）
     if (!g_dev) return 0;
     uint64_t a = (uint64_t)g_dev.currentAllocatedSize, z = atomic_load(&g_nocopy_bytes);
     return a > z ? a - z : 0;
 }
-static void pool_walk_frame(void) { uint64_t f = atomic_load(&g_cur_frame); if (f != g_walk_frame) { g_walk_frame = f; g_walk_spent = 0; g_walk_req = 0; } }
+static void pool_walk_frame(void) { uint64_t f = atomic_load(&g_cur_frame); if (f != g_walk_frame) { g_walk_frame = f; g_walk_spent = 0; g_walk_req = 0; g_live_spent = 0; } }
 // What may still be made up front this frame: gpu = GPU allocation without the zero-copy wraps (s2a_gpu_alloc_bytes), ws = recommendedMaxWorkingSetSize, spent = made this frame
 // floor: the headroom made-up-front textures must leave. Not below what idle-texture reclaim brings headroom back to (2 × tex_reclaim_low, see tex_idle_reclaim):
 //   those textures sit in pool tables, which reclaim skips (tex_pinned), so making them between reclaim's threshold and its target pinned memory it could then not take back
@@ -12997,6 +13002,13 @@ static uint64_t pool_room(void) {
     uint64_t avail = 0; int has = mem_avail(&avail);
     return pool_room_calc(s2a_gpu_alloc_bytes(), (uint64_t)g_dev.recommendedMaxWorkingSetSize, g_walk_spent, has, avail, pool_avail_floor(mem_margin(), tex_reclaim_low()));
 }
+// The registration batch's room: charged only with what registration batches made this frame, not what the budget queue made (pool_left_scan runs once a frame, often in its
+//   first pool_gpu; on the shared count it took the frame's 32 MB and the textures the game registered later that frame went to the queue and read the dummy, #2269 B)
+static uint64_t pool_room_live(void) {
+    pool_walk_frame();
+    uint64_t avail = 0; int has = mem_avail(&avail);
+    return pool_room_calc(s2a_gpu_alloc_bytes(), (uint64_t)g_dev.recommendedMaxWorkingSetSize, g_live_spent, has, avail, pool_avail_floor(mem_margin(), tex_reclaim_low()));
+}
 // A render target no pass has written holds nothing to read, and a pass makes its texture when it renders. Made for a read, one that only registers next frame's target took three times the
 // textures and 17 GB allocated on Ocarina of Time (upstream): the game re-registers its IDs with transient targets, whose IDs a shader read as the previous texture
 //   "No pass has written" is about the storage, not the object: an NVN texture object is a description, its content is the memory. A game that draws through one object and registers
@@ -13010,27 +13022,26 @@ static int pool_unwritten_target(const tex_t *t) {   // caller holds g_rmu (g_sm
                                                (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, n); }
     return !shared;
 }
-static int pool_size_cmp(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
 static int pool_unmade(int id_) { return id_ > 0 && id_ < g_ntreg && g_treg[id_].ok && !g_treg[id_].gone && !g_treg[id_].view && !tex_get(g_treg[id_].t.serial); }
-// The largest texture these IDs may make: this frame's room, spent from the smallest up. UINT64_MAX while they all fit. ids NULL: base .. base + n - 1
-static uint64_t pool_walk_limit(int base, int n, const uint32_t *ids) {
-    uint64_t room = pool_room(), sum = 0;
-    if (!room) return 0;   // no need to size a walk that can make nothing
-    uint64_t *z = malloc(sizeof *z * (size_t)(n ? n : 1)); int m = 0;
-    if (!z) return 0;
-    for (int i = 0; i < n; i++) { int id_ = ids ? (int)ids[i] : base + i; if (pool_unmade(id_)) { z[m] = pool_tex_size(&g_treg[id_].t); sum += z[m]; m++; } }
-    uint64_t limit = UINT64_MAX;
-    if (sum > room) {
-        qsort(z, (size_t)m, sizeof *z, pool_size_cmp);
-        limit = 0; sum = 0;
-        for (int i = 0; i < m && sum + z[i] <= room; i++) { sum += z[i]; limit = z[i]; }
-    }
-    free(z);
-    return limit;
+// The read bitmap a table's shaders set (dm_pool_mark: bit = the table's own index, not the ID): a table based at 0 sets the global bitmap (first POOL_SEEN_WORDS words,
+//   indexed by ID) directly; a table at another base (nvn_dpool_base: a game with several texture pools) has a slice of its own after it, folded into the global one by
+//   base + index at each submission (pool_seen_fold). With one shared bitmap such a table's bits named the wrong IDs and the IDs it read were never made for the read —
+//   a table walk that made small textures up front hid it, and it walks none now (#2269)
+static uint64_t pool_seen_gpu(int base, int ti) {
+    if (!g_seen_buf) { g_seen_buf = [g_dev newBufferWithLength:(1 + POOL_TABS) * POOL_SEEN_WORDS * 4 options:MTLResourceStorageModeShared]; res_add(g_seen_buf); res_commit(); }
+    if (!base) return g_seen_buf.gpuAddress;
+    memset((uint32_t *)g_seen_buf.contents + (size_t)(1 + ti) * POOL_SEEN_WORDS, 0, POOL_SEEN_WORDS * 4);   // a new table in this slot: nothing it read yet
+    return g_seen_buf.gpuAddress + (uint64_t)(1 + ti) * POOL_SEEN_WORDS * 4;
 }
-static uint64_t pool_seen_gpu(void) {
-    if (!g_seen_buf) { g_seen_buf = [g_dev newBufferWithLength:POOL_SEEN_WORDS * 4 options:MTLResourceStorageModeShared]; res_add(g_seen_buf); res_commit(); }
-    return g_seen_buf.gpuAddress;
+static void pool_seen_fold(void) {   // the slices of tables at a non-zero base into the global bitmap, by ID (base + index)
+    uint32_t *g = (uint32_t *)g_seen_buf.contents;
+    for (int k = 0; k < POOL_TABS; k++) {
+        const pool_tab *t = &g_ptab[k]; if (!t->used || t->samp || !t->base) continue;
+        const uint32_t *sl = g + (size_t)(1 + k) * POOL_SEEN_WORDS; unsigned words = MIN(t->n / 32 + 1, (unsigned)POOL_SEEN_WORDS);
+        for (unsigned j = 0; j < words; j++) for (uint32_t v = atomic_load((_Atomic uint32_t *)&sl[j]); v; v &= v - 1) {
+            uint32_t id_ = (uint32_t)t->base + j * 32 + (uint32_t)__builtin_ctz(v); if (id_ >= POOL_SEEN_WORDS * 32) break;
+            atomic_fetch_or((_Atomic uint32_t *)&g[id_ >> 5], 1u << (id_ & 31)); }
+    }
 }
 // ----- Pins: allocation → the entries naming it (entry code: table << 20 | index), and the pinned allocations res_remove was asked to retire. Under g_pin_mu, which res_remove takes
 //   inside g_res_mu: nothing here calls res_add / res_remove / defer_* with it held
@@ -13143,6 +13154,7 @@ static void pool_ent_put(int ti, uint32_t i, void *o, uint64_t rid) {
 }
 // ----- What an ID names
 static int pool_covers(const pool_tab *t, int id_) { return t->used && id_ >= t->base && (uint32_t)(id_ - t->base) < t->n; }
+static int pool_rw_covers(int id_) { for (int k = 0; k < POOL_TABS; k++) if (g_ptab[k].rw && !g_ptab[k].samp && pool_covers(&g_ptab[k], id_)) return 1; return 0; }   // an image table names id_
 static void pool_evict_id(int id_) {   // every table entry for texture ID id_ to the dummy (g_rmu held, submit thread): a pool-held texture reclaim let go (alias_dead_views)
     for (int k = 0; k < POOL_TABS; k++) { const pool_tab *t = &g_ptab[k]; if (t->used && !t->samp && pool_covers(t, id_)) pool_ent_put(k, (uint32_t)(id_ - t->base), NULL, 0); }
 }
@@ -13244,7 +13256,8 @@ static void pool_seen_word(unsigned i, int recheck, int sg_chg, uint64_t sg) {
     for (uint32_t bits = g_seen_todo[i]; bits; bits &= bits - 1) {
         int b = __builtin_ctz(bits), id_ = (int)i * 32 + b;
         if (id_ <= 0 || id_ >= g_ntreg || !g_treg[id_].ok || (!g_treg[id_].view && !tex_storage_live(&g_treg[id_]))) { g_seen_todo[i] &= ~(1u << b); continue; }
-        if (!g_treg[id_].view && pool_unwritten_target(&g_treg[id_].t)) continue;   // waits for a pass to write it
+        if (!g_treg[id_].view && pool_unwritten_target(&g_treg[id_].t) && !pool_rw_covers(id_)) continue;   // waits for a pass to write it; unless an image table names it:
+        //   a shader's write through that table set the bit, and a target only shaders write through a pool is made here (no table walk makes it up front any more, #2269)
         if (!g_treg[id_].view && !tex_get(g_treg[id_].t.serial)) { if (g_walk_req >= POOL_REQ_BYTES) break; }
         g_seen_todo[i] &= ~(1u << b);
         int unmade = !g_treg[id_].view && !tex_get(g_treg[id_].t.serial);
@@ -13287,6 +13300,7 @@ static void pool_seen_scan(void) {
     g_seen_sub = g_sub_serial; g_seen_dirty = dg; g_seen_ser = sg;
     if (new_sub) {
         pool_walk_frame();
+        pool_seen_fold();
         const uint32_t *w = (const uint32_t *)g_seen_buf.contents; unsigned words = MIN((unsigned)g_ntreg / 32 + 1, (unsigned)POOL_SEEN_WORDS);
         for (unsigned i = 0; i < words; i++) {
             uint32_t fresh = w[i] & ~g_seen_done[i];
@@ -13388,16 +13402,18 @@ static int pool_tab_new(int samp, int dtt, int dpf, int rw, int base) {   // the
     else if (rw) { id<MTLTexture> di = dummy_img(dtt, dpf, 0); t->dummy = di ? di.gpuResourceID._impl : 0; }
     else if (dtt == (int)MTLTextureTypeTextureBuffer) t->dummy = dummy_tbuf(dpf) ? g_dummy_tbuf_rid[dpf & 3] : 0;
     else t->dummy = dummy_tex(dtt, dpf) ? g_dummy_tex_rid[dtt & 15][dpf & 3] : 0;
-    uint8_t *c = b.contents; memset(c, 0, DMSH_POOL_HEAD); *(uint32_t *)c = (uint32_t)n; if (!samp) *(uint64_t *)(c + 8) = pool_seen_gpu();
+    uint8_t *c = b.contents; memset(c, 0, DMSH_POOL_HEAD); *(uint32_t *)c = (uint32_t)n; if (!samp) *(uint64_t *)(c + 8) = pool_seen_gpu(base, ti);
     uint64_t *e = (uint64_t *)(c + DMSH_POOL_HEAD);
     for (uint32_t i = 0; i <= (uint32_t)n; i++) e[i] = t->dummy;
-    int real = 0, left = 0; uint64_t limit = samp ? 0 : pool_walk_limit(base, n, NULL);
+    // Nothing made up front for the table (#2269): of the tens of thousands of IDs it covers shaders read a few hundred (made when read: pool_seen_word), and those it leaves out
+    //   are not queued for later either — queued, pool_left_scan made every cold texture 32 MB a frame (0400486024DEC000: 50,244 textures / 26.9 GB in 3 minutes, 15.4 GB in all)
+    int real = 0, left = 0; const uint64_t limit = 0;
     for (int i = 0; i < n; i++) {
         int id_ = base + i; uint64_t rid = 0; void *o = NULL; int lft = 0;
         if (samp) o = pool_samp_obj(id_, &rid);
         else if (id_ > 0 && id_ < g_ntreg && g_treg[id_].ok && g_treg[id_].tt1 && g_treg[id_].tt1 - 1 != dtt) {}   // an ID of another texture type, seen before: nothing to look up or charge
         else { o = pool_tex_obj(id_, limit, &lft, &rid, rw); o = pool_fit(t, id_, o, &rid); }
-        if (lft == 1) { left++; pool_dset_add(&g_pleft, id_); } else if (lft == 2) { pool_dset_add(&g_punwritten, id_); }
+        if (lft == 1) left++; else if (lft == 2) pool_dset_add(&g_punwritten, id_);
         if (o) { pool_ent_put(ti, (uint32_t)i, o, rid); real++; }
     }
     g_psnap_gen++;
@@ -13419,7 +13435,8 @@ static uint64_t pool_gpu(int samp, int dtt, int dpf, int rw, int base, __unsafe_
             for (uint32_t j = 0; j < nr; j++) {
                 pthread_mutex_lock(&g_pin_mu); pin_list *l = nvn_hm_get(&g_pin, &rs[j]); uint32_t m = l ? l->n : 0; uint32_t *codes = m ? malloc(m * 4) : NULL; if (codes) memcpy(codes, l->e, m * 4); else m = 0; pthread_mutex_unlock(&g_pin_mu);
                 for (uint32_t q = 0; q < m; q++) { const pool_tab *t = &g_ptab[codes[q] >> 20]; uint32_t i = codes[q] & 0xfffff; if (!t->used || i >= t->n) continue;
-                    g_pool_upd_ret++; if (t->samp) pool_samp_update(t->base + (int)i); else pool_tex_update(t->base + (int)i, pool_room()); }
+                    g_pool_upd_ret++; if (t->samp) pool_samp_update(t->base + (int)i); else { int id_ = t->base + (int)i, lr = pool_tex_update(id_, pool_room_live());   // what replaced it is live too
+                        if (lr == 1) pool_dset_add(&g_pleft, id_); else if (lr == 2) pool_dset_add(&g_punwritten, id_); } }
                 free(codes);
             }
             free(rs);
@@ -13427,8 +13444,9 @@ static uint64_t pool_gpu(int samp, int dtt, int dpf, int rw, int base, __unsafe_
         for (int s = 0; s < 2; s++) if (g_pdirty[s].n) {
             uint32_t m = g_pdirty[s].n; uint32_t *ids = malloc(m * sizeof *ids); if (!ids) break;
             memcpy(ids, g_pdirty[s].list, m * sizeof *ids); pool_dset_clear(&g_pdirty[s]);
-            uint64_t room0 = s ? 0 : pool_room(), spent0 = g_walk_spent;   // once a batch (headroom and device size are system calls); each texture then takes what the batch made so far off it
+            uint64_t room0 = s ? 0 : pool_room_live(), spent0 = g_walk_spent;   // once a batch (headroom and device size are system calls); each texture then takes what the batch made so far off it
             for (uint32_t j = 0; j < m; j++) { g_pool_upd_dirty++; if (s) pool_samp_update((int)ids[j]); else { uint64_t used = g_walk_spent - spent0, room = room0 > used ? room0 - used : 0; int lr = pool_tex_update((int)ids[j], room); if (lr == 1) pool_dset_add(&g_pleft, (int)ids[j]); else if (lr == 2) pool_dset_add(&g_punwritten, (int)ids[j]); } }
+            if (!s) g_live_spent += g_walk_spent - spent0;   // this frame's registration batches so far (pool_room_live)
             free(ids);
         }
         pool_unwritten_scan();
@@ -13445,9 +13463,9 @@ static uint64_t pool_gpu(int samp, int dtt, int dpf, int rw, int base, __unsafe_
         pthread_mutex_lock(&g_smu);
         for (uint32_t i = 0; i < g_pool_held.cap; i++) { if (!g_pool_held.vals[i]) continue; hn_++; uint64_t k; memcpy(&k, g_pool_held.keys + (size_t)i * 8, 8);
             __unsafe_unretained id o = hm_get_id(&g_by_serial, &k); id<MTLTexture> x = [o isKindOfClass:[NvPkg class]] ? ((NvPkg *)o)->tex : [o conformsToProtocol:@protocol(MTLTexture)] ? (id<MTLTexture>)o : nil;
-            if (x) hb_ += x.allocatedSize; }
+            if (x && !x.buffer && !x.parentTexture) hb_ += x.allocatedSize; }   // own storage only: a texture over a (zero-copy) buffer or a view reports the whole of what it sits on, counted over and over
         pthread_mutex_unlock(&g_smu);
-        MLOG("pool tables: %llu calls, whole walks %llu (%.0f ms), buffers %llu; entries looked up again: registrations %llu, retired %llu (late, deferred behind the unpinning submission %llu), read by a shader %llu, left out %llu; %.0f ms in all; %u IDs read by a shader (%llu MB), %u left out, allocated %llu MB; made only once a shader read the dummy %llu (+%llu since the last line); pool-held (finalized, a registration still names them) %u, %llu MB made now, %llu let go by idle reclaim (%llu MB) so far",
+        MLOG("pool tables: %llu calls, whole walks %llu (%.0f ms), buffers %llu; entries looked up again: registrations %llu, retired %llu (late, deferred behind the unpinning submission %llu), read by a shader %llu, left out %llu; %.0f ms in all; %u IDs read by a shader (%llu MB), %u left out, allocated %llu MB; made only once a shader read the dummy %llu (+%llu since the last line); pool-held (finalized, a registration still names them) %u, %llu MB of own storage made now, %llu let go by idle reclaim (%llu MB) so far",
              (unsigned long long)g_pool_calls, (unsigned long long)g_pool_walks, g_pool_walk_ms, (unsigned long long)g_pool_made, (unsigned long long)g_pool_upd_dirty, (unsigned long long)g_pool_upd_ret, (unsigned long long)atomic_load(&g_unpin_late),
              (unsigned long long)g_pool_upd_seen, (unsigned long long)g_pool_upd_left, g_pool_ms, nseen, (unsigned long long)(bseen >> 20), g_pleft.n, (unsigned long long)(g_dev.currentAllocatedSize >> 20),
              (unsigned long long)g_pool_seen_late, (unsigned long long)(g_pool_seen_late - g_pool_seen_late_last),
@@ -13484,7 +13502,7 @@ static void pool_session_reset(void) {
     pool_dset_clear(&g_pleft);
     pool_dset_clear(&g_punwritten); g_punwritten_ser = ~0ull;
     memset(g_seen_done, 0, sizeof g_seen_done); memset(g_seen_todo, 0, sizeof g_seen_todo); memset(g_seen_listed, 0, sizeof g_seen_listed); g_nseen_words = 0; g_seen_sub = ~0ull;
-    if (g_seen_buf) memset(g_seen_buf.contents, 0, POOL_SEEN_WORDS * 4);
+    if (g_seen_buf) memset(g_seen_buf.contents, 0, (1 + POOL_TABS) * POOL_SEEN_WORDS * 4);
     g_psnap_gen++;
 }
 // Snapshot substitution for same-pass feedback sampling (registered by fb_prepare, used by encode_args; see the notes before draw)
