@@ -121,10 +121,24 @@ static void stallReport(const char *name, uint64_t ticket, const PresentObservat
             }
             if (list) CFRelease(list);
             [above appendFormat:@"（另有系统层 %d 个）", system];
-            win = [NSString stringWithFormat:@"窗口 #%ld visible=%d occluded=%d onActiveSpace=%d key=%d main=%d；本进程 active=%d；最前台 %@；上面的屏上窗口%@",
+            // 11-27 09:03 现场：本帧入队到调 present 六步全做了、平台回调仍不来——再分清「窗口 / 图层没上屏」与「屏幕没在出帧」：
+            //   系统屏上窗口列表里这个窗口的 onscreen / alpha / 位置；图层挂没挂、隐藏 / 透明、尺寸与绘制尺寸；所在屏幕与它的刷新率；在线 / 活动的显示器个数
+            NSString *ws = @"系统列表里没有";
+            CFArrayRef me = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, (CGWindowID)window.windowNumber);
+            for (NSDictionary *w in (__bridge NSArray *)me) {
+                CGRect r = CGRectZero; CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)w[(id)kCGWindowBounds], &r);
+                ws = [NSString stringWithFormat:@"onscreen=%@ alpha=%@ 层%@ %.0fx%.0f@%.0f,%.0f", w[(id)kCGWindowIsOnscreen] ?: @"无", w[(id)kCGWindowAlpha], w[(id)kCGWindowLayer], r.size.width, r.size.height, r.origin.x, r.origin.y];
+            }
+            if (me) CFRelease(me);
+            NSScreen *sc = window.screen;
+            uint32_t online = 0, active = 0; CGGetOnlineDisplayList(0, NULL, &online); CGGetActiveDisplayList(0, NULL, &active);
+            NSString *lay = [NSString stringWithFormat:@"图层 挂在窗口=%d hidden=%d opacity=%.2f bounds=%.0fx%.0f drawable=%.0fx%.0f scale=%.1f；屏幕 %@（%ld Hz）；显示器 在线 %u 活动 %u",
+                layer.superlayer != nil || window.contentView.layer == layer, layer.hidden, layer.opacity, layer.bounds.size.width, layer.bounds.size.height,
+                layer.drawableSize.width, layer.drawableSize.height, layer.contentsScale, sc ? sc.localizedName : @"无", (long)(sc ? sc.maximumFramesPerSecond : 0), online, active];
+            win = [NSString stringWithFormat:@"窗口 #%ld visible=%d occluded=%d onActiveSpace=%d key=%d main=%d；本进程 active=%d；最前台 %@；上面的屏上窗口%@；系统列表 %@；%@",
                 (long)window.windowNumber, window.visible, !(window.occlusionState & NSWindowOcclusionStateVisible), window.onActiveSpace,
                 window.keyWindow, window.mainWindow, NSApp.active, NSWorkspace.sharedWorkspace.frontmostApplication.localizedName ?: @"无",
-                above];
+                above, ws, lay];
         }
     });
     // 上屏阶段：本帧卡在哪一步——没出队 / 出队没拿到 drawable / 拿到没提交（编码失败或在等）/ 提交了 GPU 没做完 / 做完没调 present / 调了 present 系统没显示
@@ -148,7 +162,17 @@ static BOOL checkPresentation(NSString *name, uint64_t sequence, uint64_t ticket
         pthread_mutex_unlock(&drawableMutex);
         production=nvn_be_presented_time(ticket);
         if (((o.callbacks || o.sampledTime>0) && presentationConsistent(&o,production)) || CACurrentMediaTime()>=end) break;
-        if (!reported && CACurrentMediaTime()-begin>5) { reported=YES; stallReport(name.UTF8String,ticket,&o,production,CACurrentMediaTime()-begin); }
+        if (!reported && CACurrentMediaTime()-begin>5) { reported=YES; stallReport(name.UTF8String,ticket,&o,production,CACurrentMediaTime()-begin);
+            // 11-27 门禁现场（09:15:46 一格，系统日志对得上）：本帧我方六步做完（GPU 做完、调了 present），系统合成器也收了这一帧（WindowServer ASEProcessing 记了它），
+            //   平台「已呈现」回调却一直不回——丢的是系统给本进程的呈现回执，不是我方上屏没做。本测逐帧等回执，丢一次就一路等到 60 秒闹钟。
+            //   这种情形退出 78：脚本对这一格换个进程重跑一次，再丢才记未证（不计红）；我方任何一步没做完照旧往下判红
+            uint64_t pp[6] = {0}; if (nvn_be_present_progress) nvn_be_present_progress(pp);
+            if (!o.callbacks && pp[4] >= ticket && pp[5] >= ticket) {
+                printf("未证：%s ticket %llu 平台呈现回执丢失（上屏六步已做完：GPU 做完 %llu、调 present %llu；回调 0 次），本格换进程重跑\n",
+                    name.UTF8String, ticket, (unsigned long long)pp[4], (unsigned long long)pp[5]);
+                fflush(stdout); _exit(78);
+            }
+        }
         struct timespec pause={0,1000000}; nanosleep(&pause,NULL);
     }
     // 没有 handler 且没有正呈现时间，只能确认 ring 尚无记录，不能算已显示。
