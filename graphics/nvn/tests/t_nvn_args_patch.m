@@ -126,7 +126,6 @@ int main(void) { @autoreleasepool {
     VERIFY(g_stat_args_enc == e0 + 1 && g_stat_args_patch == p0,
            "⑨c TEXP 在 g_ser_gen 前进后换 cb0：不跳过 pool_gpu（整块 +%llu、打补丁 +%llu，期望 1 / 0）",
            (unsigned long long)(g_stat_args_enc - e0), (unsigned long long)(g_stat_args_patch - p0));
-  }
     // ⑨d 钉住时退役的条目待回查（g_pin_has_new）时换 cb0：pool_gpu 有活要做，不能走打补丁跳过它（整块 +1、打补丁 +0）
     VERIFY(pool_gpu_settled(), "⑨d 前置：⑨c 整块重编后池表已安定");
     atomic_store(&g_pin_has_new, 1);
@@ -152,5 +151,6 @@ int main(void) { @autoreleasepool {
                "⑩ 表要补长 %d / 脏页代号变 %d / 换提交 %d / 渲染写代号变 %d / 挡下的条目换帧 %d（同帧 %d）/ 未写目标代号变 %d（未变 %d）/ 脏条目 %d / 复原 %d（期望 0/0/0/0/0（1）/0（1）/0/1）",
                grow, seen_dirty, seen_sub, seen_ser, left, left_same_frame, unw, unw_same, dirty, pool_gpu_settled());
     }
+  }
     printf("%s t_nvn_args_patch：%u 项，失败 %u\n", failures ? "✗" : "✓", checks, failures); return failures ? 1 : 0;
 }
