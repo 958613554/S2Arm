@@ -61,7 +61,7 @@
 #include "spirv_compliance.h"   // #1865 统一装载闸：能力 / 扩展 / 存储类字节声明扫描
 #include "../capprobe/capprobe.h"
 #include "direct/sha256.h"
-_Static_assert(NVN_GPU_CONTRACT_VERSION == 26, "核对 Vulkan 后端与新版 NVN GPU 契约");
+_Static_assert(NVN_GPU_CONTRACT_VERSION == 27, "核对 Vulkan 后端与新版 NVN GPU 契约");
 #include "nvn_vk_dq.inc"   // 两级回放：从这里往下 vkCmd* 等名字走它的包装（调试开关 nvk_dq，缺省开）
 // 宿主后端夹具可能不链回放布局；缺来源时能力关闭并明确报原因。
 // 弱链接[androiddraw]：nvn_deswizzle_geom
@@ -1713,6 +1713,15 @@ static void fill_caps(struct nvn_gpu_vk *vk, const nvn_gpu_open_desc *d) {
         c->storage_stages |= 1u << NVN_GPU_SH_GS;
         c->atomic_stages |= 1u << NVN_GPU_SH_GS;
     }
+    int tess_enabled = f.tessellationShader && l->maxTessellationPatchSize > 0;
+    if (tess_enabled) {
+        c->caps |= NVN_GPU_CAP_TESSELLATION;
+        c->max_patch_size = l->maxTessellationPatchSize;
+        if (f.vertexPipelineStoresAndAtomics) {
+            c->storage_stages |= (1u << NVN_GPU_SH_TCS) | (1u << NVN_GPU_SH_TES);
+            c->atomic_stages |= (1u << NVN_GPU_SH_TCS) | (1u << NVN_GPU_SH_TES);
+        }
+    }
     if (f.vertexPipelineStoresAndAtomics) c->storage_stages |= 1u << NVN_GPU_SH_VS;
     if (f.fragmentStoresAndAtomics) c->storage_stages |= 1u << NVN_GPU_SH_FS;
     c->storage_stages |= 1u << NVN_GPU_SH_CS;
@@ -1737,7 +1746,7 @@ static void fill_caps(struct nvn_gpu_vk *vk, const nvn_gpu_open_desc *d) {
     if (vk->dev->draw_indirect_count_enabled && vk->dev->draw_indirect_count &&
         vk->dev->draw_indexed_indirect_count && f.multiDrawIndirect && f.drawIndirectFirstInstance)
         c->caps |= NVN_GPU_CAP_INDIRECT_COUNT;
-    // HOST_IMPORT / GPU_VA / TILE_MEMORY / SAMP_MINMAX / LOD_BIAS / DEPTH_CLIP_CTL / GEOMETRY / TESSELLATION /
+    // HOST_IMPORT / GPU_VA / TILE_MEMORY / SAMP_MINMAX / LOD_BIAS / DEPTH_CLIP_CTL / GEOMETRY /
     // XFB / LINKED_PIPE / GPU_DURATION / GPU_TIME_HOST / DYN_* / DESWIZZLE：
     // 本段没有实现或没实测生效，一律不置位（契约：后端不做近似）。
 
@@ -3362,6 +3371,8 @@ void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd ch, const nvn_gpu_buf_copy *v, uint32
     if (stages & 1u << NVN_GPU_SH_VS) dst |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
     if (stages & 1u << NVN_GPU_SH_FS) dst |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     if ((stages & 1u << NVN_GPU_SH_GS) && g.dev->core_features.geometryShader) dst |= VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
+    if ((stages & 1u << NVN_GPU_SH_TCS) && g.dev->core_features.tessellationShader) dst |= VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT;
+    if ((stages & 1u << NVN_GPU_SH_TES) && g.dev->core_features.tessellationShader) dst |= VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT;
     if (!dst) { set_sticky(c, NVN_GPU_E_ARG, "copy_bufs 没给读的阶段（stages=%#x）", stages); return; }
     // 源可能刚被计算 / 传输 / 图形写过（GPU 写出的间接记录、主段里的镜像同步），目标是本段新分的暂存：一道屏障盖住两者
     mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
@@ -3390,6 +3401,8 @@ static VkShaderStageFlagBits vk_shader_stage(nvn_gpu_stage st) {
     case NVN_GPU_SH_VS: return VK_SHADER_STAGE_VERTEX_BIT;
     case NVN_GPU_SH_FS: return VK_SHADER_STAGE_FRAGMENT_BIT;
     case NVN_GPU_SH_GS: return VK_SHADER_STAGE_GEOMETRY_BIT;
+    case NVN_GPU_SH_TCS: return VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
+    case NVN_GPU_SH_TES: return VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
     case NVN_GPU_SH_CS: return VK_SHADER_STAGE_COMPUTE_BIT;
     default: return 0;
     }
@@ -3407,7 +3420,8 @@ static VkPrimitiveTopology vk_topology(uint32_t prim) {
     case 0xB: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
     case 0xC: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
     case 0xD: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
-    default: return VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;   // 2 线环 / 7–9（回放核心已展开 / 换成扇）/ 14 补丁：未实现
+    case NVN_DRAW_PRIMITIVE_PATCHES: return VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+    default: return VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;   // 2 线环 / 7–9（回放核心已展开 / 换成扇）：未实现
     }
 }
 
@@ -3945,6 +3959,8 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
     if (!s || !s->blob || !s->bytes) return fail(err, NVN_GPU_E_ARG, "着色器 blob 为空");
     if (s->stage == NVN_GPU_SH_GS && !(g.caps.caps & NVN_GPU_CAP_GEOMETRY))
         return fail(err, NVN_GPU_E_UNSUPPORTED, "GS 未启用或探测未通过");
+    if ((s->stage == NVN_GPU_SH_TCS || s->stage == NVN_GPU_SH_TES) && !(g.caps.caps & NVN_GPU_CAP_TESSELLATION))
+        return fail(err, NVN_GPU_E_UNSUPPORTED, "细分着色器未启用或设备不支持 tessellationShader");
     if (s->kind != NVN_GPU_BLOB_SPIRV) return fail(err, NVN_GPU_E_UNSUPPORTED, "只收 SPIR-V blob（kind=%d）", s->kind);
     if (s->bytes & 3) return fail(err, NVN_GPU_E_ARG, "SPIR-V 字节数不是 4 的倍数");
     // #1865 统一合规核对：能力 / 扩展声明、SPIR-V 版本、push 与描述符用量、计算工作组（含 Workgroup 字节）。
@@ -4543,12 +4559,25 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
     for (int st = 0; st < 5; st++)
         if (d->st[st].sh && d->st[st].sh->missing_vertex_feature)
             return fail(err, NVN_GPU_E_UNSUPPORTED, "阶段 %d 的着色器要设备特性 %s，设备没启用（#1072）", st, d->st[st].sh->missing_vertex_feature);
+    const int has_tcs = d->st[NVN_GPU_SH_TCS].sh != NULL;
+    const int has_tes = d->st[NVN_GPU_SH_TES].sh != NULL;
+    const int is_patch = d->prim == NVN_DRAW_PRIMITIVE_PATCHES;
     if (d->st[NVN_GPU_SH_GS].sh && !(g.caps.caps & NVN_GPU_CAP_GEOMETRY))
         return fail(err, NVN_GPU_E_UNSUPPORTED, "GS 未启用或探测未通过");
-    if (d->st[NVN_GPU_SH_GS].sh && d->prim != 0 && d->prim != 1 && d->prim != 4)
+    if (d->st[NVN_GPU_SH_GS].sh && d->prim != 0 && d->prim != 1 && d->prim != 4 && !(has_tcs && has_tes && is_patch))
         return fail(err, NVN_GPU_E_UNSUPPORTED, "GS 非原生图元未实现");
-    for (int i = NVN_GPU_SH_TCS; i < 5; i++)
-        if (d->st[i].sh) return fail(err, NVN_GPU_E_UNSUPPORTED, "细分阶段：本段未实现");
+    if (has_tcs || has_tes || is_patch) {
+        if (!(g.caps.caps & NVN_GPU_CAP_TESSELLATION))
+            return fail(err, NVN_GPU_E_UNSUPPORTED, "细分着色器未启用或设备不支持 tessellationShader");
+        if (!has_tcs || !has_tes)
+            return fail(err, NVN_GPU_E_UNSUPPORTED, "细分管线须同时提供 TCS 与 TES 阶段（Vulkan 1.1 不支持单阶段细分）");
+        if (!is_patch)
+            return fail(err, NVN_GPU_E_ARG, "细分管线图元须为 PATCHES（0xE），实为 %u", d->prim);
+        if (!d->patch_size)
+            return fail(err, NVN_GPU_E_ARG, "细分管线 patch_size 不能为 0");
+        if (d->patch_size > g.caps.max_patch_size)
+            return fail(err, NVN_GPU_E_UNSUPPORTED, "细分管线 patch_size=%u 超出设备上限 %u", d->patch_size, g.caps.max_patch_size);
+    }
 
     struct merged { uint8_t set; uint16_t binding; uint8_t cls; uint16_t count; uint32_t stages; int16_t dbase; } m[64];   // dbase：动态 UBO 在所属组里的动态序号起点，-1 = 静态
     uint32_t nm = 0, maxset = 0;
@@ -4889,6 +4918,11 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
     dyns.dynamicStateCount = 7;
     dyns.pDynamicStates = dyn;
 
+    VkPipelineTessellationStateCreateInfo tess;
+    memset(&tess, 0, sizeof tess);
+    tess.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
+    tess.patchControlPoints = d->patch_size;
+
     VkGraphicsPipelineCreateInfo gp;
     memset(&gp, 0, sizeof gp);
     gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -4896,6 +4930,7 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
     gp.pStages = stages;
     gp.pVertexInputState = &vin;
     gp.pInputAssemblyState = &ia;
+    gp.pTessellationState = (has_tcs && has_tes) ? &tess : NULL;
     gp.pViewportState = &vp;
     gp.pRasterizationState = &rs;
     gp.pMultisampleState = &ms;
@@ -6801,7 +6836,11 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
         cmd_ref(c, a->cnt, REF_BUF);
         if (!rc_is(c->sticky, NVN_GPU_OK)) return;
     }
-    if (a->prim != 0x0 && a->prim != 0x1 && a->prim != 0x3 && a->prim != 0x4 && a->prim != 0x5 && a->prim != 0x6) {
+    if (a->prim == NVN_DRAW_PRIMITIVE_PATCHES) {
+        if (!(g.caps.caps & NVN_GPU_CAP_TESSELLATION)) {
+            set_sticky(c, NVN_GPU_E_UNSUPPORTED, "图元 PATCHES：设备未启用 tessellationShader"); return;
+        }
+    } else if (a->prim != 0x0 && a->prim != 0x1 && a->prim != 0x3 && a->prim != 0x4 && a->prim != 0x5 && a->prim != 0x6) {
         set_sticky(c, NVN_GPU_E_UNSUPPORTED, "图元 %u 未实现（线环 / quads 等）", a->prim); return;
     }
     struct nvn_gpu_pipe_s *p = c->pipe;
@@ -8708,6 +8747,8 @@ void nvn_gpu_compute_to_graphics(nvn_gpu_cmd ch) {
     VkPipelineStageFlags dst = VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
         VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     if (g.dev->core_features.geometryShader) dst |= VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
+    if (g.dev->core_features.tessellationShader)
+        dst |= VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT | VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT;
     mem_barrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, dst,
         VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
         VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT);

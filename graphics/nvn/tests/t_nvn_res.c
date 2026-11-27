@@ -265,27 +265,27 @@ static void t_res_bind_fast(void) {
     const op_hdr eh = {OP_END, 8}; uint8_t sv[8]; uint64_t pf[RP_PERF_N];
     memcpy(sv, s.b + o1, 8); memcpy(s.b + o1, &eh, 8);
     nvn_be_exec(s.b);                                                 // ①
-    CHECK(g_gdraws == 1 && g_bind_calls[0] == 1 && g_bind_calls[1] == 1 && g_bind_calls[2] == 1);
+    CHECK(g_gdraws == 1 && g_bind_calls[0] == 1 && g_bind_calls[1] == 1 && g_bind_calls[2] == 1 && g_bind_calls[3] == 1 && g_bind_calls[4] == 1);
     rp_perf_take(pf);
     memcpy(s.b + o1, sv, 8);
     memcpy(sv, s.b + o2, 8); memcpy(s.b + o2, &eh, 8);
     nvn_be_exec(s.b + o1);                                            // ②
-    CHECK(g_gdraws == 2 && g_bind_calls[0] == 1 && g_bind_calls[1] == 1 && g_bind_calls[2] == 1);   // 一次 bind 都没发
-    rp_perf_take(pf); CHECK(pf[RP_PERF_BIND_FAST] == 3);              // 三个阶段都整组沿用
+    CHECK(g_gdraws == 2 && g_bind_calls[0] == 1 && g_bind_calls[1] == 1 && g_bind_calls[2] == 1 && g_bind_calls[3] == 1 && g_bind_calls[4] == 1);   // 一次 bind 都没发
+    rp_perf_take(pf); CHECK(pf[RP_PERF_BIND_FAST] == RP_PROG_STAGES); // 全部图形阶段都整组沿用
     memcpy(s.b + o2, sv, 8);
     memcpy(sv, s.b + o3, 8); memcpy(s.b + o3, &eh, 8);
     rp_perf_take(pf);
     nvn_be_exec(s.b + o2);                                            // ③
-    CHECK(g_gdraws == 3 && g_bind_calls[0] == 2 && g_bind_calls[1] == 1 && g_bind_calls[2] == 1);   // 只有顶点阶段重建
+    CHECK(g_gdraws == 3 && g_bind_calls[0] == 2 && g_bind_calls[1] == 1 && g_bind_calls[2] == 1 && g_bind_calls[3] == 1 && g_bind_calls[4] == 1);   // 只有顶点阶段重建
     rp_perf_take(pf);
-    CHECK(pf[RP_PERF_BIND_FAST] == 2);                          // 没变的两阶段整组沿用
+    CHECK(pf[RP_PERF_BIND_FAST] == RP_PROG_STAGES - 1);          // 没变的阶段整组沿用
     CHECK(pf[RP_PERF_BIND_SLICE_HIT] == 2);                     // DRV0 / DRV2 内容没变：命中上次那片
     memcpy(s.b + o3, sv, 8);
     rp_perf_take(pf);
     nvn_be_exec(s.b + o3);                                            // ④
-    CHECK(g_gdraws == 4 && g_bind_calls[0] == 2 && g_bind_calls[1] == 2 && g_bind_calls[2] == 1);   // 只有片元阶段重建
+    CHECK(g_gdraws == 4 && g_bind_calls[0] == 2 && g_bind_calls[1] == 2 && g_bind_calls[2] == 1 && g_bind_calls[3] == 1 && g_bind_calls[4] == 1);   // 只有片元阶段重建
     rp_perf_take(pf);
-    CHECK(pf[RP_PERF_BIND_FAST] == 2);                          // 没变的两阶段整组沿用
+    CHECK(pf[RP_PERF_BIND_FAST] == RP_PROG_STAGES - 1);          // 没变的阶段整组沿用
     CHECK(pf[RP_PERF_BIND_SLICE_HIT] == 0);                     // 贴图句柄表变了：驱动段必须重做
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     nvn_be_tex_release(&rtt); nvn_be_tex_release(&tx); nvn_be_tex_release(&ty); nvn_be_pool_del(g_pmem);

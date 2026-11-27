@@ -614,7 +614,7 @@ struct facts {
     struct s2a_compile_texture_src tex[S2A_COMPILE_TEXTURE_MAX]; int ntex;
     char tfmt[S2A_COMPILE_TEXTURE_MAX][S2A_TEX_FORMAT_MAX], tsmp[S2A_COMPILE_TEXTURE_MAX][S2A_TEX_SAMPLER_MAX];
     uint32_t ubo_use[6];
-    struct img_miss img[3][8];   // [阶段][高槽]：why = IMGF_*（0 = 事实给了）
+    struct img_miss img[RP_PROG_STAGES][8];   // [阶段][高槽]：why = IMGF_*（0 = 事实给了）
 };
 
 // c2 字 72..86（组合槽 32..39）与图像表重叠，来源同 iOS tex_slot_h。
@@ -663,9 +663,11 @@ static int ubo_need_learn(const char *summary, const uint8_t (*keys)[8], int nst
     const char *m = strstr(summary, " has no source (stage=");
     if (!m) return 0;
     m += strlen(" has no source (stage=");
-    int st = !strncmp(m, "vs,", 3) ? 0 : !strncmp(m, "fs,", 3) ? 1 : !strncmp(m, "gs,", 3) ? 2 : !strncmp(m, "cs,", 3) ? 5 : -1;
+    int st = !strncmp(m, "vs,", 3) ? 0 : !strncmp(m, "fs,", 3) ? 1 : !strncmp(m, "gs,", 3) ? 2 :
+             !strncmp(m, "tcs,", 4) ? 3 : !strncmp(m, "tes,", 4) ? 4 : !strncmp(m, "cs,", 3) ? 5 : -1;
+    const size_t nlen = (st == 3 || st == 4) ? 4u : 3u;
     unsigned word = 0; int cbuf = 0; char close = 0;
-    if (st < 0 || st >= nst || !(st_mask >> st & 1u) || sscanf(m + 3, "handle=%u,cbufSlot=%d%c", &word, &cbuf, &close) != 3 || close != ')') return 0;
+    if (st < 0 || st >= nst || !(st_mask >> st & 1u) || sscanf(m + nlen, "handle=%u,cbufSlot=%d%c", &word, &cbuf, &close) != 3 || close != ')') return 0;
     if (cbuf < 3 || cbuf > 18 || word >= 0x10000 / 4) return 0;
     struct ubo_need *e = ubo_need_at(st, keys[st], 1);
     if (!e) { red1("ubo_handle_need_table_full", "着色器的常量缓冲句柄坐标表满"); return 0; }
@@ -674,7 +676,7 @@ static int ubo_need_learn(const char *summary, const uint8_t (*keys)[8], int nst
     e->c[e->n].word = (uint16_t)word; e->c[e->n].cbuf = (uint8_t)cbuf; e->n++;
     return 1;
 }
-static const char *ubo_st_name(int st) { return st == 0 ? "vs" : st == 1 ? "fs" : st == 5 ? "cs" : "gs"; }   // 用户常量缓冲句柄表里的阶段号（NVN 阶段）→ 编译器的阶段名
+static const char *ubo_st_name(int st) { return st == 0 ? "vs" : st == 1 ? "fs" : st == 2 ? "gs" : st == 3 ? "tcs" : st == 4 ? "tes" : "cs"; }   // 用户常量缓冲句柄表里的阶段号（NVN 阶段）→ 编译器的阶段名
 // 常量缓冲 cbuf（c3 起 = 用户槽 cbuf − 3）字下标 word 处的句柄 → 贴图号。-1 = 槽没绑 / 越界 / 不在登记过的池里
 static long ubo_tex_id(int st, unsigned cbuf, unsigned word) {
     const unsigned reg = cbuf - 3, off = word * 4;
@@ -1118,7 +1120,7 @@ static void load_cold_fragment(struct rp_prog *p, const nvn_gpu_shader_src *sour
 // lib = 这份结果字节来自出包预编库（shader_src.precompiled=1）：装载闸对表外声明按拒收，
 //   调用方照旧 mark_bad 退回现编。离线库 / 跨局缓存 / 现编结果传 0。
 static _Atomic uint64_t g_lp_link_refused;   // 出包预编程序因两段接口对不上退回现编的份数（本局）
-static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_source_entry_view views[3], int nst,
+static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_source_entry_view views[RP_PROG_STAGES], int nst,
                            const uint8_t identity[32], int lib) {
     struct entry *e = calloc(1, sizeof *e);
     if (!e) return NULL;
@@ -1335,9 +1337,9 @@ struct work_snap {
     int tf_on;
     struct facts f;                          // 编译事实（gfx + textures 的字符串存储都在这里）
     uint8_t identity[32];
-    uint8_t keys[3][8];
+    uint8_t keys[RP_PROG_STAGES][8];
     struct s2a_direct_compile_context pc;    // profile_json / closure / profile_hash 指向本结构内的私有副本
-    struct s2a_source_entry_view views[3];   // acquire 的 pin；build() 从这里逐字节拷 c1
+    struct s2a_source_entry_view views[RP_PROG_STAGES];   // acquire 的 pin；build() 从这里逐字节拷 c1
     int acquired;
     int lp_ok;                               // libpack_state_ok（快照时按事实算好：工作线程不碰 rp_S）
     unsigned lp_gate;                        // 被挡下的状态闸位集合（libpack_gate_mask；lp_ok == (lp_gate == 0)），只给读数用
@@ -2306,9 +2308,9 @@ static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
     }
     // 出包预编库：清单记着每阶段键，预热带直接按键取（新装的游戏第一局没有跨局缓存，靠的就是这一份）
     const int compute = rec->stage_mask == 32u;
-    struct s2a_source_entry_view views[3];
+    struct s2a_source_entry_view views[RP_PROG_STAGES];
     memset(views, 0, sizeof views);
-    for (int st = 0; st < nst && st < 3; st++) {
+    for (int st = 0; st < nst && st < NVK_PROG_REC_STAGES; st++) {
         views[st].key = rec->keys[st];   // 拒收 / 合规核对行要靠它打程序键
         if (rec->c1_ok & (1u << st)) { views[st].c1 = rec->c1[st]; views[st].c1_bytes = rec->c1_len[st]; }
     }
@@ -2446,12 +2448,12 @@ void nvk_shader_last_test_put(uint64_t key, const struct rp_prog *prog) { last_p
 const struct rp_prog *nvk_shader_last_test_find(uint64_t key) { const struct last_ent *e = last_find(key, 1, 1); return e ? e->prog : NULL; }
 // 阶段键一律经核心导出接口取（rp_shader_stage_key）：没绑定 / 键缺失给全 0，不读可能过期的核心内部分量。
 static const uint8_t *stage_key(unsigned st) {
-    static uint8_t k[3][8], kc[8];
+    static uint8_t k[RP_PROG_STAGES][8], kc[8];
     if (st == 5) {   // 计算阶段不在 rp_shader_stage_key 的图形范围（0..4）里：直接读核心状态里的键（同 shader_resolve_compute 的 skey_ok 判据），没绑定给全 0
         if (rp_S.skey_ok >> 5 & 1) memcpy(kc, rp_S.skey[5], 8); else memset(kc, 0, 8);
         return kc;
     }
-    unsigned i = st < 3 ? st : 0u;
+    unsigned i = st < RP_PROG_STAGES ? st : 0u;
     if (!rp_shader_stage_key(st, k[i])) memset(k[i], 0, 8);
     return k[i];
 }
@@ -2488,7 +2490,7 @@ static uint64_t combined_fact_sig(int st) {
     return c->sig;
 }
 // 缓存有效高槽的事实摘要；被 image 遮住的 tex 变化不改变编译输入。
-static struct { uint64_t handles[8], rg, sig; int base, pn; uint8_t ok; } g_high_sig[3];
+static struct { uint64_t handles[8], rg, sig; int base, pn; uint8_t ok; } g_high_sig[RP_PROG_STAGES];
 static uint64_t graphics_high_fact_sig(int st) {
     uint64_t handles[8]; graphics_high_handles(st, handles);
     uint64_t rg = rp_tex_reg_gen();

@@ -4,7 +4,7 @@
 #pragma once
 #include "nvn_backend.h"
 
-enum { RP_PROG_STAGES = 3, RP_PROG_ENT_MAX = 128 };   // 顶点、片元、几何
+enum { RP_PROG_STAGES = 5, RP_PROG_ENT_MAX = 128 };   // 0 顶点 1 片元 2 几何 3 细分控制 4 细分求值
 // 句柄放在游戏用户常量缓冲里的绑定（NVN_RB_TEXU / NVN_RB_TBUFU，语义照 iOS nvn_refl.h / nvn_mtl.m ubo_packed）的来源。
 //   一个字：用户常量槽 reg 的字节 off 处的 32 位字；sid = 它是采样器号（读出后左移 20）；pair = 同一 Ryujinx 句柄的另一半
 //   （pair_reg / pair_off 处的字，pair_sid 时左移 20），两半相或 = 打包句柄：低 20 位纹理号、高 12 位采样器号。
@@ -26,7 +26,7 @@ struct rp_cold_proof {
     uint32_t prefix_ent, prefix_byte, prefix_mask;
 };
 struct rp_prog {
-    nvn_gpu_shader sh[RP_PROG_STAGES];                        // 0 顶点 1 片元 2 几何
+    nvn_gpu_shader sh[RP_PROG_STAGES];                        // 0 顶点 1 片元 2 几何 3 细分控制 4 细分求值
     nvn_gpu_layout_ent ent[RP_PROG_STAGES][RP_PROG_ENT_MAX];  // 与交给后端装载的布局同一份：核心按 src_kind / src_reg 逐项绑定
     uint8_t dtt[RP_PROG_STAGES][RP_PROG_ENT_MAX];             // 声明目标 + 1；0 = 未知，沿用登记视图
     uint8_t dcls[RP_PROG_STAGES][RP_PROG_ENT_MAX];            // 0 float，1 uint，2 sint，3 depth 比较

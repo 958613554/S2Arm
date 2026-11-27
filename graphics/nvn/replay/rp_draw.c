@@ -1686,17 +1686,30 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     }
     if (dr && dr->tfc) { skip("transform_feedback_count", rec); return; }
     if (rp_S.tf_on) { skip("transform_feedback_active", rec); return; }
-    // 0..9 是普通图元，10..13 是四种邻接图元（直接映射 Vulkan 的 *_WITH_ADJACENCY，不展开）；14 曲面细分补丁另说
-    if (!(prim <= 13)) { char nm[24]; snprintf(nm, sizeof nm, "prim_%u", prim); skip(nm, rec); return; }
-    if (prim >= 10) {   // Vulkan：设备没开 geometryShader 特性时不许用邻接拓扑（VUID-VkPipelineInputAssemblyStateCreateInfo-topology-00429）
+    // 0..9 是普通图元，10..13 是四种邻接图元（直接映射 Vulkan 的 *_WITH_ADJACENCY，不展开）；14 是曲面细分补丁（PATCHES）
+    if (!(prim <= 14)) { char nm[24]; snprintf(nm, sizeof nm, "prim_%u", prim); skip(nm, rec); return; }
+    const uint32_t gstages = rp_shader_graphics_stages();
+    const uint32_t tess_mask = (1u << NVN_GPU_SH_TCS) | (1u << NVN_GPU_SH_TES);
+    const uint32_t tess_bound = gstages & tess_mask;
+    if (prim == NVN_DRAW_PRIMITIVE_PATCHES) {
         nvn_gpu_caps caps; nvn_gpu_caps_get(&caps);
-        if (!(caps.caps & NVN_GPU_CAP_GEOMETRY)) { skip("adjacency_without_geometry_feature", rec); return; }
+        if (!(caps.caps & NVN_GPU_CAP_TESSELLATION)) { skip("patches_without_tessellation_feature", rec); return; }
+        if (tess_bound != tess_mask) { skip("incomplete_tessellation_stages", rec); return; }
+        if (rp_S.patch_size <= 0 || (caps.max_patch_size && (uint32_t)rp_S.patch_size > caps.max_patch_size)) {
+            skip("patch_size_exceeds_device_limit", rec); return;
+        }
+    } else {
+        if (tess_bound) { skip("tessellation_without_patches_topology", rec); return; }
+        if (prim >= 10) {   // Vulkan：设备没开 geometryShader 特性时不许用邻接拓扑（VUID-VkPipelineInputAssemblyStateCreateInfo-topology-00429）
+            nvn_gpu_caps caps; nvn_gpu_caps_get(&caps);
+            if (!(caps.caps & NVN_GPU_CAP_GEOMETRY)) { skip("adjacency_without_geometry_feature", rec); return; }
+        }
     }
     // 带 GS 的拓扑（同 Ryujinx 的 Vulkan 后端：原生能收的直接交给 GS，收不了的换成三角形列表）：
     //   三角带按 GL 序展开（GS 的 gl_in 顺序与 Vulkan 原生三角带的奇三角形不同，#696）：不带索引 gs_tstrip_expand、带索引 gs_tstrip_expand_ix（读游戏索引、分段重启）；
     //   间接的三角带：索引 / 参数在 GPU 上，CPU 展开不了，按原生三角带画（Ryujinx 同此，奇三角形 gl_in[0] 与 GL 不同、绕序相同）；
     //   线带 / 三角扇 / 多边形（= 扇）/ 邻接图元：原生交给 GS；线环 / 四边形 / 四边形带：沿用下面的展开（GS 看到展开后的线 / 三角形，同 Ryujinx）。
-    const int gs = (rp_shader_graphics_stages() & 4u) != 0;
+    const int gs = (gstages & 4u) != 0;
     uint32_t count = (uint32_t)(di ? di->count : dr->count);
     if (!count && !ind) return;
     if (ind) count = 0;   // GPU parameters, not stale direct fields, own the draw count.
@@ -1727,7 +1740,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     const int clip_neg1 = !rp_depth_zero();
     const int raster = (rp_origin_lower_left() != 0) | ((s2a_nvn_rast_flip != 0) << 1) | (clip_neg1 << 2);
     if (raster != g_raster) { g_raster = raster; rp_pso_dirty = 1; }
-    int args_dirty = rp_args_dirty[0] || rp_args_dirty[1] || rp_args_dirty[2];
+    int args_dirty = rp_args_dirty[0] || rp_args_dirty[1] || rp_args_dirty[2] || rp_args_dirty[3] || rp_args_dirty[4];
     int lib_retry = 0;   // 出库版绑定核对失败只回退现编一次：现编版再失败照旧具名跳过
     if (!g_prog || rp_pso_dirty || args_dirty) {
         struct rp_shader_req q; memset(&q, 0, sizeof q); q.prim = prim; q.rt_count = rt->n;
