@@ -15275,11 +15275,15 @@ static int state_op(uint32_t op, const void *a, uint32_t size) {
         case OP_BLEND_COLOR: memcpy(S.blend_color, ((const p_blend_color *)a)->rgba, 16); break;
         case OP_TF_BIND: { const p_tf_bind *b = a; if (b->index >= 0 && b->index < 4) S.tf[b->index] = *b; break; }
         case OP_TF_STATE: { const p_tf_state *b = a;   // Begin writes from the start of each buffer; Pause / Resume keep the offsets (the host keeps them itself, the game's control buffer is not used)
-            if (b->what == 0) { S.tf_on = 1; S.tf_gpu = 0; S.tf_ctl = b->ctl; memset(S.tf_off, 0, sizeof S.tf_off); } else S.tf_on = b->what == 3; break; }
+            if (b->what == 0) { S.tf_on = 1; S.tf_gpu = 0; S.tf_ctl = b->ctl; memset(S.tf_off, 0, sizeof S.tf_off); } else S.tf_on = b->what == 3;
+            { static _Atomic int seen[4]; if (b->what >= 0 && b->what < 4 && !atomic_exchange(&seen[b->what], 1)) MLOG("transform feedback: first state change %d seen (0 Begin, 3 Resume, else End / Pause)", b->what); }   // #2264：游戏发没发过变换反馈命令
+            break; }
         case OP_PRIM_RESTART: S.restart = *(const p_prim_restart *)a; break;
         case OP_ALPHA_REF: S.alpha_ref = ((const p_alpha_ref *)a)->ref; break;
         case OP_SET_PATCH_SIZE: { int sz = ((const p_set_patch_size *)a)->size; if (sz > 0 && sz <= 32) S.patch_size = sz; break; }   // S2Arm tessellation: control points per patch (tess_draw P)
-        case OP_RAST_DISCARD: S.rast_discard = ((const p_rast_discard *)a)->on; break;
+        case OP_RAST_DISCARD: S.rast_discard = ((const p_rast_discard *)a)->on;
+            { static _Atomic int seen[2]; int on = S.rast_discard ? 1 : 0; if (!atomic_exchange(&seen[on], 1)) MLOG("rasterizer discard: first set %s", on ? "on" : "off"); }   // #2264：同上
+            break;
         default: return 0;
     }
     return 1;
@@ -18550,6 +18554,13 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     }
     draw_gs_check(pr);   // a geometry stage left with no function (see prog_fold_gs)
     if (S.rast_discard) { if (!S.tf_on && sx_draw(pr, dw, di)) return; tf_draw(pr, dw, di); return; }   // the vertex stage only: transform feedback capture, a vertex shader's storage writes (sx_draw), or nothing (tf_draw)
+    // #2264（11-27，一款横版平台游戏 iPhone：角色毛发画成方块 / 拉长的色块）：只写变换反馈数据、不写位置的顶点着色器（翻译 json raster.pos_attr -1 且有 entry_tf），
+    //   本该在光栅器丢弃 + 变换反馈捕获里跑（上面 tf_draw），却到了这里当普通绘制：位置是未定义的，画出来是色块，该捕获的数据也没写。
+    //   每支顶点打一行红，带片元键与当时的变换反馈 / 光栅器丢弃状态（游戏是用我们没映射的方式开的丢弃 / 捕获，还是真机上也这样画，下一份诊断据此定）
+    if (pr->sh[0] && pr->sh[0]->rf.pos_attr < 0 && pr->sh[0]->tf_fn) { NvShader *v0 = pr->sh[0];
+        if (!(v0->logged & (1ull << 42))) { v0->logged |= 1ull << 42; static _Atomic unsigned n; if (atomic_fetch_add(&n, 1) < 16)
+            MLOG("【红】 vertex %s writes no position (a transform feedback shader) but is drawn as a normal draw: fragment %s, transform feedback %s, rasterizer discard off",
+                 v0->key, pr->sh[1] ? pr->sh[1]->key : "-", S.tf_on ? "on" : "off"); } }
     if (g_nubd && (g_enc || ubd_lazy()) && ubd_conflict(pr, dw, di)) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // land the deferred inline updates before this draw (see ubd_conflict)
     if (zskip_can_draw(pr)) {   // Zero-source skip: the output is always 0, writing 0 over 0, so this draw changes no result (see zskip_can_draw)
         g_zskip_count++; { static int once; if (!once++) MLOG("zero-source skip: first case pass %llu", g_stat_pass + 1); }
