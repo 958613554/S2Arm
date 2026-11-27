@@ -1312,12 +1312,19 @@ class Stages:
         return sorted(found, key=lambda p: os.fsencode(str(p)))
 
     @staticmethod
-    def _source_identity(paths):
-        rows = []
-        for p in paths:
-            st = p.stat()
-            rows.append(f'{st.st_size} {st.st_mtime_ns} {st.st_ctime_ns} {st.st_ino}')
-        return '\n'.join(rows)
+    def _source_content(path, block=64 * 1024):
+        """原件的内容身份：大小 + 首尾各 64 KiB 的 SHA-256（≤128 KiB 读全文）；同 pack/resource_input_key.py 的首尾抽样口径。
+        不含路径 / 修改时间 / ctime / inode：同一份原件换盘、换路径、换机器键不变；NSP / XCI 头部列着各内容的哈希，换了内容头部就变"""
+        size = path.stat().st_size
+        h = hashlib.sha256()
+        with path.open('rb') as stream:
+            if size <= 2 * block:
+                h.update(stream.read())
+            else:
+                h.update(stream.read(block))
+                stream.seek(size - block)
+                h.update(stream.read(block))
+        return f'{size} {h.hexdigest()}'
 
     def _source_rows(self, tool, work, env):
         cache = Path(env.get('S2A_SRC_IDS', Path(env.get('S2A_ICONS', self._run_root() / 's2arm/icons')) / '.ids.tsv'))
@@ -1384,9 +1391,8 @@ class Stages:
 
     @staticmethod
     def _aoc_base(current, rows, tool):
-        paths = [Path(row[0]) for row in rows]
-        raw = '\n'.join('\t'.join(row) for row in rows) + '\n'
-        raw += Stages._source_identity(paths) + '\n'
+        # 原件按内容进键（程序号 + 内容身份，按内容排序），不带路径：两台出包机原件放在不同目录，同一份原件命中同一份追加内容缓存
+        raw = ''.join(f'{pid}\t{ident}\n' for pid, ident in sorted((row[3], Stages._source_content(Path(row[0]))) for row in rows))
         dll = Path(str(tool) + '.dll') if tool.suffix.lower() != '.exe' else tool.with_suffix('.dll')
         for binary in (dll, tool):
             if binary.is_file():

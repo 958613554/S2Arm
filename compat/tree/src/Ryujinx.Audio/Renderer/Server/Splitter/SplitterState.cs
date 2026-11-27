@@ -99,6 +99,26 @@ namespace Ryujinx.Audio.Renderer.Server.Splitter
             HasNewConnection = false;
         }
 
+        // S2Arm (#12/#13 拆分 · 渲染拍不等 Update 的锁): 分频器落账(影子→live)。字段(SampleRate/DestinationCount/
+        //   HasNewConnection)游戏写、拍只读,整拷;链头按下标从影子目的地数组平移回 live 数组——链结构原样照影子,
+        //   不按 id / DestinationCount 重走重建(原版 Update 在跨分频器挪动等情形下链长可短于 DestinationCount,
+        //   按计数重走会取到空节点的 Id 0、连出 0→0 自环)。目的地 _next 同法由 SplitterContext.S2ACommitFrom 落
+        internal unsafe void S2ACommitGameFieldsFrom(
+            in SplitterState source,
+            SplitterDestinationVersion1* shadowBaseV1,
+            SplitterDestinationVersion2* shadowBaseV2,
+            SplitterDestinationVersion1* liveBaseV1,
+            SplitterDestinationVersion2* liveBaseV2)
+        {
+            SampleRate = source.SampleRate;
+            DestinationCount = source.DestinationCount;
+            HasNewConnection = source.HasNewConnection;
+
+            _destinationDataV1 = source._destinationDataV1;
+            _destinationDataV2 = source._destinationDataV2;
+            S2ARebindSnapshotPointers(shadowBaseV1, shadowBaseV2, liveBaseV1, liveBaseV2);
+        }
+
         /// <summary>
         /// Utility function to apply an action to all <see cref="Destination"/>.
         /// </summary>
@@ -177,6 +197,26 @@ namespace Ryujinx.Audio.Renderer.Server.Splitter
             {
                 SampleRate = parameter.SampleRate;
                 HasNewConnection = true;
+            }
+        }
+
+        // S2Arm (#12/#13 拆分 · 渲染拍不等 Update 的锁): 锁1 快照拷贝的重绑。从 live 整拷来的链头指着 live 目的地
+        //   数组,而影子解析段的 ClearLinks/Link 会顺着链头把 _next 写下去——指针指进 live 就是锁外改活状态(渲染拍
+        //   正在读链)。两边数组同布局(live=工作缓冲原生块,影子=影子原生块),按下标平移重绑到影子数组
+        internal unsafe void S2ARebindSnapshotPointers(
+            SplitterDestinationVersion1* liveBaseV1,
+            SplitterDestinationVersion2* liveBaseV2,
+            SplitterDestinationVersion1* shadowBaseV1,
+            SplitterDestinationVersion2* shadowBaseV2)
+        {
+            if (_destinationDataV1 != null)
+            {
+                _destinationDataV1 = shadowBaseV1 + (_destinationDataV1 - liveBaseV1);
+            }
+
+            if (_destinationDataV2 != null)
+            {
+                _destinationDataV2 = shadowBaseV2 + (_destinationDataV2 - liveBaseV2);
             }
         }
 

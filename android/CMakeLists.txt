@@ -624,6 +624,11 @@ else()
     target_compile_options(direct_program_cache_test PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(direct_program_cache_test PRIVATE pthread)
     add_test(NAME android_direct_program_cache COMMAND direct_program_cache_test)
+    # jv 字符串收尾改 memchr（11-26）：与改动前的逐字节扫描逐项对拍
+    add_executable(direct_jv_test tests/direct_jv_test.c native/direct/jv.c)
+    target_include_directories(direct_jv_test PRIVATE native)
+    target_compile_options(direct_jv_test PRIVATE -O2 -Wall -Wextra -Werror)
+    add_test(NAME android_direct_jv COMMAND direct_jv_test)
     # F5.3：安装 revision 的只读离线库消费（命中/缺失/改名/截断/链接/只读 revision）。
     add_executable(direct_offline_library_test tests/direct_offline_library_test.c
         native/direct/offline_library.c native/direct/program_cache.c native/direct/sha256.c)

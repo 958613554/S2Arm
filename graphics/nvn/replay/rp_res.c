@@ -13,9 +13,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+// 活对象共用同一份池内字节。新纳入的 CPU 来源要求宿主建图用途和默认通道映射也相同。
+typedef struct { uintptr_t pool; int64_t off; nvn_texdesc d; uint32_t swz; } live_key;
+
 // 一份后端贴图存储。可被多个贴图对象（序号）共用。
 struct rp_tex {
     nvn_gpu_tex g;
+    live_key live;             // 创建时的用途和通道映射；仅有活对象引用时进索引
+    uint8_t live_indexed;
     int users;                 // 指向它的序号个数
     uint8_t cpu;               // 内容来自游戏内存（按脏页重传）
     uint8_t gpu_written;       // 内容以 GPU 为准
@@ -75,6 +80,7 @@ static struct pinned_samp *g_pinned_samps;
 static int g_tpool_n;
 static nvn_hmap g_by_serial = {.klen = 8};                  // 序号 → struct rp_tex *
 static nvn_hmap g_alias = {.klen = sizeof(alias_key)};      // 键 → struct rp_tex *
+static nvn_hmap g_live = {.klen = sizeof(live_key)};
 static nvn_hmap g_cpu_ser = {.klen = 8};                    // 游戏用 WriteTexels 写过的序号（可能早于首次使用）
 static nvn_hmap g_pool_gpu = {.klen = 8};                   // GPU 写过的内存池
 static uint64_t g_ser_gen = 1;                              // 任何「序号 → 存储」映射变了就 +1：各贴图号缓存的视图据此重验
@@ -246,15 +252,39 @@ static int tex_epoch_on(void) {
 
 // ---------- 内容归属 ----------
 void nvn_be_pool_gpu_written(const void *pool) { uint64_t k = (uint64_t)(uintptr_t)pool; pthread_mutex_lock(&g_rmu); nvn_hm_put(&g_pool_gpu, &k, (void *)1); pthread_mutex_unlock(&g_rmu); }
-void nvn_be_tex_cpu_written(const tex_t *t) {
+static int live_key_of(live_key *key, const tex_t *t) {
+    memset(key, 0, sizeof *key);
+    if (!t->pool || !t->mem || !t->L.size || t->has_layout || t->d.samples > 1 ||
+        t->d.target == NVN_TEXTURE_TARGET_BUFFER ||
+        (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE)) ||
+        (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return 0;
+    nvn_fmt_info info;
+    if (!nvn_fmt_info_of((uint32_t)t->d.format, &info) || info.bw > 1 || info.bh > 1) return 0;
+    key->pool = (uintptr_t)t->pool;
+    key->off = t->off;
+    key->d = t->d;
+    key->swz = t->set_swz && t->swz != SWZ_IDENTITY ? t->swz : 0;
+    return 1;
+}
+static struct rp_tex *live_storage(const tex_t *t) {
+    live_key key;
+    return g_live.n && live_key_of(&key, t) ? nvn_hm_get(&g_live, &key) : NULL;
+}
+// 提示只说明客体页可能有变动。尚未解析的另一个对象不能仅凭这个提示覆盖 GPU 版本。
+static void mark_cpu(const tex_t *t, int inferred) {
     if (!t || !t->serial) return;
     pthread_mutex_lock(&g_rmu);
     nvn_hm_put(&g_cpu_ser, &t->serial, (void *)1);
     struct rp_tex *x = nvn_hm_get(&g_by_serial, &t->serial);
-    if (x) { tex_bytes_drop(x); x->cpu = 1; x->gpu_written = 0; x->uploaded = 0; x->check_epoch = 0; x->check_seg = 0; x->check_dirty = 1; }   // 游戏刚用 CPU 写了它：下次使用整张重传（纪元清零 = 强制重查）
+    if (!x) {
+        x = live_storage(t);
+        if (inferred && x && x->gpu_written) x = NULL;
+    }
+    if (x) { x->zero_pending = 0; tex_bytes_drop(x); x->cpu = 1; x->gpu_written = 0; x->uploaded = 0; x->check_epoch = 0; x->check_seg = 0; x->check_dirty = 1; }   // 游戏刚用 CPU 写了它：下次使用整张重传（纪元清零 = 强制重查）
     pthread_mutex_unlock(&g_rmu);
 }
-void nvn_be_tex_cpu_inferred(const tex_t *t) { nvn_be_tex_cpu_written(t); }
+void nvn_be_tex_cpu_written(const tex_t *t) { mark_cpu(t, 0); }
+void nvn_be_tex_cpu_inferred(const tex_t *t) { mark_cpu(t, 1); }
 // 调试取证：这个序号的存储现在的归属（位 0 当 CPU 贴图、位 1 传过、位 2 GPU 写过、位 3 有存储），没建过 = 0
 int rp_tex_debug_state(uint64_t serial) {
     pthread_mutex_lock(&g_rmu);
@@ -821,13 +851,22 @@ static uint32_t usage_of(const tex_t *t, int cpu) {
 //   按目标取视图的表（g_vf）和贴图号登记表（g_treg）两处。登记表这一处原先只有 alias_take_over 放：另两条路放了存储，
 //   登记表里那一项的视图还在，后端贴图被视图引用着拆不掉（只记 released），游戏不重登记那个号就一直占着显存；
 //   而且 r->of 成了野指针，下一份存储若分在同一地址，rp_view_by_id 的「序号换了存储」判断（r->of != x）认不出，旧视图接着用。
+static void live_remove(struct rp_tex *x) {
+    if (x->live_indexed) {
+        nvn_hm_del(&g_live, &x->live);
+        x->live_indexed = 0;
+    }
+}
 static void tex_free(struct rp_tex *x) {
+    live_remove(x);
     vf_drop_of(x);   // 视图表按存储认视图：存储放掉之前，它名下的视图一并放（序号销毁时不再放，见 g_vf 一节）
     for (int r = 0; r < g_ntreg && x->nreg > 0; r++) if (g_treg[r].of == x) treg_drop_view(&g_treg[r]);
     nvn_gpu_tex_release(x->g); g_built--; tex_bytes_drop(x); texdiag_drop(x); free(x->runs); free(x);
 }
 static void tex_unref(struct rp_tex *x) {
-    if (--x->users > 0 || x->in_alias) return;   // 共用表里的存储由表持有：池销毁时才放（nvn_be_alias_drop_pool）
+    if (--x->users > 0) return;
+    live_remove(x);
+    if (x->in_alias) return;   // 共用表里的存储由表持有：池销毁时才放（nvn_be_alias_drop_pool）
     tex_free(x);
 }
 
@@ -841,16 +880,25 @@ static void tex_unref(struct rp_tex *x) {
 // 每个宽高是一个并存的贴图对象、表里一个新条目，只进不出——标题画面一分钟后端贴图 297 → 2299 张、显存 8.7 GB，手机内存吃光、游戏被杀。
 // iOS 的同类事故：一款游戏的阴影图几乎每帧换尺寸，同一偏移 429 张深度贴图。持 g_rmu。
 enum { ALIAS_IDLE = 16 };
-static int alias_overwritten(const alias_key *a, const struct rp_tex *self, uint64_t since) {   // 与 a 存储重叠的别的条目里，有没有在 since 之后被 GPU 写过的
-    const int64_t lo = a->off, hi = a->off + (int64_t)self->size;
+static int alias_overwritten(const alias_key *a, uint64_t size, uint64_t since) {   // 重叠区间在 since 之后是否有 GPU 写
+    const int64_t lo = a->off, hi = a->off + (int64_t)size;
     for (uint32_t i = 0; i < g_alias.cap; i++) {
         const struct rp_tex *y = g_alias.vals[i];
-        if (!y || y == self) continue;
+        if (!y || y->wrote <= since) continue;
         alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
         if (k.pool != a->pool || k.off >= hi || k.off + (int64_t)y->size <= lo) continue;
-        if (y->wrote > since) return 1;
+        return 1;
     }
     return 0;
+}
+// 普通线性采样图可以和渲染目标住在同一个池里。共用表继续按存储找图，
+// 只给尚无 GPU 写入的区间启用客体行上传及后续脏页跟踪。
+static int mixed_pool_linear_source(const tex_t *t, const alias_key *k) {
+    if (!(t->d.flags & NVN_TEXTURE_FLAGS_LINEAR) ||
+        (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE)) ||
+        fmt_depth(t->d.format)) return 0;
+    const char *why;
+    return linear_class(t, &why, 0) > 0 && !alias_overwritten(k, t->L.size, 0);
 }
 static void alias_take_over(const alias_key *nk, uint64_t nsize) {
     if (!nsize) return;
@@ -866,7 +914,7 @@ static void alias_take_over(const alias_key *nk, uint64_t nsize) {
             if (x->seen && now - x->seen < ALIAS_IDLE) continue;
             if (x->users > 0) {   // ②
                 const uint64_t last = x->seen > x->wrote ? x->seen : x->wrote;
-                if ((x->wrote && now - x->wrote < ALIAS_IDLE) || !alias_overwritten(&k, x, last)) continue;
+                if ((x->wrote && now - x->wrote < ALIAS_IDLE) || !alias_overwritten(&k, x->size, last)) continue;
                 for (int more = 1; more;) {   // 指着它的序号都出表：对象下次用到时重建
                     more = 0;
                     for (uint32_t q = 0; q < g_by_serial.cap; q++) if (g_by_serial.vals[q] == x) {
@@ -893,11 +941,17 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
     struct rp_tex *x = nvn_hm_get(&g_by_serial, &t->serial);
     if (!x) {
         rp_perf_add(RP_PERF_RES_NEW, 1); new_size_note(t->d.width, t->d.height);
+        int track_linear = 0;
         int sp = 0, cpu = cpu_content(t, &sp);
         alias_key k; alias_key_of(&k, t);
-        if (!cpu && t->pool) { x = nvn_hm_get(&g_alias, &k); if (x) x->seen = rp_sub_serial() + 1; }   // 同存储同描述的另一个对象已经建过：共用
+        live_key lk;
+        int live = live_key_of(&lk, t);
+        if (live) x = nvn_hm_get(&g_live, &lk);
+        struct rp_tex *retained = !cpu && t->pool ? nvn_hm_get(&g_alias, &k) : NULL;
+        if (!x) x = retained;   // 同存储同描述的另一个对象已经建过：共用
         if (!x) {
-            nvn_gpu_tex_desc d = {0}; d.d = t->d; d.usage = usage_of(t, cpu); d.swz = t->set_swz && t->swz != SWZ_IDENTITY ? t->swz : 0;
+            track_linear = !cpu && mixed_pool_linear_source(t, &k);
+            nvn_gpu_tex_desc d = {0}; d.d = t->d; d.usage = usage_of(t, cpu || track_linear); d.swz = t->set_swz && t->swz != SWZ_IDENTITY ? t->swz : 0;
             rp_fold_1d_desc(&d.d);   // 后端没有一维目标：一维 → 高 1 的二维，一维数组 → 二维数组（#1810）
             nvn_gpu_tex g = NULL; nvn_gpu_err err = {0};
             uint64_t mk0_ = res_now(); nvn_gpu_rc mkr_ = nvn_gpu_tex_create(&d, &g, &err); rp_perf_add(RP_PERF_RES_MAKE, res_now() - mk0_);
@@ -907,9 +961,20 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
                 return NULL;
             }
             x = calloc(1, sizeof *x); x->g = g; x->cpu = (uint8_t)cpu; x->sparse = (uint8_t)sp; x->mem = t->mem; x->size = t->L.size; x->need_init = 1; x->uid = ++g_tex_uid; g_built++;
-            if (!cpu && t->pool) { alias_take_over(&k, t->L.size); nvn_hm_put(&g_alias, &k, x); x->in_alias = 1; x->seen = rp_sub_serial() + 1; }
+            if (live) memcpy(&x->live, &lk, sizeof lk);
         }
+        if (!cpu && t->pool && !retained) {
+            alias_take_over(&k, t->L.size);
+            nvn_hm_put(&g_alias, &k, x);
+            x->in_alias = 1;
+        }
+        if (live && !x->live_indexed && !memcmp(&lk, &x->live, sizeof lk)) {
+            nvn_hm_put(&g_live, &lk, x);
+            x->live_indexed = 1;
+        }
+        if (x->in_alias) x->seen = rp_sub_serial() + 1;
         x->users++;
+        if (track_linear) x->cpu = 1;
         nvn_hm_put(&g_by_serial, &t->serial, x); g_ser_gen++;
     }
     if (plain && c && bc1_replay_format(t->d.format) && nvn_gpu_tex_bc1_unwrap) {
@@ -935,6 +1000,14 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
         if (xc) { x->zero_pending = 0; if (!x->gpu_written) { zero_fill(t, x, xc); rp_perf_add(RP_PERF_RES_ZERON, 1); } }
     }
     if (x->cpu && !x->gpu_written && c && t->mem) {
+        // 池镜像有在途的缓冲写时，客体字节还没回写。下一次使用再取，避免上传旧值。
+        if (x->in_alias && (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR) &&
+            rp_buf_gpu_pending((uintptr_t)t->mem, t->L.size)) {
+            x->check_dirty = 1;
+            nvn_unimpl("tex", "linear_pending_pool_write", t);
+            pthread_mutex_unlock(&g_rmu);
+            return NULL;
+        }
         if (x->byte_upload_sub && x->byte_upload_epoch != tex_bytes_failure_epoch()) {
             // 淘汰了字节缓存也要重试这份可能未录成的内容。
             x->byte_upload_sub = 0;
@@ -1120,6 +1193,11 @@ void nvn_be_alias_drop_pool(const void *pool) {
     uint64_t pk = (uint64_t)(uintptr_t)pool;
     pthread_mutex_lock(&g_rmu);
     nvn_hm_del(&g_pool_gpu, &pk);
+    for (uint32_t i = 0; i < g_live.cap;) {
+        struct rp_tex *x = g_live.vals[i];
+        if (x && x->live.pool == pk) live_remove(x);
+        else i++;
+    }
     for (int again = 1; again;) { again = 0;
         for (uint32_t i = 0; i < g_alias.cap; i++) { if (!g_alias.vals[i]) continue;
             alias_key k; memcpy(&k, g_alias.keys + (size_t)i * sizeof k, sizeof k); if (k.pool != pk) continue;
@@ -1576,8 +1654,8 @@ void rp_res_reset(void) {
         all[n++] = x; }
     for (int j = 0; j < n; j++) { nvn_gpu_tex_release(all[j]->g); tex_bytes_drop(all[j]); texdiag_drop(all[j]); free(all[j]->runs); free(all[j]); }
     free(all);
-    nvn_hmap *clr[4] = {&g_by_serial, &g_alias, &g_cpu_ser, &g_pool_gpu};
-    for (int k = 0; k < 4; k++) { uint32_t kl = clr[k]->klen; free(clr[k]->keys); free(clr[k]->vals); nvn_hm_init(clr[k], kl); }
+    nvn_hmap *clr[] = {&g_by_serial, &g_alias, &g_cpu_ser, &g_pool_gpu, &g_live};
+    for (size_t k = 0; k < sizeof clr / sizeof clr[0]; k++) { uint32_t kl = clr[k]->klen; free(clr[k]->keys); free(clr[k]->vals); nvn_hm_init(clr[k], kl); }
     if (g_texdiag_on == 1 && g_texdiag_events) {
         char line[256]; snprintf(line, sizeof line, "events=%llu first=%llu repeat=%llu initial=%llu same=%llu changed=%llu unknown=%llu",
             (unsigned long long)g_texdiag_events, (unsigned long long)g_texdiag_first, (unsigned long long)(g_texdiag_events - g_texdiag_first),
@@ -1605,6 +1683,7 @@ int rp_tex_is_read(const tex_t *t, const rp_pass_read *reads, int n) {
     if (!t || !t->serial) return 0;
     pthread_mutex_lock(&g_rmu);
     struct rp_tex *x = nvn_hm_get(&g_by_serial, &t->serial);
+    if (!x) x = live_storage(t);
     if (!x && t->pool) {
         alias_key key; alias_key_of(&key, t);
         x = nvn_hm_get(&g_alias, &key);
@@ -1629,8 +1708,12 @@ int rp_tex_storage_aliases(const tex_t *a, const tex_t *b) {
     const struct rp_tex *x = nvn_hm_get(&g_by_serial, &a->serial);
     const struct rp_tex *y = nvn_hm_get(&g_by_serial, &b->serial);
     int sparse = 0;
-    int shared = x && y ? x == y :
-        (x ? x->in_alias : !cpu_content(a, &sparse)) && (y ? y->in_alias : !cpu_content(b, &sparse));
+    if (!x) x = live_storage(a);
+    if (!y) y = live_storage(b);
+    live_key la, lb;
+    int exact = live_key_of(&la, a) && live_key_of(&lb, b) && !memcmp(&la, &lb, sizeof la);
+    int shared = x && y ? x == y : ((!x && !y && exact) ||
+        ((x ? x->in_alias : !cpu_content(a, &sparse)) && (y ? y->in_alias : !cpu_content(b, &sparse))));
     pthread_mutex_unlock(&g_rmu);
     return shared;
 }
