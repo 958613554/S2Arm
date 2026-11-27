@@ -12872,7 +12872,9 @@ static pool_tab g_ptab[POOL_TABS]; static unsigned g_ptab_next; static _Atomic i
 static uint64_t g_psnap_gen = 1;   // bumped when a table's address changes (made, grown, dropped): an argument block holding a pool address is not reused past it (encode_args_ ab_pgen)
 // Counters (t_nvn_pool_tex reads them): whole walks, buffers made, entries looked up again by cause
 static uint64_t g_pool_walks, g_pool_made, g_pool_upd_dirty, g_pool_upd_ret, g_pool_upd_seen, g_pool_upd_left, g_pool_calls; static double g_pool_ms, g_pool_walk_ms;
-// Made only when a shader read it (pool_seen_word): that submission read the dummy (a one-frame black flash, #2269), counted whole run and since the last pool tables line
+// Made only when a shader read it (pool_seen_word): that submission read the dummy (a one-frame black flash, #2269), counted whole run and since the last pool tables line.
+//   Floor by design: the textures the budget left out of a table's first walk that a shader reads that same submission (Ocarina of Time cold start: the same 11 IDs at 30 and 60 Hz,
+//   the frame's budget already spent 33–64 MB of 32) — only making every registered texture up front avoids them (about 2.5 GB more); not counted as a defect
 static uint64_t g_pool_seen_late, g_pool_seen_late_last;
 // How each texture ID's last lookup for a table ended (pool_tex_obj), for the case lines above: why one a shader read was not made before
 enum { PM_NEVER, PM_STORAGE, PM_FAILED, PM_LEFT, PM_UNWRITTEN, PM_MADE, PM_DIRTY };
@@ -13172,15 +13174,17 @@ static void pool_seen_word(unsigned i, int recheck, int sg_chg, uint64_t sg) {
         if (!g_treg[id_].view && !tex_get(g_treg[id_].t.serial)) { if (g_walk_req >= POOL_REQ_BYTES) break; }
         g_seen_todo[i] &= ~(1u << b);
         int unmade = !g_treg[id_].view && !tex_get(g_treg[id_].t.serial);
+        int dummy = 0;   // the case line says whether a table entry this ID reads held the dummy or still the texture it had (#2269 「made before (since dropped)」: not yet known which)
+        for (int k = 0; k < POOL_TABS && unmade && !dummy; k++) { const pool_tab *t = &g_ptab[k]; if (!t->samp && !t->rw && pool_covers(t, id_) && !t->obj[id_ - t->base]) dummy = 1; }
         int in_left = g_pleft.bits && (g_pleft.bits[(uint32_t)id_ >> 5] >> (id_ & 31) & 1);   // left out by the up-front budget (pool_left_scan's queue) vs never looked up since it registered
         uint64_t spent = g_walk_spent; int why = id_ < (1 << 20) ? g_pool_miss[id_] : PM_NEVER;
         pool_tex_update(id_, 0); g_pool_upd_seen++;
         if (unmade && (g_treg[id_].view || tex_get(g_treg[id_].t.serial))) {
             g_pool_seen_late++;
             // The first cases one by one (#2269): which way each was missed — waiting in the budget queue, or not there (a registration path that never looked it up)
-            if (g_pool_seen_late <= 32) MLOG("pool tables: made only once a shader read the dummy, case %llu: ID %d %ux%u format %#x %llu KB, %s (%s); made this frame so far %llu MB (up-front budget %u MB), frame %llu",
+            if (g_pool_seen_late <= 32) MLOG("pool tables: made only once a shader read the dummy, case %llu: ID %d %ux%u format %#x %llu KB, %s (%s), table entry %s; made this frame so far %llu MB (up-front budget %u MB), frame %llu",
                 (unsigned long long)g_pool_seen_late, id_, g_treg[id_].t.d.width, g_treg[id_].t.d.height, g_treg[id_].t.d.format,
-                (unsigned long long)(pool_tex_size(&g_treg[id_].t) >> 10), in_left ? "waiting in the budget queue" : "not in the budget queue", k_pool_miss[why],
+                (unsigned long long)(pool_tex_size(&g_treg[id_].t) >> 10), in_left ? "waiting in the budget queue" : "not in the budget queue", k_pool_miss[why], dummy ? "the dummy" : "still the texture it had",
                 (unsigned long long)(spent >> 20), POOL_FRAME_BYTES >> 20, (unsigned long long)atomic_load(&g_cur_frame));
         }
     }
@@ -13221,15 +13225,25 @@ static void pool_seen_scan(void) {
         }
     }
 }
-// Once a frame, while there is room: the textures the budget left out, smallest first
+// Once a frame, while there is room: the textures the budget left out, in the order they were left out (first in, first made). Made smallest first, a stream of small new
+//   textures took each frame's room and a large one waited until a shader read it, the dummy that submission (#2269: 1920x1920 BC textures of 14 MB on Ocarina of Time at 60 Hz,
+//   left out for frames while 300–600 KB ones kept arriving). In order, each is made within the frames the ones before it take. The first that does not fit this frame's room
+//   ends the walk (it is made first next frame); one larger than a whole frame's room never fits and does not hold up the rest (a shader's read makes it, pool_seen_word)
 static uint64_t g_left_frame = ~0ull;
 static void pool_left_scan(void) {
     uint64_t f = atomic_load(&g_cur_frame); if (!g_pleft.n || f == g_left_frame) return;
     g_left_frame = f;
-    uint64_t limit = pool_walk_limit(0, (int)g_pleft.n, g_pleft.list); if (!limit) return;
+    uint64_t room0 = pool_room(), spent0 = g_walk_spent; if (!room0) return;   // once a walk (system calls, as the registration batch); each make takes its bytes off
     uint32_t *ids = malloc(g_pleft.n * sizeof *ids), m = g_pleft.n; if (!ids) return;
     memcpy(ids, g_pleft.list, m * sizeof *ids); pool_dset_clear(&g_pleft);
-    for (uint32_t j = 0; j < m; j++) { g_pool_upd_left++; int lr = pool_tex_update((int)ids[j], limit); if (lr == 1) pool_dset_add(&g_pleft, (int)ids[j]); else if (lr == 2) pool_dset_add(&g_punwritten, (int)ids[j]); }
+    int full = 0;
+    for (uint32_t j = 0; j < m; j++) {
+        int id_ = (int)ids[j];
+        if (full || (pool_unmade(id_) && pool_tex_size(&g_treg[id_].t) > POOL_FRAME_BYTES)) { pool_dset_add(&g_pleft, id_); continue; }   // after the walk ended / never fits a frame: stays queued, in order
+        uint64_t used = g_walk_spent - spent0, room = room0 > used ? room0 - used : 0;
+        if (pool_unmade(id_) && pool_tex_size(&g_treg[id_].t) > room) { full = 1; pool_dset_add(&g_pleft, id_); continue; }
+        g_pool_upd_left++; int lr = pool_tex_update(id_, room); if (lr == 1) pool_dset_add(&g_pleft, id_); else if (lr == 2) pool_dset_add(&g_punwritten, id_);
+    }
     free(ids);
 }
 // When a render pass creates/writes a target that was previously skipped by pool_unwritten_target (g_ser_gen bumped), populate its pool entry immediately in the same submission (#674)
