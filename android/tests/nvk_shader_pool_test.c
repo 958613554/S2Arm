@@ -56,7 +56,7 @@ static unsigned fake_array_count;
 static int separate_fixture;
 static int record_link_refused;
 static int link_map_flag;   // nvk_link_map_diag 开关替身
-static int fake_gs_success, fake_gs_result_mode, gs_loads[6], fake_geometry_enabled = 1, fake_depth_clip;
+static int fake_gs_success, fake_gs_result_mode, gs_loads[6], fake_geometry_enabled = 1, fake_depth_clip, fake_tess_enabled;
 static size_t gs_blob_bytes[6];   // 每个阶段最后一次装载的 SPIR-V 字节数（出包预编库命中时认出是哪一份）
 static int fake_gs_fact_deps;
 // 与 fake_gs_fact_deps 一起用：结果的依赖清单末尾再多一条（真编译器的形状）：1 = 请求开关 requiresLinkedVaryingInterface；
@@ -183,7 +183,7 @@ const prog_t *nvn_prog_snap_get(uint64_t serial, uint8_t keys[6][8], uint8_t *ok
     return &gs_program;
 }
 static uint32_t fixture_ssbo_align;   // 设备 minStorageBufferOffsetAlignment（非窗口补件夹具要非对齐的存储缓冲基址，请求才带 hasUnalignedStorageBuffer）
-void nvn_gpu_caps_get(nvn_gpu_caps *out) { memset(out, 0, sizeof *out); out->min_ssbo_align = fixture_ssbo_align; out->caps = (fake_geometry_enabled ? NVN_GPU_CAP_GEOMETRY : 0) | (fake_depth_clip ? NVN_GPU_CAP_DEPTH_CLIP_CTL : 0); }
+void nvn_gpu_caps_get(nvn_gpu_caps *out) { memset(out, 0, sizeof *out); out->min_ssbo_align = fixture_ssbo_align; out->caps = (fake_geometry_enabled ? NVN_GPU_CAP_GEOMETRY : 0) | (fake_depth_clip ? NVN_GPU_CAP_DEPTH_CLIP_CTL : 0) | (fake_tess_enabled ? NVN_GPU_CAP_TESSELLATION : 0); }
 static uint32_t sampled_fixture_format;
 int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *h) {
     // 77：带视图（改目标为 RECTANGLE）；78 / 79：同一组格式 / 目标 / 深度的两个不同句柄（快路按事实认，不按句柄认）。
@@ -379,9 +379,11 @@ static int fact_matches(const char *stage, int handle, const char *sampler, int 
 static unsigned gs_c1_len = 0x100;   // c1 段长度（c1fill 非 0 时）：缺省 0x100；长 c1 用例临时改大（段落在控制段 0x200 起，最长 0x500）
 static void gs_source_ex(unsigned st, unsigned variant, unsigned c1fill, uint8_t key[8]) {
     uint8_t ctl[0x760] = {0}, code[0x70] = {0}, digest[32];
-    const unsigned type[3] = {1, 5, 4};
+    const unsigned type[5] = {1, 5, 4, 2, 3};
     wr(code, (st == 1 ? 2u : 1u) | (3u << 5) | (type[st] << 10));
     if (st == 1) wr(code + 72, 15);
+    if (st == 3) wr(code + 8, 3u << 24);   // TCS 输出 3 个控制点
+    if (st == 4) { wr(ctl + 0x738, 7); wr(ctl + 0x73c, 0x8e7c); wr(ctl + 0x744, 0x900); }
     if (st == 2) { wr(code + 8, 1u << 24); wr(code + 12, 7u << 24); wr(code + 16, 3); }
     wr64(code + 0x50, 0x001f8000fc0007e0ull); wr64(code + 0x58, 0xe30000000007000full);
     wr64(code + 0x60, 0xe30000000007000full); wr64(code + 0x68, 0xe30000000007000full);
@@ -393,6 +395,85 @@ static void gs_source_ex(unsigned st, unsigned variant, unsigned c1fill, uint8_t
     memcpy(key, digest, 8);
 }
 static void gs_source(unsigned st, unsigned variant, uint8_t key[8]) { gs_source_ex(st, variant, 0, key); }
+
+static int load_fixture_profile(const char *profile_path, const char *closure) {
+    FILE *pf = fopen(profile_path, "rb"); if (!pf) return 1;
+    size_t pn = fread(external_profile, 1, sizeof external_profile - 1, pf);
+    int extra = fgetc(pf); fclose(pf); if (!pn || extra != EOF || strlen(closure) >= sizeof external_closure) return 1;
+    external_profile[pn] = 0; snprintf(external_closure, sizeof external_closure, "%s", closure);
+    struct s2a_jv profile_obj = {external_profile, pn}, hash_field;
+    return s2a_jv_obj_find(profile_obj, "profileHash", &hash_field) ||
+        s2a_jv_str(hash_field, external_profile_hash, sizeof external_profile_hash);
+}
+// 真实来源快照 → 回放阶段状态 → 设备解析 → 编译请求。夹具只在编译边界捕获。
+static int tess_request_test(const char *profile_path, const char *closure, const char *payload, int execute) {
+    if (profile_path && load_fixture_profile(profile_path, closure)) return 1;
+    fake_tess_enabled = 1;
+    rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
+    memset(&gs_program, 0, sizeof gs_program); gs_program.magic = MAGIC('P','R','O','G');
+    gs_program.serial = 101; gs_program.nstage = 4;
+    memset(gs_stages, 0xff, sizeof gs_stages); memset(gs_keys, 0, sizeof gs_keys);
+    const unsigned order[] = {4, 0, 3, 1};
+    for (unsigned i = 0; i < 4; i++) {
+        gs_stages[i] = (uint8_t)order[i];
+        gs_source_ex(order[i], 0, order[i] >= 3 ? 0xb0 + order[i] : 0, gs_keys[i]);
+    }
+    gs_keys_ok = 15;
+    p_bind_program_id bind = {&gs_program, gs_program.serial, 0x1f, 0};
+    CHECK(rp_state_op(OP_BIND_PROGRAM, &bind, sizeof bind + 8), "bind tessellation program");
+    CHECK(rp_shader_graphics_stages() == 0x1b, "tessellation program mask includes a GS hole");
+    bind_pools(7); captured[0] = 0; compiler_calls = 0;
+    struct rp_shader_req q = {0}; q.prim = NVN_DRAW_PRIMITIVE_PATCHES;
+    const struct rp_prog *prog = NULL;
+    capture_output = execute ? NULL : payload;
+    fake_compile_file = execute ? payload : NULL;
+    fake_gs_success = execute;
+    int released = shader_release_count;
+    int rc = rp_shader_resolve(&q, &prog);
+    CHECK(compiler_calls == 1, "real resolver reaches compiler for VS/TCS/TES/FS");
+    if (!compiler_calls) CHECK(!nvn_unimpl_count("shader", "stages_0x1b_not_vs_fs"),
+                               "0x1b is accepted by the production resolver");
+    if (execute) {
+        CHECK(!rc && prog && prog->tess && prog->sh[0] && prog->sh[1] &&
+              !prog->sh[2] && prog->sh[3] && prog->sh[4], "result loads all four shader modules");
+        CHECK(gs_loads[0] == 1 && gs_loads[1] == 1 && !gs_loads[2] && gs_loads[3] == 1 && gs_loads[4] == 1,
+              "shader loads use their original NVN slots");
+    }
+    struct s2a_jv root = {captured, strlen(captured)}, program, stages, slot;
+    CHECK(!s2a_jv_obj_find(root, "program", &program) &&
+          !s2a_jv_obj_find(program, "stages", &stages) &&
+          s2a_jv_arr_count(stages) == 5 &&
+          !s2a_jv_arr_item(stages, 2, &slot) && s2a_jv_is_null(slot) &&
+          strstr(captured, "\"stage\":\"tcs\"") && strstr(captured, "\"stage\":\"tes\""),
+          "compiler request preserves all five NVN slots");
+    if (execute && prog) {
+        uint8_t identity[32];
+        memcpy(identity, prog->identity, 32);
+        nvk_prog_warm_save();
+        CHECK(s2a_program_cache_drain(5000) == 0, "tessellation program cache drains");
+        rp_shader_reset();
+        CHECK(shader_release_count == released + 4, "session reset releases all four stages");
+        struct nvk_prog_rec rec = {0};
+        CHECK(nvk_prog_warm_load() == 1 && nvk_prog_warm_take(&rec) == 1 &&
+              rec.stage_mask == 0x1b && rec.c1_ok == 0x18 && !memcmp(rec.identity, identity, 32) &&
+              rec.c1[3][0] == 0xb3 && rec.c1[4][255] == 0xb4,
+              "prior manifest retains sparse stages and tessellation c1");
+        CHECK(nvk_prog_warm_build(&rec) == 0, "tessellation program prewarms from prior cache");
+        const struct rp_prog *warm = NULL, *again = NULL;
+        CHECK(rp_shader_prog_by_identity(identity, &warm) && warm && warm->tess &&
+              warm->sh[3] && warm->sh[4] && warm->c1_ok == 0x18, "prewarm publishes both tessellation stages");
+        CHECK(!rp_shader_resolve(&q, &again) && again == warm && compiler_calls == 1,
+              "real resolver consumes prewarmed program without recompiling");
+    }
+    const int calls = compiler_calls;
+    fake_tess_enabled = 0;
+    CHECK(rp_shader_resolve(&q, &prog) == -1 && !prog && compiler_calls == calls &&
+          nvn_unimpl_count("shader", "tessellation_not_enabled"),
+          "disabled native tessellation capability rejects before compile");
+    rp_shader_reset(); s2a_source_clear();
+    printf("tessellation resolver: sizeof(rp_prog)=%zu checks=%d failures=%d\n", sizeof(struct rp_prog), checks, failures);
+    return failures != 0;
+}
 
 static void gs_request_test(void) {
     rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
@@ -744,12 +825,7 @@ static const char *arms_root, *arms_manifest;   // --nowindow-arms：种子目�
 static void test_nowindow_seed(const char *root, const char *manifest, const struct rp_shader_req *q);
 
 static int emit_real_request(const char *profile_path, const char *closure, const char *dir, const char *output, int tbuf) {
-    FILE *pf = fopen(profile_path, "rb"); if (!pf) return 1;
-    size_t pn = fread(external_profile, 1, sizeof external_profile - 1, pf);
-    int extra = fgetc(pf); fclose(pf); if (!pn || extra != EOF || strlen(closure) >= sizeof external_closure) return 1;
-    external_profile[pn] = 0; snprintf(external_closure, sizeof external_closure, "%s", closure);
-    struct s2a_jv profile_obj = {external_profile, pn}, hash_field;
-    if (s2a_jv_obj_find(profile_obj, "profileHash", &hash_field) || s2a_jv_str(hash_field, external_profile_hash, sizeof external_profile_hash)) return 1;
+    if (load_fixture_profile(profile_path, closure)) return 1;
     // GS 整链（--emit-real 及其复用变体）：生成的请求要与 vk/t_replay_gs 在 lavapipe 上发出的逐字节相同；lavapipe 有 VK_EXT_depth_clip_control，
     //   有这项能力时现编不改写 z（nvk_shader.c fill_facts），所以这里同样报有（设备没有时 t_replay_gs 的逐字节比对会直接红）
     fake_depth_clip = tbuf == 0 || tbuf >= 3;   // GS 整链的基准（0）、执行复用（3）、三种宽松输入（4–6）同一口径，内容才可比；贴图缓冲链（1 / 2）不变
@@ -2855,6 +2931,9 @@ static int lp_gate_test(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--tess-request")) return tess_request_test(NULL, NULL, NULL, 0);
+    if (argc == 5 && (!strcmp(argv[1], "--emit-tess") || !strcmp(argv[1], "--execute-tess")))
+        return tess_request_test(argv[2], argv[3], argv[4], !strcmp(argv[1], "--execute-tess"));
     if (argc == 2 && !strcmp(argv[1], "--lp-gate")) return lp_gate_test();
     if (argc == 2 && !strcmp(argv[1], "--live-compile-default")) return live_compile_thread_test(0);
     if (argc == 2 && !strcmp(argv[1], "--live-compile-thread")) return live_compile_thread_test(1);

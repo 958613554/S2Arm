@@ -317,7 +317,9 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     // 只链 vk_device.c 的宿主探针照旧能链接（NULL→关 GS，与无判定文件同向安全）。
     enabled_features.geometryShader =
         s2a_vk_gs_path && s2a_vk_gs_path(features.geometryShader, NULL) ? VK_TRUE : VK_FALSE;
-    enabled_features.tessellationShader = VK_FALSE;
+    enabled_features.tessellationShader =
+        (features.tessellationShader && out->properties.limits.maxTessellationPatchSize > 0)
+            ? VK_TRUE : VK_FALSE;
     // C2 生成的 SPIR-V 会声明这些能力；只在实际支持时启用，不支持则留给 shader 校验显式失败。
     enabled_features.shaderImageGatherExtended = features.shaderImageGatherExtended;
     enabled_features.shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats;

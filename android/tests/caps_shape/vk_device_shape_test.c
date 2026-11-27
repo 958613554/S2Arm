@@ -114,8 +114,12 @@ int main(int argc, char **argv) {
            "vertexPipelineStoresAndAtomics 启用=%u，支持=%u", d.core_features.vertexPipelineStoresAndAtomics, s->features.vertexPipelineStoresAndAtomics);
     EXPECT(d.core_features.shaderClipDistance == s->features.shaderClipDistance, "shaderClipDistance 启用=%u，支持=%u",
            d.core_features.shaderClipDistance, s->features.shaderClipDistance);
-    EXPECT(!d.core_features.shaderFloat64 && !d.core_features.shaderInt64 && !d.core_features.tessellationShader,
-           "64 位 / 曲面细分不该启用（%u %u %u）", d.core_features.shaderFloat64, d.core_features.shaderInt64, d.core_features.tessellationShader);
+    EXPECT(!d.core_features.shaderFloat64 && !d.core_features.shaderInt64,
+           "64 位特性不该启用（%u %u）", d.core_features.shaderFloat64, d.core_features.shaderInt64);
+    const VkBool32 tess_want = (s->features.tessellationShader && s->props.limits.maxTessellationPatchSize > 0) ? VK_TRUE : VK_FALSE;
+    EXPECT(d.core_features.tessellationShader == tess_want,
+           "tessellationShader 启用=%u，期望=%u（支持=%u maxPatch=%u）",
+           d.core_features.tessellationShader, tess_want, s->features.tessellationShader, s->props.limits.maxTessellationPatchSize);
     // 几何着色器（#1456 / #1482）：判定已放行，开不开 = 设备支不支持
     EXPECT(d.core_features.geometryShader == s->features.geometryShader, "geometryShader 启用=%u，支持=%u（判定放行）",
            d.core_features.geometryShader, s->features.geometryShader);

@@ -160,12 +160,19 @@ def oracle(name, got_path):
     want = json.load(open(os.path.join(DEVICES, stem + '.json')))
     got = json.load(open(got_path))
     # 档案里写 null（来源没读数）的格式，假驱动按「能力未知 = 按不支持」回答；device_caps.c 里由这些格式决定的格式族因此不比，点名列出
-    null_fmts = {k for k, v in load(name)['vulkan']['formats'].items() if v is None}
+    prof_v = load(name)['vulkan']
+    null_fmts = {k for k, v in prof_v['formats'].items() if v is None}
     unknown = {('formats', group) for group, fmts in caps_format_groups().items() if fmts & null_fmts}
     bad = []
     for sect in ('limits', 'features', 'formats', 'memory'):
         for k, v in want[sect].items():
             if sect == 'features' and k in ('geometryShader', 'geometryShaderOcclusionQuery'): continue   # capprobe 判定，不是能力形态
+            if sect == 'features' and k == 'tessellationShader':
+                # devices/{8e,9000}.json 采于 vk_device.c 启用 tessellationShader 之前；按物理档核对本构建启用值，不篡改历史真机采样档
+                want_tess = bool(prof_v['features'].get('tessellationShader')) and int(prof_v['properties']['limits'].get('maxTessellationPatchSize') or 0) > 0
+                g = got.get(sect, {}).get(k)
+                if g != want_tess: bad.append('%s.%s：物理档期望 %r / 本构建 %r' % (sect, k, want_tess, g))
+                continue
             if (sect, k) in unknown: continue
             g = got.get(sect, {}).get(k)
             if (abs(g - v) > 1e-6 if isinstance(v, float) else g != v): bad.append('%s.%s：真机 %r / 本构建 %r' % (sect, k, v, g))

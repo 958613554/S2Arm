@@ -21,7 +21,7 @@
 extern "C" {
 #endif
 
-#define NVK_PROG_REC_STAGES 3
+#define NVK_PROG_REC_STAGES 5
 #define NVK_PROG_REC_C1_MIN 0x100     // c1 完整判据，与 source_store / build 同源（views[st].c1_bytes >= 0x100 才算捕获）
 #define NVK_PROG_REC_C1_MAX 0x10000   // 单阶段 c1 上限，与 source_store 接受的 c1 范围上限同源
 
