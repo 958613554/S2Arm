@@ -12657,11 +12657,6 @@ __attribute__((weak)) int s2a_front_warm_tick(long done, long total) { (void)don
 //   used to close only on its own guards, so a release here left it on "optimizing" until those fired). Weak no-op without a front end
 void s2a_front_warm_released(void);
 __attribute__((weak)) void s2a_front_warm_released(void) {}
-// How many pipelines this prepare step has really compiled so far (not taken from the package's or the device's archive; every one when the archive is off: g_par_compiled),
-//   sent before each tick: the front end shows "optimizing" only for real compiling and "loading" when a later start mostly loads from the archive (11-26: a later start that
-//   loaded 30k lines from a full archive was shown as "optimizing graphics for your device" every time). Weak no-op without a front end
-void s2a_front_warm_compiled(long n);
-__attribute__((weak)) void s2a_front_warm_compiled(long n) { (void)n; }
 static _Atomic int g_wp_full_sent;   // the (total, total) tick went out
 static void warm_tick_full(long total) { if (!atomic_exchange(&g_wp_full_sent, 1)) (void)s2a_front_warm_tick(total, total); }
 // 11-02 (Monster Hunter Rise on an iPhone 17 Pro, a cold start): the first frame waited 64 s for 12,741 of 17,630 lines on every core and the phone was in the serious thermal state
@@ -12717,14 +12712,14 @@ static int warm_prepare(NSArray<WarmTask *> *tasks, long lines) {
         for (;;) { if (atomic_load(&stop)) break; long i = warm_pick(&next, n); if (i < 0 || dm_gfx_session_stopping()) break; WARM_PREPARE_TASK(tasks[(NSUInteger)i]); }
     });
     int shown = 0, late = 0; long seen = -1; uint64_t moved = t0;
-    uint64_t compiled0 = atomic_load(&g_par_compiled);   // real compiles from here on (s2a_front_warm_compiled)
-    int front = s2a_front_warm_tick(0, lines) >= 0;   // a front end decides when to stop waiting (it was told the total); else this file's guards
-    while (dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, 50 * (int64_t)NSEC_PER_MSEC))) {
+    int f0 = s2a_front_warm_tick(0, lines), front = f0 >= 0;   // a front end decides when to stop waiting (it was told the total); else this file's guards
+    // 11-27 之后的启动（前端：本包已完整预热过）开等这一拍就放行：首帧前不等，整张清单转后台（加载页 GO_LATER，runtime/src/loadprog.c）。不先等 50 ms 那一拍
+    if (f0 == 1) late = WARM_WHY_LATER;
+    while (!late && dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, 50 * (int64_t)NSEC_PER_MSEC))) {
         uint64_t now = bp_now(), el = now - t0; long done = g_warm_done; double rest = done ? (double)el * (double)(lines - done) / (double)done : 1e18;
         if (done != seen) { seen = done; moved = now; }
         wp_sample(now, done);   // the rate window keeps moving while nobody reads
         int why;
-        if (front) s2a_front_warm_compiled((long)(atomic_load(&g_par_compiled) - compiled0));
         if (front) why = s2a_front_warm_tick(done, lines) == 1 || atomic_load(&g_wp_play) ? WARM_WHY_PLAYER : WARM_WHY_NONE;   // the front end owns the page, its estimate and its guards
         else why = warm_hold_why(el, now - moved, atomic_load(&g_wp_play), lim, stall);
         if (!why && !front && lim && el >= lim) why = WARM_WHY_LIMIT;   // 上限只管没有前端的宿主（11-22 #502：有加载页时编译还在进展就继续等，玩家可随时点「先开始玩」）
@@ -12742,7 +12737,7 @@ static int warm_prepare(NSArray<WarmTask *> *tasks, long lines) {
           }); }
         atomic_store(&g_wp_why, late); atomic_store(&g_wp_phase, WARM_BG);
         MLOG("pipeline prepare: the first frame waited %.0f ms (%s); %ld of %ld lines done, the rest goes on in the background on %d workers", (bp_now() - t0) / 1e6,
-             late == WARM_WHY_PLAYER ? "the player chose to play now" : late == WARM_WHY_STALL ? "no line finished for DM_PSO_PREPARE_STALL_MS" :
+             late == WARM_WHY_PLAYER ? "the player chose to play now" : late == WARM_WHY_LATER ? "a later start: this package was fully prewarmed before" : late == WARM_WHY_STALL ? "no line finished for DM_PSO_PREPARE_STALL_MS" :
              late == WARM_WHY_TAIL ? "every line taken, only the ones being built left; they finish on the prepare workers" : "the cap, DM_PSO_PREPARE_MAX_MS",
              (long)g_warm_done, lines, workers);
         if (front) s2a_front_warm_released();
