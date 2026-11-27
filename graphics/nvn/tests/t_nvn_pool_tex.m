@@ -142,6 +142,7 @@ int main(void) { @autoreleasepool {
            "反射：tex_pool → TEXP、samp_pool → SAMPP、记成池 / 无绑定（%s）", cs ? "转换成功" : err);
     if (cs) {
         // 第一次提交：读 40（采样器 40）、3、51、60
+        uint64_t late0 = g_pool_seen_late;   // 「读到占位后才建」：40 / 3 / 41 预建了不算，60 是没写过的目标（跳过）不算；51、50 各算一次
         read4(cs, 40u | 40u << 20, 3u | 1u << 20, 51u | 1u << 20, 60u | 1u << 20);
         VERIFY(near(out4[0], 40.5f) && near(out4[1], 3.5f), "① 句柄 40（采样器 40）→ %.2f（期望 40.50）、句柄 3 → %.2f（期望 3.50）", out4[0], out4[1]);
         VERIFY(seen_bit(40) && seen_bit(3) && seen_bit(51) && seen_bit(60) && !seen_bit(41) && !seen_bit(50),
@@ -150,10 +151,13 @@ int main(void) { @autoreleasepool {
                "③ 首次走池预建到本帧 32 MB：12 MB %d、14 MB %d（期望 1）；18 MB %d、20 MB %d（期望 0）；读 51 → %.2f（期望占位 0.00）", made(70), made(71), made(50), made(51), out4[2]);
         // 第二次提交：折叠位图 → 51 建；50 上次没读，仍不建
         read4(cs, 51u | 1u << 20, 41u | 1u << 20, 50u | 1u << 20, 60u | 1u << 20);
+        uint64_t late51 = g_pool_seen_late - late0;
         VERIFY(made(51) && near(out4[0], 51.5f) && !made(50) && near(out4[2], 0.0f) && near(out4[1], 41.5f),
                "③ 折叠后只建被读的：51 已建 %d、读得 %.2f（期望 1、51.50）；50 已建 %d、读得 %.2f（期望 0、0.00）；41 → %.2f（期望 41.50）", made(51), out4[0], made(50), out4[2], out4[1]);
         read4(cs, 50u | 1u << 20, 60u | 1u << 20, 61u | 1u << 20, 3u | 1u << 20);
         VERIFY(made(50) && near(out4[0], 50.5f), "③ 再下一次：50 已建 %d、读得 %.2f（期望 1、50.50）", made(50), out4[0]);
+        VERIFY(late51 == 1 && g_pool_seen_late - late0 == 2, "③ 读到占位后才建：建 51 那次 +%llu（期望 1）、建 50 后共 %llu（期望 2）",
+               (unsigned long long)late51, (unsigned long long)(g_pool_seen_late - late0));
         VERIFY(!made(60) && near(out4[1], 0.0f) && near(out4[2], 61.5f), "④ 没写过的渲染目标 60：已建 %d、读得 %.2f（期望 0、0.00）；普通贴图 61 → %.2f（期望 61.50）", made(60), out4[1], out4[2]);
         // ⑤ 本帧已读贴图记满 128 MB：GPU 置了 52 的位（这里直接置），下一次提交不建
         texture(52, W, 22 * MB / (W * 4), 0);
