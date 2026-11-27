@@ -145,12 +145,14 @@ namespace S2A.Services
 
             // 单一 IMG v1（v0.3.0）：有 game.img 就用它（Mac 运行目录里的是 iPhone 资源包那份的硬链接，0.6.0 一款一份资源）；旧形态（romfs.img 三件套 / romfs/ 目录）照旧支持。
             //   Mac 运行目录的界面覆盖层在 ui_overlay/romfs（iPhone 资源包是 romfs_overlay，OpenImg 缺省）
+            IStorage given = null;   // 交给游戏的本体 RomFS（下面四种来源之一），推支持语言用
             IStorage imgV1 = RomFsIndex.OpenImg(programDir, Directory.Exists(overlayDir) ? overlayDir : null);
             if (imgV1 != null)
             {
                 // programIndex 是目录槽（0 = 这个包的根程序，单独导出的程序 n 也在槽 0），不是程序身份序号：没标目标的 romfs/ Mod 给根程序，按身份序号改会错
                 imgV1 = RomFsMods.ApplyAtLaunch(imgV1, programIndex, ProgramId);   // 资源替换类 mod（RomFsMods.cs）：没有 mod 原对象返回；下面几处同
                 device.Configuration.VirtualFileSystem.SetRomFs(pid, RomFsIndex.ReadLog(imgV1, readLogAs));
+                given = imgV1;
                 Native.Mark("服务：RomFS 单一 IMG\0"u8);
             }
             // 标准 RomFS 镜像（Mac 运行版本 / 产物根里 romfs/ 不在、只有 romfs.std）：整个文件就是游戏要的 RomFS，直接交（RomFsIndex.OpenStd）；romfs/ 在照旧读目录
@@ -159,6 +161,7 @@ namespace S2A.Services
             {
                 IStorage image = RomFsMods.ApplyAtLaunch(RomFsIndex.OpenStd(std, overlayDir), programIndex, ProgramId);
                 device.Configuration.VirtualFileSystem.SetRomFs(pid, RomFsIndex.ReadLog(image, readLogAs));
+                given = image;
                 Native.Mark("服务：RomFS 标准镜像\0"u8);
             }
             IStorage imageStorage = imgV1 != null || std != null ? null : RomFsIndex.OpenImage(programDir);
@@ -168,6 +171,7 @@ namespace S2A.Services
             {
                 imageStorage = RomFsMods.ApplyAtLaunch(imageStorage, programIndex, ProgramId);
                 device.Configuration.VirtualFileSystem.SetRomFs(pid, RomFsIndex.ReadLog(imageStorage, readLogAs));
+                given = imageStorage;
                 Native.Mark("服务：RomFS 单文件镜像\0"u8);
             }
             else if (source == RomFsIndex.Source.Directory)
@@ -190,6 +194,7 @@ namespace S2A.Services
                 }
 
                 image = RomFsMods.ApplyAtLaunch(image, programIndex, ProgramId);
+                given = image;
                 device.Configuration.VirtualFileSystem.SetRomFs(pid, RomFsIndex.ReadLog(image, readLogAs));   // 镜像本身按偏移读：各数据存储会话互不共享读位置（#883），大读也不租中间数组
                 Native.Mark("服务：RomFS 目录表建\0"u8);
             }
@@ -197,6 +202,8 @@ namespace S2A.Services
             {
                 Red.Report("游戏数据缺 romfs/（也没有 romfs.std）", programDir);
             }
+
+            DeriveLanguages(given, nacp.Value);
 
             Aoc.Register(gameDir);   // DLC：aoc.tsv 里的全部登记为已拥有（有数据的挂 aoc/<idx>/，仅授权的挂载时报红）
 
@@ -225,6 +232,32 @@ namespace S2A.Services
 
             Native.Mark("服务：arp 登记\0"u8);
             Console.Error.WriteLine($"S2A 应用登记：程序号 {ProgramId:X16}、pid {pid}、{result.Name} {result.DisplayVersion}");
+        }
+
+        // D-7FZ6：控制数据是导入时合成的（显示版本 ?）或没声明已知语言 → 从 RomFS 文件路径推游戏支持的语言（RomFsLanguages），交 GetDesiredLanguage 当真表用；
+        //   推不出（没有语言槽）留 -1，选语言照旧（#465 回宿主主语言）。推出的表打一行黄字，日后与真表对账（11-26 对账：RomFS 有、NACP 没声明的会多推）
+        internal static void DeriveLanguages(IStorage romfs, in LibHac.Ns.ApplicationControlProperty nacp)
+        {
+            Ryujinx.HLE.S2AHooks.RomFsTitleLanguages = -1;
+            int flag = (int)nacp.SupportedLanguageFlag;
+            if (romfs == null || (nacp.DisplayVersionString.ToString() != "?"
+                && !Ryujinx.HLE.HOS.Services.Am.AppletOE.ApplicationProxyService.ApplicationProxy.IApplicationFunctions.NoKnownLanguages(flag))) return;   // 真 NACP：用它自己的表
+            System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+            List<string> files = new();
+            try { RomFsIndex.ListFiles(new LibHac.Tools.FsSystem.RomFs.RomFsFileSystem(romfs).FileTable, "", files); }
+            catch (Exception e)   // 推不出只是不知道支持表，不拦起局
+            {
+                Console.Error.WriteLine($"[S2A 语言] 【黄】控制数据是合成的（0x{flag:X4}），列 RomFS 文件失败（{e.Message}）：支持表未知，选语言照旧按宿主主语言");
+                return;
+            }
+            int bits = RomFsLanguages.Detect(files, out int slots);
+            if (bits == 0)
+            {
+                Console.Error.WriteLine($"[S2A 语言] 【黄】控制数据是合成的（0x{flag:X4}），RomFS {files.Count} 个文件里没有语言槽：支持表未知，选语言照旧按宿主主语言（{sw.ElapsedMilliseconds} ms）");
+                return;
+            }
+            Ryujinx.HLE.S2AHooks.RomFsTitleLanguages = bits;
+            Console.Error.WriteLine($"[S2A 语言] 【黄】控制数据是合成的（0x{flag:X4}）：支持表按 RomFS 推出 0x{bits:X5}（{RomFsLanguages.Names(bits)}；语言槽 {slots} 个、文件 {files.Count} 个，{sw.ElapsedMilliseconds} ms）");
         }
 
         // 程序序号表（Ryujinx ProcessLoaderHelper.RegisterProgramMapInfo，每次加载都登记）：序号 i → 程序号 应用号 + i、主程序号 = 应用号。
