@@ -545,6 +545,7 @@
 "settings.toggle.diagRun" = "Session de diagnostic (prochaine session)";
 "settings.diagRun.note" = "Activez, fermez l'app depuis le sélecteur d'apps et relancez ce jeu. Restez à l'endroit où le problème apparaît pendant au moins 3 minutes, puis exportez le diagnostic. S'applique uniquement à la prochaine session ; cette session sera plus lente.";
 "settings.docked.note" = "Image plus nette, mais consommation et température plus élevées ; déconseillé sur un téléphone";
+"settings.recommended" = "Recommandé pour ce jeu (testé)";
 "settings.toggle.fullscreen" = "Plein écran";
 "settings.toggle.metalHud" = "Afficher l'overlay de performances Metal";
 "settings.toggle.phoneHaptics" = "Vibrations du téléphone";

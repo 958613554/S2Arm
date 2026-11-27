@@ -5,6 +5,7 @@
 #import "cpatch_model.h"
 #import "s2a_l10n.h"
 #include "caps.h"
+#include "gdefaults.h"   // 逐款测过的缺省（11-27）
 #include "s2a_launch_ctx.h"
 #include <errno.h>
 #include <stdio.h>
@@ -15,6 +16,11 @@
 static NSString *caps_dir(void) {
     const s2a_launch_ctx *lc = s2a_launch_ctx_get();
     return lc ? @(lc->caps_dir) : NSBundle.mainBundle.bundlePath;
+}
+// 模块目录（main.npdm、随行表所在）：逐款缺省按它读程序号 + 构建号（runtime/src/caps.c s2a_game_defaults_peek）；单款包 = App 包顶层
+static NSString *module_dir(void) {
+    const s2a_launch_ctx *lc = s2a_launch_ctx_get();
+    return lc && lc->module_dir[0] ? @(lc->module_dir) : NSBundle.mainBundle.bundlePath;
 }
 
 // Only lifecycle startup writes these values; the session coordinator serializes
@@ -295,6 +301,23 @@ BOOL s2a_ios_metalfx_blocked(NSString *gid) {
     return caps_value_in(dir, "direct") != 1;
 }
 
+// 逐款测过的缺省（11-27）：本款这一项（定义表 id）的逐款值，没有 / 读不到 / 这款用不上 → nil。宿主起局按同一张表写环境（runtime/src/gdefaults.c），
+//   设置页没选过的项照它显示，才和真生效的一致。正在跑的这款按模块目录读程序号 + 构建号，游戏库里别的款按它的游戏目录
+NSString *s2a_ios_game_default(NSString *gid, NSString *item) {
+    NSString *dir = !gid.length || [gid isEqualToString:current_gid() ?: @""] ? module_dir() : s2a_ios_game_dir(gid);
+    const char *v = s2a_game_default_value(dir.fileSystemRepresentation, item.UTF8String);
+    if (!v) return nil;
+    if ([item isEqual:@"quality"] && (!strcmp(v, "MetalFX") || !strcmp(v, "Fsr")) && s2a_ios_metalfx_blocked(gid)) return nil;   // 同宿主：锐利放大要走直连
+    return @(v);
+}
+// iOS 存的键 → 定义表 id（逐款缺省按定义表 id 给值）
+static NSString *table_item(NSString *key) {
+    return @{@"S2AResolutionScale": @"resolutionScale", @"S2AScalingFilter": @"quality", @"S2AFrameRateLimit": @"fpsLimit", @"S2ADockedMode": @"docked", @"S2AFpsPick": @"fpsPick"}[key];
+}
+BOOL s2a_ios_game_default_shown(NSUserDefaults *defaults, NSString *key) {
+    return ![defaults objectForKey:key] && table_item(key) && s2a_ios_game_default(nil, table_item(key)) != nil;
+}
+
 NSArray<NSDictionary *> *s2a_ios_graphics_options(void) {
     return @[
         @{@"key": @"S2AResolutionScale", @"title": S2AL(@"gfx.resolution"), @"initial": @"1",
@@ -337,12 +360,13 @@ NSDictionary *s2a_ios_graphics_snapshot(NSUserDefaults *defaults) {
     NSMutableDictionary *snapshot = [NSMutableDictionary dictionary];
     for (NSDictionary *option in s2a_ios_graphics_options()) {
         id value = [defaults objectForKey:option[@"key"]];
+        if (!value && table_item(option[@"key"])) value = s2a_ios_game_default(nil, table_item(option[@"key"]));   // 没选过：本款逐款缺省（11-27），没有再按初始值
         snapshot[option[@"key"]] = [option[@"values"] containsObject:value ?: NSNull.null] ? value : option[@"initial"];
     }
     for (NSString *key in @[@"S2AWidescreen", @"S2AFps60"])
         snapshot[key] = [defaults objectForKey:key] ? @([defaults boolForKey:key]) : @YES;
     snapshot[@"S2AFps60Manual"] = @([defaults boolForKey:@"S2AFps60Manual"]);
-    snapshot[@"S2ADockedMode"] = @([defaults boolForKey:@"S2ADockedMode"]);
+    snapshot[@"S2ADockedMode"] = [defaults objectForKey:@"S2ADockedMode"] ? @([defaults boolForKey:@"S2ADockedMode"]) : @([s2a_ios_game_default(nil, @"docked") isEqual:@"docked"]);   // 没选过：本款逐款缺省，没有 = 掌机
     return snapshot;
 }
 
@@ -387,7 +411,7 @@ void s2a_ios_apply_graphics_settings(NSUserDefaults *defaults) {
             fprintf(stderr, "[S2A 画面设置] %s=%s（启动环境）\n", options[i].env, explicit);
             continue;
         }
-        // 只写玩家选过的（11-27 逐款缺省）：没选过不写，宿主按「逐款缺省 → 定义表缺省」定（runtime/src/caps.c s2a_game_defaults_apply，未设才写）。
+        // 只写玩家选过的（11-27 逐款缺省）：没选过不写，宿主按「逐款缺省 → 定义表缺省」定（runtime/src/gdefaults.c s2a_game_defaults_apply，未设才写）。
         //   原先没选过也把初始值写成显式值，宿主分不清是玩家选的还是缺省，逐款缺省盖不过它；宿主各处未设时的缺省与这里的初始值相同（nvn_present_aa.inc / nvn_rscale.inc / nvn_fps.c）
         id value = [defaults objectForKey:options[i].key];
         if (!value) { fprintf(stderr, "[S2A 画面设置] %s 没选过：不写，按逐款缺省 / 缺省 %s\n", options[i].env, options[i].initial.UTF8String); continue; }
@@ -744,6 +768,7 @@ void s2a_ios_load_graphics_settings(void) {
         //   （审计 #854 F-caps-beats-settings：原先清单先写，设置里关 60 帧 / 宽屏不生效）
         s2a_ios_apply_graphics_settings(s2a_ios_settings_defaults());
         s2a_caps_apply(caps_dir().fileSystemRepresentation);
+        s2a_game_defaults_apply(module_dir().fileSystemRepresentation, caps_dir().fileSystemRepresentation);   // 逐款缺省（11-27）：清单之后、未设才写
         s2a_ios_publish_bundle_info(NSBundle.mainBundle.infoDictionary ?: @{}, NSUserDefaults.standardUserDefaults);
         // 存档位置 SaveData（services/S2A.Services/SaveFolder.cs 读 S2A_SAVE_FOLDER，共享层不判平台）：本款文档根下的 SaveData。
         //   这里在服务层起来之前跑，多款容器选游戏后 S2A_DOCS 已是 Documents/games/<游戏号>（runtime/src/launchctx.c）；单款包没有 S2A_DOCS = Documents。启动环境显式给的优先
@@ -780,8 +805,10 @@ int s2a_ios_reload_graphics_settings(void) {
         // 与起局同一顺序：设置 → 清单。先撤清单自己写的变量（审计 P1-80：原先只撤设置页登记的，清单写的 S2A_FPS60=1 留着，设置里关 60 帧、立刻重启不生效）
         @try {
             s2a_caps_reset();
+            s2a_game_defaults_reset();
             s2a_ios_reapply_graphics_settings(s2a_ios_settings_defaults());
             s2a_caps_apply(caps_dir().fileSystemRepresentation);
+        s2a_game_defaults_apply(module_dir().fileSystemRepresentation, caps_dir().fileSystemRepresentation);   // 逐款缺省（11-27）：清单之后、未设才写
         }
         @catch (NSException *error) {
             fprintf(stderr, "[S2A 画面设置] 【红】重读失败，保留停止状态：%s\n", error.reason.UTF8String);

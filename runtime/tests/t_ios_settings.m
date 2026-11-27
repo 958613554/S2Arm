@@ -228,7 +228,7 @@ int main(int argc, char **argv) {
         }
         for (size_t i = 0; i < 4; i++) {
             NSDictionary *spec = specs[keys[i]];
-            check([spec[@"DefaultValue"] isEqual:@(getenv(variables[i]))], [keys[i] stringByAppendingString:@" 的首次启动值与菜单默认值一致"]);
+            check(!getenv(variables[i]), [keys[i] stringByAppendingString:@" 首次启动没选过：不写进环境（宿主未设时的缺省 = 菜单默认值，11-27 逐款缺省）"]);
             check([spec[@"Values"] count] == [spec[@"Titles"] count], [keys[i] stringByAppendingString:@" 的显示项与保存值数量一致"]);
             check([spec[@"Values"] containsObject:spec[@"DefaultValue"]], [keys[i] stringByAppendingString:@" 的默认值是有效选项"]);
             for (NSString *value in spec[@"Values"]) {
@@ -254,7 +254,7 @@ int main(int argc, char **argv) {
         check([a boolForKey:@"S2ANS2ProAdapterEnabled"], @"读取画面设置保留现有手柄偏好");
         clear_environment();
         s2a_ios_apply_graphics_settings(b);
-        check(!strcmp(getenv(variables[0]), "1") && !strcmp(getenv(variables[1]), "None") && !strcmp(getenv(variables[2]), "Bilinear") && !strcmp(getenv(variables[3]), "0"), @"另一 App 的偏好仍是默认值");
+        check(!getenv(variables[0]) && !getenv(variables[1]) && !getenv(variables[2]) && !getenv(variables[3]), @"另一 App 没选过：四项都不写进环境（按缺省）");
 
         clear_environment();
         setenv(variables[0], "0.75", 1);
@@ -276,13 +276,13 @@ int main(int argc, char **argv) {
                 clear_environment();
                 [a setObject:invalid forKey:keys[i]];
                 s2a_ios_apply_graphics_settings(a);
-                check([specs[keys[i]][@"DefaultValue"] isEqual:@(getenv(variables[i]))], [NSString stringWithFormat:@"%@ 的非法保存值 %@ 使用默认值", keys[i], invalid]);
+                check(!getenv(variables[i]), [NSString stringWithFormat:@"%@ 的非法保存值 %@ 按没选过：不写进环境", keys[i], invalid]);
                 check([a objectForKey:keys[i]] == nil, [keys[i] stringByAppendingString:@" 的非法保存值已清除"]);
                 check([a synchronize], @"清除后的偏好写入成功");
                 clear_environment();
                 NSUserDefaults *reopened = [[NSUserDefaults alloc] initWithSuiteName:suiteA];
                 s2a_ios_apply_graphics_settings(reopened);
-                check([specs[keys[i]][@"DefaultValue"] isEqual:@(getenv(variables[i]))] && [reopened objectForKey:keys[i]] == nil, [keys[i] stringByAppendingString:@" 再次启动仍使用默认值且无失效保存值"]);
+                check(!getenv(variables[i]) && [reopened objectForKey:keys[i]] == nil, [keys[i] stringByAppendingString:@" 再次启动仍按没选过且无失效保存值"]);
             }
         }
 
@@ -324,7 +324,7 @@ int main(int argc, char **argv) {
             [a removeObjectForKey:key];
         }
         {   // 11-27 逐款缺省的根：玩家一项都没选过时，画面五项（渲染倍率 / 抗锯齿 / 画质提升 / 帧率上限 / 档位）与帧率档一个都不写进环境，
-            //   交宿主按「逐款缺省 → 定义表缺省」定（runtime/src/caps.c s2a_game_defaults_apply 未设才写）；选过的（含选回全局缺省值）照写。
+            //   交宿主按「逐款缺省 → 定义表缺省」定（runtime/src/gdefaults.c s2a_game_defaults_apply 未设才写）；选过的（含选回全局缺省值）照写。
             //   期望手写；用改前的 settings.m 跑，前一项不通过（原先没选过也写 1 / None / Bilinear / 0 / 0）
             NSString *suite = [@"local.s2arm.settings-unchosen." stringByAppendingString:NSUUID.UUID.UUIDString];
             NSUserDefaults *u = [[NSUserDefaults alloc] initWithSuiteName:suite];

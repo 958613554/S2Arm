@@ -181,7 +181,7 @@ def missing_after_crash(c, runtime, manifest):
 
 def requested_docked(c):
     """请求明给布尔（作业测试 / 内部调用）的档位 → "1" / "0"；没给 → None。
-    没给不写 S2A_DOCKED：玩家没选过的档位交宿主按「逐款缺省 → 定义表缺省」定（runtime/src/caps.c s2a_game_defaults_apply），
+    没给不写 S2A_DOCKED：玩家没选过的档位交宿主按「逐款缺省 → 定义表缺省」定（runtime/src/gdefaults.c s2a_game_defaults_apply），
     原先这里按定义表缺省写成显式 "0"，宿主分不清是玩家选的掌机还是缺省，逐款缺省盖不过它（11-27）。玩家按款选过的由 launch() 里 community.launch_env 覆盖"""
     v = c.r.get("docked")
     return ("1" if v else "0") if isinstance(v, bool) else None

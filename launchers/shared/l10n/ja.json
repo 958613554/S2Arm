@@ -1224,6 +1224,7 @@
   "display.mods.remove": "削除",
   "display.mods.files": "{0} 個のファイル · {1}",
   "display.mods.imported": "読み込みました：{0}",
+  "display.recommended": "このゲームのおすすめ（検証済み）",
   "display.cheats.player": "インポート済み",
   "display.cheats.library": "{0} から",
   "display.cheats.author": "作成者 {0}",

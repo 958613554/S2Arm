@@ -1337,6 +1337,7 @@
   "display.mods.remove": "刪除",
   "display.mods.files": "{0} 個檔案 · {1}",
   "display.mods.imported": "已匯入：{0}",
+  "display.recommended": "本款推薦（實測過）",
   "display.cheats.player": "你匯入的",
   "display.cheats.library": "來自 {0}",
   "display.cheats.author": "作者 {0}",

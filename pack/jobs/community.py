@@ -219,6 +219,33 @@ def _default(item, caps, platform="mac", rows=None):
     return d
 
 
+def game_defaults(c, gid, caps):
+    """这款 Mac 版的逐款测过的缺省（launchers/shared/game_defaults.v1.tsv，tools/game_defaults.py）：{设置 id: 值}。
+    程序号 = 游戏号，构建号读 Mac 运行版本的随行表（同宿主 runtime/src/gdefaults.c）；这款没有那个杠杆的不算（画质 MetalFX / FSR 要走直连，
+    具体帧率档要清单有帧率来源），与宿主同一判法。还没出 Mac 版（读不到构建号）只认 * 行"""
+    import importlib.util   # 模块与本文件同在引擎快照（tools/ 与 pack/jobs/ 一起收，launchers/macos/bundle_engine.py INPUTS）
+    spec = importlib.util.spec_from_file_location("s2a_game_defaults", Path(__file__).resolve().parents[2] / "tools/game_defaults.py")
+    gd = importlib.util.module_from_spec(spec); spec.loader.exec_module(gd)
+    engine = getattr(c, "engine", None)
+    rows = gd.load(Path(engine) / "launchers/shared/game_defaults.v1.tsv") if engine else []   # 引擎快照里没有这张表 = 没有逐款值
+    if not rows:
+        return {}
+    items = {k: it for k, it in settings_table(c).items() if it.get("env")}
+    bid = gd.peek_bid(layout.image_mac(c, gid, create=False))
+    out = {}
+    for key in items:
+        hit = gd.lookup(rows, gid, bid, "mac", key)
+        if not hit:
+            continue
+        v = hit[0]
+        if key == "quality" and v in ("MetalFX", "Fsr") and caps.get("direct") != "1":
+            continue
+        if key == "fpsPick" and v != "0" and "fps60" not in caps:
+            continue
+        out[key] = v
+    return out
+
+
 def mac_settings(c, gid):
     """Mac 启动设置页：定义表里 Mac 有的每一项 {available, value, reason}（页面 / 补丁两类由各自的入口画，不在这里）。
     缺省跟定义表 / 能力清单走；60 帧在清单没有方案时、画面增强在没走直连时不可用"""
@@ -227,6 +254,7 @@ def mac_settings(c, gid):
     picked = chosen(c, gid, table)
     # 满屏改不动只认强信号（tools/caps_policy.py 原因写「强信号：…」）；「发布缺省关」只是没验证过，玩家可以明确开（同 iPhone settings.m s2a_ios_fullscreen_state）
     full, strong, _ = fullscreen_state(c, gid, picked, rows)
+    per_game = game_defaults(c, gid, caps)
     need = {"fps60": ("fps60" in caps, NO_FPS60), "widescreen": (not strong, NO_WIDEN)}
     out = {}
     for key, item in table.items():
@@ -235,10 +263,13 @@ def mac_settings(c, gid):
         # 还没出 Mac 版（读不到能力清单）：各项都能选、先存偏好，出好后生效（v0.3.1「拿不准不停」：有没有 60 帧方案、走不走直连此时还不知道，不先挡）；
         #   清单明说没有 60 帧方案 / 没走直连的，才是物理上用不了
         ok, why = need.get(key, (True, "")) if caps else (True, "")
-        value = picked.get(key, _default(item, caps, rows=rows))
+        mine = per_game.get(key) if key not in picked else None   # 逐款测过的缺省（11-27）：没选过的项显示本款推荐值，同宿主 runtime/src/gdefaults.c
+        value = picked.get(key, mine if mine is not None else _default(item, caps, rows=rows))
         if key == "widescreen":
             value = full   # 显示起局真生效的那个值（fullscreen_state，同 launch_env）
         out[key] = dict(available=ok, value=value if ok else _default(item, caps, rows=rows), reason="" if ok else why)
+        if mine is not None and ok:
+            out[key]["recommended"] = True   # 界面写「本款推荐」：值来自逐款缺省表，不是全局缺省
         if key == "language":
             out[key].update(language_state(c, gid, item, out[key]["value"]))
     # 画质提升：标准 / 2D 游戏专用哪款都能用；锐利放大（MetalFX）要走直连。清单明说没走直连的，锐利放大置灰（blocked）、写一句为什么（这一行照样能选另两档）
@@ -667,7 +698,7 @@ def launch_env(c, gid, existing=None):
     elif s.get("fps60") is False:
         env["DM_PRESENT_FI"] = "0"
     # 帧率档位 / 画质 / 渲染分辨率 / 帧率上限 / 档位：选过就写，值等于全局缺省也写（11-27 逐款缺省）——宿主对没选过的项按「逐款缺省 → 定义表缺省」定
-    #   （runtime/src/caps.c s2a_game_defaults_apply，未设才写）。原先只写和全局缺省不同的值：玩家明确选回「标准 / 1× / 不限 / 自动」时不写，
+    #   （runtime/src/gdefaults.c s2a_game_defaults_apply，未设才写）。原先只写和全局缺省不同的值：玩家明确选回「标准 / 1× / 不限 / 自动」时不写，
     #   这一项会被这款的逐款缺省盖掉，玩家的选择不算数
     if "fpsPick" in s:
         env["S2A_FPS_PICK"] = str(s["fpsPick"])   # "0" = 自动（宿主 cpatch.c fps_pick：0 按屏幕挑）
