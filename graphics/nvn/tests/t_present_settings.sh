@@ -109,6 +109,7 @@ on_term() {
     printf '✗ 本测被结束（SIGTERM，多半是门禁步超时）：已跑完 %s 格，用时 %s 秒；正在跑：%s\n' "$cells_done" "$SECONDS" "${name:-还没开始跑格（编译 / 链接阶段）}" >&2
     if [[ -n "$runtime" && -f "$runtime/run.log" ]]; then
         /usr/bin/grep -a '^【卡】' "$runtime/run.log" 2> /dev/null | head -n 3 | cut -c1-600 | sed "s/^/✗ 卡 ${name}｜/" >&2
+        /usr/bin/grep -a '【红】\|\[红\]' "$runtime/run.log" 2> /dev/null | /usr/bin/grep -Fv '【红】地址窗口：读不到本款 main.npdm' | head -n 4 | cut -c1-400 | sed "s/^/✗ 红 ${name}｜/" >&2
         [[ ! -s "$runtime/stuck.sample" ]] || awk "$stuck_awk" "$runtime/stuck.sample" | cut -c1-220 | sed "s/^/✗ 栈 ${name}｜/" >&2
         /usr/bin/grep -av '^\[s2a\] \[心跳\]\|^\[s2a\] \[能耗\]' "$runtime/run.log" 2> /dev/null | tail -n 6 | sed "s/^/✗ 尾 ${name}｜/" >&2
     fi
@@ -177,6 +178,8 @@ for backend in mtl3 mtl4; do
                 #   作为单测（tests/present_settings_test.sh）时 tools/gate.sh 摘 ^(不通|✗) 前 10 行；「FAIL: 」与【红】那几行名额会被编译命令文本占掉
                 printf '✗ %s（exit=%s）\n' "$name" "$status" >&2
                 /usr/bin/grep -a '^【卡】' "$runtime/run.log" 2> /dev/null | head -n 3 | cut -c1-600 | sed "s/^/✗ 卡 ${name}｜/" >&2
+                # 这一格的红行（去掉已知的 npdm 那条）：上屏编码失败、drawable 没呈现等都在这里点名（11-27：门禁树会被复用，整格日志留不住）
+                /usr/bin/grep -a '【红】\|\[红\]' "$runtime/run.log" 2> /dev/null | /usr/bin/grep -Fv '【红】地址窗口：读不到本款 main.npdm' | head -n 4 | cut -c1-400 | sed "s/^/✗ 红 ${name}｜/" >&2
                 [[ ! -s "$runtime/stuck.sample" ]] || awk "$stuck_awk" "$runtime/stuck.sample" | cut -c1-220 | sed "s/^/✗ 栈 ${name}｜/" >&2
                 # 末 6 行去掉每 10 秒一条的心跳 / 能耗（卡死格里它们占满 6 行、把卡住前的最后一步挤掉）
                 /usr/bin/grep -av '^\[s2a\] \[心跳\]\|^\[s2a\] \[能耗\]' "$runtime/run.log" 2> /dev/null | tail -n 6 | sed "s/^/✗ 尾 ${name}｜/" >&2; fi
