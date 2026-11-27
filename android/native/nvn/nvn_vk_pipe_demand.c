@@ -12,7 +12,7 @@
 #include "rp_shader.h"    // rp_shader_prog_borrow/return / struct rp_prog
 #include "nvn_plat.h"     // 已有；nvn_plat_log / nvn_plat_flag
 // 弱链接[pipedemand]：s2a_fu_rt_reset（nvn_first_use.c 提供；android/tools/nvn_vk_pipe_demand_test.sh 不链它）
-// 弱链接[pipedemand]：nvn_vk_pipe_try_cached（backend_vulkan.c 提供；android/tools/nvn_vk_pipe_demand_test.sh 可不链后端）
+// 弱链接[pipedemand,replay]：nvn_vk_pipe_try_cached（backend_vulkan.c 提供；android/tools/nvn_vk_pipe_demand_test.sh 与 nvk_pipe_async_draw_test.sh 可不链后端）
 void s2a_fu_rt_reset(void) __attribute__((weak));   // 首用 fresh/seen 历史清表（nvn_first_use.c；弱引用，宿主缺实现就跳过）
 int nvn_vk_pipe_try_cached(const nvn_gpu_pipe_desc *d, nvn_gpu_pipe *out) __attribute__((weak));
 
