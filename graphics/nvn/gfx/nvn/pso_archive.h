@@ -79,8 +79,8 @@ static void par_check_dead_write(void) {   // 起局（打开归档目录时）�
     if (unlink(path.fileSystemRepresentation) == 0)
         MLOG("【黄】 pipeline archive: removed a .writing marker from an older build (left by any death while writing: a swipe, a memory kill, a suspension kill — not proof of a crash in Metal): writing again; a real crash in the writer is recorded by the crash handler (#756)");
 }
+static _Atomic uint64_t g_par_compiled;   // 真现编的管线条数（不从随包 / 本机归档取；归档关着也计）：加载页剩余时间按它的速率估（loadprog.c）
 static const char *g_par_harvest;                                        // S2A_PSO_HARVEST: the folder the harvest writes into (nvn_pso_harvest); writes at once instead of noting
-static _Atomic uint64_t g_par_compiled;   // 真现编的管线条数（不从随包 / 本机归档取；归档关着也计）：加载页按它分「优化」与「载入中」（loadprog.c）
 static _Atomic uint64_t g_par_hits, g_par_misses, g_par_written, g_par_write_failed, g_par_stale, g_par_ga_removed;
 static _Atomic uint64_t g_par_ser_failed;   // 序列化没成的批（Metal 返回失败；它的 error 不读，见 par_write_batch）
 static __thread int par_write_in_place;                                  // the prewarm's threads: what they compile is noted for writing (par_flush_bg)
