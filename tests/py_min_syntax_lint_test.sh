@@ -35,5 +35,5 @@ ck "② 命中行号 1 2 3 4 6（复用双引号 / 复用单引号 / 反斜杠 /
 ck "③ 好写法不报" '! echo "$o" | grep -q "^good.py"'
 printf 'PYTHON_MINIMUM = (3, 12)\n' > "$T/r/pack/jobs/toolchain.py"
 o=$("$PY" "$H/tools/py_min_syntax_lint.py" "$T/r" bad.py 2>&1); r=$?
-ck "④ 下限改成 3.12：不查、坏夹具也不报（实际 rc=$r：${o:0:200}）" '[ $r = 0 ] && [ -z "$o" ]'
+ck "④ 下限改成 3.12：不查、坏夹具也不报（实际 rc=${r}：${o:0:200}）" '[ $r = 0 ] && [ -z "$o" ]'
 [ $bad = 0 ] && echo "✅ Python 最低版本语法守卫全通" || { echo "🔴 Python 最低版本语法守卫有不通"; exit 1; }
