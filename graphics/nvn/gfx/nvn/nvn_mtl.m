@@ -13165,8 +13165,17 @@ static void pool_seen_word(unsigned i, int recheck, int sg_chg, uint64_t sg) {
         if (!g_treg[id_].view && !tex_get(g_treg[id_].t.serial)) { if (g_walk_req >= POOL_REQ_BYTES) break; }
         g_seen_todo[i] &= ~(1u << b);
         int unmade = !g_treg[id_].view && !tex_get(g_treg[id_].t.serial);
+        int in_left = g_pleft.bits && (g_pleft.bits[(uint32_t)id_ >> 5] >> (id_ & 31) & 1);   // left out by the up-front budget (pool_left_scan's queue) vs never looked up since it registered
+        uint64_t spent = g_walk_spent;
         pool_tex_update(id_, 0); g_pool_upd_seen++;
-        if (unmade && (g_treg[id_].view || tex_get(g_treg[id_].t.serial))) g_pool_seen_late++;
+        if (unmade && (g_treg[id_].view || tex_get(g_treg[id_].t.serial))) {
+            g_pool_seen_late++;
+            // The first cases one by one (#2269): which way each was missed — waiting in the budget queue, or not there (a registration path that never looked it up)
+            if (g_pool_seen_late <= 32) MLOG("pool tables: made only once a shader read the dummy, case %llu: ID %d %ux%u format %#x %llu KB, %s; made this frame so far %llu MB (up-front budget %u MB), frame %llu",
+                (unsigned long long)g_pool_seen_late, id_, g_treg[id_].t.d.width, g_treg[id_].t.d.height, g_treg[id_].t.d.format,
+                (unsigned long long)(pool_tex_size(&g_treg[id_].t) >> 10), in_left ? "waiting in the budget queue" : "not in the budget queue",
+                (unsigned long long)(spent >> 20), POOL_FRAME_BYTES >> 20, (unsigned long long)atomic_load(&g_cur_frame));
+        }
     }
     if (recheck) for (uint32_t bits = g_seen_done[i] & ~g_seen_todo[i]; bits; bits &= bits - 1) {
         int id_ = (int)i * 32 + __builtin_ctz(bits);
