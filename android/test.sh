@@ -26,6 +26,8 @@ elif [ ! "${PY+x}" ]; then
     PY="$HOME/.s2arm/venv/bin/python3"
 fi
 export PY S2A_PY="$PY"
+# 环境下限（bash 5 / Python = PYTHON_MINIMUM，tools/env_floor.sh）：错环境跑出的红是假红，不够就不跑
+source "$repo_dir/tools/env_floor.sh"; s2a_env_floor "$repo_dir" "$PY" || exit 2
 # The platform gate installs this helper; direct test.sh keeps original streams.
 source "$android_dir/tools/gate_step.sh"
 # 子项键（GATE_ONLY=<键…> 只跑这些键的步；门禁里每步都要在表里登记，见 android/tools/gate_keys.tsv）
