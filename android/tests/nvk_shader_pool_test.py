@@ -283,7 +283,7 @@ def main():
              'if (r != SBU_KNOWN) { unknown = 1; by_addr = r == SBU_PSB; }', 'if (r != SBU_KNOWN) { by_addr = r == SBU_PSB; }',
              "gate case 'unaligned storage, program not in library' #0: live compile request carries hasUnalignedStorageBuffer=true"),
             ('ssbo-fill-facts-unrefined',   # 程序身份（fill_facts）不跟新口径、快路摘要跟：身份说非对齐，库件放不出来
-             '    if (un && ssbo_used_slots_on()) {', '    if (un && !count && ssbo_used_slots_on()) {',
+             '    if (un && nst <= RP_PROG_INLINE_STAGES && ssbo_used_slots_on()) {', '    if (un && !count && nst <= RP_PROG_INLINE_STAGES && ssbo_used_slots_on()) {',
              "gate case 'unaligned storage, slot the program does not use': hit from the library"),
             ('ssbo-stages-merged',
              '            else if (used & um[st]) used_unaligned = 1;', '            else if (used & (um[0] | um[1] | um[2])) used_unaligned = 1;',
@@ -298,7 +298,7 @@ def main():
              'sbu_stage_slots(stage_key((unsigned)st), (unsigned)st, q->prim, &used)', 'sbu_stage_slots(stage_key((unsigned)st), 0u, q->prim, &used)',
              "gate case 'unaligned storage, slot the program does not use': hit from the library"),   # 片元段（有非对齐绑定才会被问）当成顶点段去读：stage 对不上 → 说不准 → 被挡下
             ('ssbo-switch-ignored',
-             '    if (un && ssbo_used_slots_on()) {', '    if (un && (ssbo_used_slots_on() || 1)) {',
+             '    if (un && nst <= RP_PROG_INLINE_STAGES && ssbo_used_slots_on()) {', '    if (un && nst <= RP_PROG_INLINE_STAGES && (ssbo_used_slots_on() || 1)) {',
              "gate case 'unaligned storage, switch off' #0: library not used"),
             ('ssbo-default-on',   # 属性没设时读生产缺省（关 = 旧口径，玩家包就是这样）：缺省改回开，「属性没设」那一行放行、命中库而红
              'nvn_plat_flag("nvk_lp_used_slots", 0) != 0', 'nvn_plat_flag("nvk_lp_used_slots", 1) != 0',
