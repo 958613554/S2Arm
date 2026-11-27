@@ -100,6 +100,22 @@ END { flush() }
 # 各格 edge 图跨跑残留：格没跑成时旧图会让 distinctions 假绿——先清
 rm -f "$out"/mtl?-*/edge-*.bgra
 bad=0; unproven=0; unpr=' '
+# 门禁到点（步超时）发 SIGTERM 整组结束时：先把正在跑的那一格的现场写进本步输出（门禁日志收的就是它），再退出。
+#   原先被掐时一行不留——11-26 门禁 5 次 720 秒超时与 1 次 60 秒闹钟真红，前者只剩「0 个步结论」，分不清卡在哪一格还是在排显卡锁。
+#   行首「✗」同红摘要（graphics/gate.sh / tools/gate.sh 摘 ^(✗ |不通 |FAIL)），摘要也能带出来
+cells_done=0; name=''; runtime=''; pid=''
+on_term() {
+    trap - TERM INT
+    printf '✗ 本测被结束（SIGTERM，多半是门禁步超时）：已跑完 %s 格，用时 %s 秒；正在跑：%s\n' "$cells_done" "$SECONDS" "${name:-还没开始跑格（编译 / 链接阶段）}" >&2
+    if [[ -n "$runtime" && -f "$runtime/run.log" ]]; then
+        /usr/bin/grep -a '^【卡】' "$runtime/run.log" 2> /dev/null | head -n 3 | cut -c1-600 | sed "s/^/✗ 卡 ${name}｜/" >&2
+        [[ ! -s "$runtime/stuck.sample" ]] || awk "$stuck_awk" "$runtime/stuck.sample" | cut -c1-220 | sed "s/^/✗ 栈 ${name}｜/" >&2
+        /usr/bin/grep -av '^\[s2a\] \[心跳\]\|^\[s2a\] \[能耗\]' "$runtime/run.log" 2> /dev/null | tail -n 6 | sed "s/^/✗ 尾 ${name}｜/" >&2
+    fi
+    [[ -z "$pid" ]] || kill "$pid" 2> /dev/null
+    exit 143
+}
+trap on_term TERM INT
 for backend in mtl3 mtl4; do
     for aa in None SmaaMedium SmaaHigh; do
         for filter in Nearest Bilinear MetalFX Fsr; do   # Fsr = AMD FSR 1
@@ -152,6 +168,7 @@ for backend in mtl3 mtl4; do
             # raw log; every other red diagnostic still rejects this case.
             if /usr/bin/grep -Ein '^FAIL |command buffer.*error|GPU Address Fault|PageFault|Page Fault|FATAL|failed assertion|Metal Validation Error|\[红\]|【红】' "$runtime/run.log" | \
                 /usr/bin/grep -Fv '【红】地址窗口：读不到本款 main.npdm（可执行文件同目录 / 模块目录），不知道要多大，不占窗口'; then ok=0; fi
+            cells_done=$((cells_done+1))
             /usr/bin/grep -E '^PASS .*coverage|^PASS .*pixel-center|^present settings:' "$runtime/run.log" || true
             if [[ "$ok" == 1 ]]; then printf 'PASS %s\n' "$name"
             else printf 'FAIL %s (exit=%s, log=%s)\n' "$name" "$status" "$runtime/run.log" >&2; bad=$((bad+1))
