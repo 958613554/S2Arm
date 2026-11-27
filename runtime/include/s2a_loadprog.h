@@ -28,6 +28,8 @@ typedef struct {
 void s2a_load_begin(uint64_t now, int first_run);
 // 直连层预热节拍（任意线程，约每 50 ms；开始一次 (0, total)、结束一次 (total, total)）：返回 1 = 现在进游戏、剩下的转后台
 int s2a_load_warm_tick(uint64_t now, long done, long total);
+// 直连层报这一局预热至今「真现编」的管线条数（不是从管线归档 / 随包归档取的；归档关着时每条都算），与节拍一起约每 50 ms 一次：剩余时间只按它的速率估
+void s2a_load_warm_compiled(long n);
 // 首帧上屏（ap_host.c）：阶段 → DONE；预热还在等（OPTIMIZE）时只记首帧已到，预热结束时才 → DONE（直连层先过首帧回调、后在首次提交里等预热）。「本包已完整预热」在收到 (total, total) 时记（首帧前编完或后台编完，直连层保证只发一次）
 void s2a_load_first_frame(uint64_t now);
 // 玩家点了「先开始玩」（主线程）
@@ -41,6 +43,8 @@ void s2a_load_eta_text(int eta_s, char *out, size_t n);
 // 直连层调的入口（画面线 wire-c/warm-progress：开始一次 (0, total)、预热等待循环里周期调、全部编完时 (total, total) 一次，后者可能在后台队列线程）：
 //   只回 0（继续等）/ 1（现在进游戏）；nvn_mtl.m 的弱定义回 -1 = 没链前端、直连层自己兜底。内部取单调时钟转给 s2a_load_warm_tick，加锁极短、不阻塞
 int s2a_front_warm_tick(long done, long total);
+// 直连层调的入口（同 s2a_front_warm_tick 的节拍）：没链前端时 nvn_mtl.m 的弱定义什么都不做
+void s2a_front_warm_compiled(long n);
 // 直连层自己不再等了（清单全部领走、只剩在编的几条；不是这里的节拍说的）：页面转「进入游戏」，首帧已到过就直接收起
 void s2a_front_warm_released(void);
 // 前台激活门（11-19 定因：系统弹框「允许使用无线数据？」「Apple 账户验证」盖在 App 上时，场景一直「前台但未激活」，宿主原先停在「等待前台」，

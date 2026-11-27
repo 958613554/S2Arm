@@ -12,10 +12,12 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static int g_stage, g_first_run, g_go;            // 阶段、首次、为什么不再等
 static _Atomic int g_skip;                        // 玩家点了「先开始玩」
 static int g_ff;                                  // 首帧已到、但预热还在等（页面先不收，预热结束时再收）
-static long g_done, g_total;
+static long g_done, g_total, g_compiled;         // g_compiled：这一局预热真现编的条数（直连层报，s2a_load_warm_compiled）
 static uint64_t g_t0, g_warm_t0, g_last_up;       // 起局、预热开始、已编数最近一次上涨
-static double g_rate;                             // 已编 / 秒，按 1 秒窗口指数平滑
-static uint64_t g_rate_t; static long g_rate_done;
+// 剩余时间只按真现编的速率估（11-27：一款冷首启前 8000 行是管线归档命中、每秒几千行，页面显示「约 11 秒」，后面 3.9 万行真编花了几分钟）：
+//   归档命中段不给数字（「正在估算」），开始真编后按 (总数 − 已编) / 真编速率给；剩下的里还有命中时实际更快，显示值按流逝时间往下走
+static double g_rate;                             // 真现编 / 秒，按 1 秒窗口指数平滑
+static uint64_t g_rate_t; static long g_rate_done;   // 窗口起点与那一刻的真现编数
 static double g_frac;                             // 显示过的最大进度
 static double g_eta_shown = -1; static uint64_t g_eta_t, g_slow_since;   // 显示的剩余秒数、它的时刻、新估计持续偏高的起点
 static char g_pack[24];
@@ -26,13 +28,14 @@ static double env_s(const char *k, double d) { const char *e = getenv(k); double
 void s2a_load_begin(uint64_t now, int first_run) {
     pthread_mutex_lock(&g_mu);
     g_stage = S2A_LOAD_DATA; g_first_run = first_run; g_go = S2A_LOAD_GO_NONE; g_ff = 0; atomic_store(&g_skip, 0);
-    g_done = g_total = 0; g_t0 = now; g_warm_t0 = g_last_up = 0; g_rate = 0; g_rate_t = 0; g_rate_done = 0;
+    g_done = g_total = g_compiled = 0; g_t0 = now; g_warm_t0 = g_last_up = 0; g_rate = 0; g_rate_t = 0; g_rate_done = 0;
     g_frac = 0; g_eta_shown = -1; g_eta_t = g_slow_since = 0;
     pthread_mutex_unlock(&g_mu);
     atomic_store(&g_begun, 1);
 }
 
 void s2a_load_user_skip(void) { atomic_store(&g_skip, 1); }
+void s2a_load_warm_compiled(long n) { pthread_mutex_lock(&g_mu); if (n > g_compiled) g_compiled = n; pthread_mutex_unlock(&g_mu); }
 
 static void mark_warm_done(void);
 int s2a_load_warm_tick(uint64_t now, long done, long total) {
@@ -42,12 +45,12 @@ int s2a_load_warm_tick(uint64_t now, long done, long total) {
     // 已在进游戏 / 页面已收起：后台那次完成通知只记标记，不动阶段。之后的启动放行（GO_LATER）在预热完成前每拍都回 1：直连层开局通告（warm_announce 的 (0, n)）
     //   比首帧前等待（warm_prepare）先发，第一拍已放行，等待里的那几拍也要能看到放行，否则照旧等满全清单
     if (g_stage >= S2A_LOAD_ENTER) { int later = g_go == S2A_LOAD_GO_LATER && done < total; pthread_mutex_unlock(&g_mu); return later; }
-    if (g_stage == S2A_LOAD_DATA) { g_stage = S2A_LOAD_OPTIMIZE; g_warm_t0 = g_last_up = g_rate_t = now; g_rate_done = done; }
+    if (g_stage == S2A_LOAD_DATA) { g_stage = S2A_LOAD_OPTIMIZE; g_warm_t0 = g_last_up = g_rate_t = now; g_rate_done = g_compiled; }
     if (total > 0) g_total = total;
     if (done > g_done) { g_done = done; g_last_up = now; }
-    if (now - g_rate_t >= S) {   // 1 秒窗口的速率，指数平滑（新窗口占 0.3）
-        double r = (double)(g_done - g_rate_done) / ((double)(now - g_rate_t) / S);
-        g_rate = g_rate > 0 ? 0.7 * g_rate + 0.3 * r : r; g_rate_t = now; g_rate_done = g_done;
+    if (now - g_rate_t >= S) {   // 1 秒窗口的真现编速率，指数平滑（新窗口占 0.3）
+        double r = (double)(g_compiled - g_rate_done) / ((double)(now - g_rate_t) / S);
+        g_rate = g_rate > 0 ? 0.7 * g_rate + 0.3 * r : r; g_rate_t = now; g_rate_done = g_compiled;
     }
     int go = 0;
     // 编完按这一 tick 自己的参数判（done ≥ total）：直连层开头的 (0, n) 一定 n > 0（warm_announce / warm_prepare 只在有条目时发），done ≥ total 只出现在完成那一下——
@@ -109,9 +112,9 @@ void s2a_load_snapshot(uint64_t now, s2a_load_view *v) {
              : g_stage == S2A_LOAD_ENTER ? 0.95 : 1.0;
     if (f > g_frac) g_frac = f;
     v->frac = g_frac;
-    // 剩余时间：只在优化画面段、测了 ≥ 2 秒且速率 > 0 时给
+    // 剩余时间：只在优化画面段、测了 ≥ 2 秒、已真现编 ≥ 32 条且真编速率 > 0 时给（归档命中段不给，见 g_rate）
     v->eta_s = -1;
-    if (g_stage == S2A_LOAD_OPTIMIZE && g_rate > 0 && now - g_warm_t0 >= 2 * S && g_total > g_done) {
+    if (g_stage == S2A_LOAD_OPTIMIZE && g_rate > 0 && g_compiled >= 32 && now - g_warm_t0 >= 2 * S && g_total > g_done) {
         double est = (double)(g_total - g_done) / g_rate;
         if (g_eta_shown < 0) g_eta_shown = est;
         else {
@@ -139,6 +142,7 @@ void s2a_load_eta_text(int s, char *out, size_t n) {
 
 // 没有加载页前端（没调过 s2a_load_begin：Mac / 安卓宿主）回 -1：直连层用自己的护栏（DM_PSO_PREPARE_STALL_MS / DM_PSO_PREPARE_MAX_MS），同弱定义
 int s2a_front_warm_tick(long done, long total) { return atomic_load(&g_begun) ? s2a_load_warm_tick(now_ns(), done, total) : -1; }
+void s2a_front_warm_compiled(long n) { if (atomic_load(&g_begun)) s2a_load_warm_compiled(n); }
 void s2a_front_warm_released(void) {
     if (!atomic_load(&g_begun)) return;
     pthread_mutex_lock(&g_mu);

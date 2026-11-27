@@ -13,6 +13,8 @@ static int fails;
     pid_t p = fork(); if (!p) { body; _exit(0); } int st; waitpid(p, &st, 0); \
     if (!WIFEXITED(st) || WEXITSTATUS(st)) { fails++; printf("✗ %s\n", name); } else printf("  ✓ %s\n", name); } while (0)
 static s2a_load_view V(uint64_t t) { s2a_load_view v; s2a_load_snapshot(t, &v); return v; }
+// 全部真编（归档关着 / 没命中）时的一拍：真编数 = 已编数，同直连层 warm_prepare 每拍先报真编数再 tick
+static int TK(uint64_t t, long d, long total) { s2a_load_warm_compiled(d); return s2a_load_warm_tick(t, d, total); }
 static int eq(int s, const char *want) { char b[64]; s2a_load_eta_text(s, b, sizeof b); return !strcmp(b, want); }
 
 #include <pthread.h>
@@ -71,18 +73,18 @@ int main(void) {
         s2a_load_user_skip(); WANT(s2a_load_warm_tick(3 * S, 10, 100) == 1); { s2a_load_view v = V(3 * S); WANT(v.stage == S2A_LOAD_DONE && v.go_reason == S2A_LOAD_GO_USER); } });
     CASE("匀速 100 条 / 秒、共 1000：测满 2 秒前不给剩余时间；3 秒时 7 秒、4 秒时 6 秒", {
         s2a_load_begin(0, 1);
-        for (uint64_t t = 0; t <= 4 * S; t += S / 2) { s2a_load_warm_tick(t, (long)(t / (S / 100)), 1000);
+        for (uint64_t t = 0; t <= 4 * S; t += S / 2) { TK(t, (long)(t / (S / 100)), 1000);
             if (t == S) WANT(V(t).eta_s == -1);
             if (t == 3 * S) WANT(V(t).eta_s == 7);
             if (t == 4 * S) WANT(V(t).eta_s == 6); } });
     CASE("变慢到 10 条 / 秒：头 3 秒显示值只往下走，持续 3 秒后按实测往上修正（≥ 15 秒）", {
         s2a_load_begin(0, 1); int last = -1;
-        for (uint64_t t = 0; t <= 4 * S; t += S / 2) { s2a_load_warm_tick(t, (long)(t / (S / 100)), 1000); last = V(t).eta_s; }
+        for (uint64_t t = 0; t <= 4 * S; t += S / 2) { TK(t, (long)(t / (S / 100)), 1000); last = V(t).eta_s; }
         WANT(last == 6);
         long d = 400;
-        for (uint64_t t = 4 * S + S / 2; t <= 7 * S; t += S / 2) { d += 5; s2a_load_warm_tick(t, d, 1000);
+        for (uint64_t t = 4 * S + S / 2; t <= 7 * S; t += S / 2) { d += 5; TK(t, d, 1000);
             if (t % S == 0) { int e = V(t).eta_s; WANT(e <= last); last = e; } }
-        int up = 0; for (uint64_t t = 7 * S + S / 2; t <= 9 * S; t += S / 2) { d += 5; s2a_load_warm_tick(t, d, 1000); if (t % S == 0 && V(t).eta_s >= 15) up = 1; }
+        int up = 0; for (uint64_t t = 7 * S + S / 2; t <= 9 * S; t += S / 2) { d += 5; TK(t, d, 1000); if (t % S == 0 && V(t).eta_s >= 15) up = 1; }
         WANT(up); });
     CASE("进度只进不退：每 0.5 秒取一次快照，frac 不降；三段边界 5% / 95% / 100%", {
         s2a_load_begin(0, 1); double prev = 0;
@@ -91,7 +93,7 @@ int main(void) {
         WANT(prev > 0.94 && prev <= 0.95); s2a_load_first_frame(14 * S); WANT(V(14 * S).frac == 1.0); });
     CASE("先开始玩一直可点（11-22 #502）：准备数据段不出；优化画面第一 tick 起就出、每 0.5 秒都在（含快编完剩不到 5 秒时）；点了下一次 tick 返回 1、原因 = 玩家；之后按钮收起", {
         s2a_load_begin(0, 1); WANT(!V(0).can_skip);
-        for (uint64_t t = 0; t <= 10 * S; t += S / 2) { s2a_load_warm_tick(t, (long)(t / (S / 95)), 1000); WANT(V(t).can_skip); }   // 95 条 / 秒，10 秒时剩 50 条
+        for (uint64_t t = 0; t <= 10 * S; t += S / 2) { TK(t, (long)(t / (S / 95)), 1000); WANT(V(t).can_skip); }   // 95 条 / 秒，10 秒时剩 50 条
         WANT(V(10 * S).eta_s < 5 && V(10 * S).can_skip);
         s2a_load_user_skip(); WANT(s2a_load_warm_tick(10 * S + S / 20, 950, 1000) == 1);
         { s2a_load_view v = V(11 * S); WANT(v.go_reason == S2A_LOAD_GO_USER && v.stage == S2A_LOAD_ENTER && !v.can_skip); } });
@@ -108,9 +110,16 @@ int main(void) {
         WANT(!r); unsetenv("DM_PSO_PREPARE_MAX_MS"); });
     CASE("剩余时间按已编 / 总数和速率估、不再按上限封顶（11-22 #502）：10 条 / 秒、共 100000 条，第 10 秒剩 99900 条 → 9990 秒、第 20 秒 → 9980 秒（±1 秒取整）", {
         s2a_load_begin(0, 1); int e10 = -9; int e20 = -9;
-        for (uint64_t t = 0; t <= 20 * S; t += S / 2) { s2a_load_warm_tick(t, (long)(t / (S / 10)), 100000);
+        for (uint64_t t = 0; t <= 20 * S; t += S / 2) { TK(t, (long)(t / (S / 10)), 100000);
             if (t == 10 * S) e10 = V(t).eta_s; if (t == 20 * S) e20 = V(t).eta_s; }
         WANT(e10 >= 9989 && e10 <= 9991); WANT(e20 >= 9979 && e20 <= 9981); });
+    CASE("剩余时间只按真编速率（11-27 冷首启：前 8000 行归档命中、页面显示「约 11 秒」）：共 47385 行，前 2 秒归档命中 4000 行 / 秒、真编 0 → 不给（-1）；之后真编 100 条 / 秒 → 第 4 秒剩 39185 行 ≈ 392 秒", {
+        s2a_load_begin(0, 1); long done = 0; long comp = 0; int e2 = -9; int e4 = -9;
+        for (uint64_t t = 0; t <= 4 * S; t += S / 2) {
+            if (t > 0 && t <= 2 * S) done += 2000; else if (t > 2 * S) { done += 50; comp += 50; }
+            s2a_load_warm_compiled(comp); s2a_load_warm_tick(t, done, 47385);
+            if (t == 2 * S) e2 = V(t).eta_s; if (t == 4 * S) e4 = V(t).eta_s; }
+        WANT(e2 == -1); WANT(e4 >= 391 && e4 <= 393); });
     CASE("全部编完才进游戏：记下本包已完整预热，同包之后 = 非首次、换包 = 首次", {
         WANT(s2a_load_first_run("aaaa"));
         s2a_load_begin(0, 1); s2a_load_warm_tick(0, 0, 10); WANT(s2a_load_warm_tick(S, 10, 10) == 0); s2a_load_first_frame(2 * S);
