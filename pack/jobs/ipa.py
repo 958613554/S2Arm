@@ -538,7 +538,7 @@ def adopt_product(c):
     tmp = image / (layout.IOS_PACK + ".adopt")
     if tmp.exists():
         _rm(c, layout.root_of(c, gid), tmp)
-    # 逐个文件克隆进这款文件夹（core.clone：同一 APFS 卷 clonefile 不另占盘，跨卷 / Windows 退回普通复制），再同卷换（_swap_pack 用 os.replace）。
+    # 逐个文件克隆进这款文件夹（core.clone：同一 APFS 卷 clonefile 不另占盘，跨卷 / Windows 退回普通复制），再同卷换（_swap_pack 目录改名，带退避重试）。
     #   原先整份 copytree：测试链每台设备每款都多一整份资源包（11-19 一款大型开放世界游戏一份 17 GB，把内置盘写满）
     from core import clone
     shutil.copytree(src, tmp, copy_function=lambda s, d: clone(s, d))
@@ -557,9 +557,10 @@ def _swap_pack(c, gid, pack_dir, want):
     dest, old = image / layout.IOS_PACK, image / (layout.IOS_PACK + ".old")
     if old.exists():
         _rm(c, managed, old)
+    from programs import _rename_dir   # 目录改名按 #361 同一套退避重试（Windows 上杀软 / 资源管理器开着刚写完的文件时报 WinError 5 / 32，扫完会放开；#2292 这里原先一次被拒整单失败）
     if dest.exists():
-        os.replace(dest, old)
-    os.replace(pack_dir, dest)   # 同一款文件夹内改名（build/ios → image/ios）
+        _rename_dir(c, dest, old)
+    _rename_dir(c, pack_dir, dest)   # 同一款文件夹内改名（build/ios → image/ios）
     layout.hide(dest)
     if old.exists():
         _rm(c, managed, old)
