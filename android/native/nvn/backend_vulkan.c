@@ -366,6 +366,7 @@ struct nvn_gpu_cmd_s {
     uint32_t pass_cfmt[8], pass_dsfmt, pass_samples;   // 当前通道各槽的 NVN 格式（空位 0）、深度模板格式、采样数（带掩码的清除建管线用）
     VkImageAspectFlags pass_ds_aspect;       // 当前通道深度模板附件有的面（0 = 没有该附件）
     VkQueryPool report_ts;
+    int report_ts_host_reset;                // 1 = report_ts 已在创建时经 VK_EXT_host_query_reset 主机重置（提交时免 init_cb 与全管线屏障）
     uint64_t report_used, report_begin_ns;
     uint32_t report_count;
     VkQueryPool tsq;                         // 调试读数 nvk_gputime：段首尾各一个 GPU 时间戳，后面每个通道首尾各一个（没开就是空）
@@ -475,6 +476,7 @@ struct nvn_gpu_vk {
     _Atomic uint64_t cold_attempts, cold_armed, cold_pairs;
     _Atomic uint32_t cold_present_count;
     PFN_vkGetCalibratedTimestampsKHR report_calibrate;
+    PFN_vkResetQueryPoolEXT host_query_reset; // VK_EXT_host_query_reset 主机侧查询池重置入口（NULL = 退回 vkCmdResetQueryPool）
     uint32_t report_bits;
     float report_period;
     int64_t report_corr_ticks;   // 自校修正（计数）：驱动校准对的 DEVICE 值与查询计数器零点不一致时从校准 GPU 值里减掉（见 report_self_calibrate）
@@ -1574,6 +1576,19 @@ static int report_calibration(uint64_t t[2], uint64_t *deviation) {
     return g.report_calibrate && g.report_calibrate(g.d, 2, info, t, deviation) == VK_SUCCESS;
 }
 
+// VK_EXT_host_query_reset 读数与统一重置入口：启用时直接在主机侧重置查询池（免去命令缓冲内 vkCmdResetQueryPool），
+// 缺失扩展/特性/入口或关闭开关时退回命令缓冲重置。调用前须保证池中查询未在 GPU 上执行（新建或已等完栅栏）。
+static uint64_t g_hqr_host_resets, g_hqr_cmd_resets, g_hqr_init_cb_saved;
+static void query_pool_reset(VkCommandBuffer cb, VkQueryPool pool, uint32_t first, uint32_t count) {
+    if (g.host_query_reset) {
+        g.host_query_reset(g.d, pool, first, count);
+        __atomic_fetch_add(&g_hqr_host_resets, 1, __ATOMIC_RELAXED);
+    } else {
+        vkCmdResetQueryPool(cb, pool, first, count);
+        __atomic_fetch_add(&g_hqr_cmd_resets, 1, __ATOMIC_RELAXED);
+    }
+}
+
 // 报告时间戳自校（11-19，Adreno 830 驱动 0x80320049 实测）：vkGetCalibratedTimestamps 的 DEVICE 值与 vkCmdWriteTimestamp 写出的
 // 计数零点差一个常数（7318 万计数 ≈ 3.81 秒），按驱动校准对换算的每个样本都落在录制窗口之前，回放层全部记 timestamp result_unavailable。
 // 这里提交一笔只写一个时间戳的探针段，提交前 / 完成后的主机时刻框住样本，取窗口中点与驱动换算之差当修正（连采 3 次取窗口最小的）。
@@ -1594,7 +1609,7 @@ static void report_self_calibrate(void) {
     for (int i = 0; i < 3; i++) {
         VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if (vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) break;
-        vkCmdResetQueryPool(cb, qp, 0, 1);
+        query_pool_reset(cb, qp, 0, 1);
         vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 0);
         if (vkEndCommandBuffer(cb) != VK_SUCCESS) break;
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
@@ -2551,6 +2566,11 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     memset(g_deswizzle_reasons, 0, sizeof g_deswizzle_reasons);
     if (nvn_plat_flag("nvk_gpu_deswizzle", 1) && !deswizzle_open())
         nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", "【红】GPU 解排不可用，本局采用 CPU 解排");
+    __atomic_store_n(&g_hqr_host_resets, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_hqr_cmd_resets, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_hqr_init_cb_saved, 0, __ATOMIC_RELAXED);
+    g.host_query_reset = (dev->host_query_reset_enabled && dev->reset_query_pool &&
+                          nvn_plat_flag("nvk_host_query_reset", 1) != 0) ? dev->reset_query_pool : NULL;
     bc_time_open();
     report_timestamp_open();
     fill_caps(&g, d);
@@ -6093,7 +6113,7 @@ static int occl_spare_reserve(struct nvn_gpu_cmd_s *c, int32_t slot, struct occl
 }
 // 通道外（旧通道已结束、新通道还没开）：新要的块整块重置（重置只能在通道外；块里的槽用之前都在重置态，一块只重置这一次）。
 static void occl_spare_reset(struct nvn_gpu_cmd_s *c, const struct occl_cont *k) {
-    if (k->fresh) vkCmdResetQueryPool(c->cb, k->pool, 0, OCC_CHUNK);
+    if (k->fresh) query_pool_reset(c->cb, k->pool, 0, OCC_CHUNK);
 }
 // 新通道里：在预留好的续段槽上接着数，活动查询改指它（之后 end / pass_end 结束的就是这个槽）。
 // 续段真正开出的次数（进程累计，nvn_gpu_stats 的 occl_cont_used）：没出错不等于续段走到了，真机读数要能直接看到它被用过。
@@ -8837,6 +8857,11 @@ void nvn_gpu_timestamp(nvn_gpu_cmd ch, uint32_t slot, uint32_t type) {
             .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = NVN_GPU_TIMESTAMP_SLOTS };
         VkResult r = vkCreateQueryPool(g.d, &qi, NULL, &c->report_ts);
         if (r != VK_SUCCESS) { set_sticky(c, NVN_GPU_E_DEVICE, "时间戳：查询池创建失败 (%d)", r); return; }
+        if (g.host_query_reset) {
+            g.host_query_reset(g.d, c->report_ts, 0, NVN_GPU_TIMESTAMP_SLOTS);
+            c->report_ts_host_reset = 1;
+            __atomic_fetch_add(&g_hqr_host_resets, 1, __ATOMIC_RELAXED);
+        }
         c->report_begin_ns = now_ns();
     }
     vkCmdWriteTimestamp(c->cb, type == NVN_COUNTER_TYPE_TIMESTAMP_TOP ?
@@ -8912,11 +8937,11 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
         VkQueryPoolCreateInfo qi; memset(&qi, 0, sizeof qi);
         qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO; qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = 2 + 2 * TS_PASS_MAX;
         if (on && vkCreateQueryPool(g.d, &qi, NULL, &c->tsq) == VK_SUCCESS) {
-            vkCmdResetQueryPool(c->cb, c->tsq, 0, 2 + 2 * TS_PASS_MAX);
+            query_pool_reset(c->cb, c->tsq, 0, 2 + 2 * TS_PASS_MAX);
             vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c->tsq, 0);
         } else c->tsq = VK_NULL_HANDLE;
     }
-    if (d && d->occlusion_slots) {   // 查询池：整池重置只能在通道外，放在段的最开头
+    if (d && d->occlusion_slots) {   // 查询池：整池重置只能在通道外，放在段的最开头（开 host_query_reset 时直接主机重置）
         VkQueryPoolCreateInfo qi; memset(&qi, 0, sizeof qi);
         qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO; qi.queryType = VK_QUERY_TYPE_OCCLUSION; qi.queryCount = d->occlusion_slots;
         c->q_used = calloc(d->occlusion_slots, 1);
@@ -8926,7 +8951,7 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
             return fail(err, NVN_GPU_E_OOM, "遮挡查询池（%u 槽）创建失败", d->occlusion_slots);
         }
         c->qcount = d->occlusion_slots;
-        vkCmdResetQueryPool(c->cb, c->qpool, 0, c->qcount);
+        query_pool_reset(c->cb, c->qpool, 0, c->qcount);
     }
     pthread_mutex_lock(&g_mu);
     if (g.closing) {
@@ -9010,7 +9035,10 @@ static uint32_t submit_cbs(struct nvn_gpu_cmd_s *c, VkCommandBuffer cbs[2]) {
         g_newimg_n = 0;
     }
     pthread_mutex_unlock(&g_mu);
-    if (!n && !c->report_ts) { cbs[0] = c->cb; return 1; }
+    const int need_ts_reset = c->report_ts && !c->report_ts_host_reset;
+    if (c->report_ts && c->report_ts_host_reset)
+        __atomic_fetch_add(&g_hqr_init_cb_saved, 1, __ATOMIC_RELAXED);
+    if (!n && !need_ts_reset) { cbs[0] = c->cb; return 1; }
     c->newimg = v; c->n_newimg = n;
     VkCommandBufferAllocateInfo ai;
     memset(&ai, 0, sizeof ai);
@@ -9024,9 +9052,10 @@ static uint32_t submit_cbs(struct nvn_gpu_cmd_s *c, VkCommandBuffer cbs[2]) {
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(c->init_cb, &bi) != VK_SUCCESS) return 0;
-    // 首次报告可能在 render pass 内；reset 必须在独立前置缓冲中，不能打断通道。
-    if (c->report_ts) {
+    // 首次报告可能在 render pass 内；未启用 host_query_reset 时，reset 必须在独立前置缓冲中，不能打断通道。
+    if (need_ts_reset) {
         vkCmdResetQueryPool(c->init_cb, c->report_ts, 0, NVN_GPU_TIMESTAMP_SLOTS);
+        __atomic_fetch_add(&g_hqr_cmd_resets, 1, __ATOMIC_RELAXED);
         vkCmdPipelineBarrier(c->init_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 0, NULL);
     }
@@ -9287,6 +9316,9 @@ void nvn_gpu_stats(nvn_gpu_stat_fn fn, void *user, int take) {
     fn(user, "pipe_warm_hits", __atomic_load_n(&g_warm_hits, __ATOMIC_RELAXED));         // 真实 draw 第一次拿到预建对象的次数
     fn(user, "pipe_install_dup", __atomic_load_n(&g_pipe_dup, __ATOMIC_RELAXED));
     fn(user, "occl_cont_used", __atomic_load_n(&g_occl_cont_used, __ATOMIC_RELAXED));   // 遮挡查询续段开出次数（进程累计，不随会话清零）        // 双检抓到「别人已经装过同配方」的次数（新建那份已销毁）
+    fn(user, "query_host_resets", __atomic_load_n(&g_hqr_host_resets, __ATOMIC_RELAXED));
+    fn(user, "query_cmd_resets", __atomic_load_n(&g_hqr_cmd_resets, __ATOMIC_RELAXED));
+    fn(user, "query_init_cb_saved", __atomic_load_n(&g_hqr_init_cb_saved, __ATOMIC_RELAXED));
     {   // 在途表读数来自 nvn_pipe_flight（模块内计数）：合并等待 / 表满自己建 / 认领后复检命中 / 已发布 / 失败
         uint64_t pw = 0, pf = 0, pl = 0, pp = 0, pfail = 0;
         nvk_pf_stats(&g_pi, &pw, &pf, &pl, &pp, &pfail);
