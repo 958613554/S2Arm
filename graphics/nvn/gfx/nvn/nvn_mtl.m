@@ -8997,6 +8997,9 @@ static int shlib_dropped(const char *name) {
 static inline int shader_fragz_from_json(NSDictionary *j, int fragc) {
     return j[@"frag_z"] ? [j[@"frag_z"] boolValue] : fragc;   // packages predating FragZ omit frag_z and fall back to frag_coord
 }
+// 弱链接[nvntest]：dm_shader_pkg_retrans（host/dsh_miss.inc 提供；图形单测不链宿主）
+extern int dm_shader_pkg_retrans(const char *k16, int nvn_stage) __attribute__((weak));
+static int fb_loadable(NSString *pc);
 static NvShader *shader_build(NSString *pc, int stage, int layer, int depth_zero) {
     NSError *e = nil; NSString *mnote = nil, *msrc = nil;   // #065090 msl_note
     // S2Arm: a key missing from the library is looked up in DM_MSL_FALLBACK (the on-device fallback translation writes <key>_b.metal + .json there; iOS cannot store a metallib built at runtime)
@@ -9054,7 +9057,26 @@ static NvShader *shader_build(NSString *pc, int stage, int layer, int depth_zero
     o->fnpfx = [j[@"fn_prefix"] isKindOfClass:[NSString class]] ? j[@"fn_prefix"] : @"";
     if (stage == 0 && [j[@"layer_from"] isKindOfClass:[NSDictionary class]]) { o->lay_loc = [j[@"layer_from"][@"loc"] intValue]; o->lay_comp = [[j[@"layer_from"][@"comp"] description] UTF8String][0]; }
     char err[160];
-    if (nvn_refl_from_json(j, &o->rf, err, sizeof err)) { MLOG("【红】 shader %s reflection conversion failed: %s", pc.UTF8String, err); return nil; }
+    if (nvn_refl_from_json(j, &o->rf, err, sizeof err)) {
+        // Packaged bundle built with an older translator (e.g., pool-image names before 544a7af93): retranslate once from LP_K_GUEST into DM_MSL_FALLBACK when possible
+        if (dir == g_msl_dir && !fb_json_current(j) && fb && *fb && pc.length >= 16 &&
+            (fb_loadable(pc) || (dm_shader_pkg_retrans && dm_shader_pkg_retrans([pc substringToIndex:16].UTF8String, stage)))) {
+            NSString *fd = @(fb);
+            NSData *fjd = [NSData dataWithContentsOfFile:[NSString stringWithFormat:@"%@/%@.json", fd, pc]];
+            NSDictionary *fj = fjd ? [NSJSONSerialization JSONObjectWithData:fjd options:0 error:nil] : nil;
+            NSString *sp = [NSString stringWithFormat:@"%@/%@.metal", fd, pc];
+            NSString *src = [NSString stringWithContentsOfFile:sp encoding:NSUTF8StringEncoding error:&e];
+            id<MTLLibrary> flib = src ? [g_dev newLibraryWithSource:src options:dm_msl_opts() error:&e] : nil;
+            if ([fj isKindOfClass:[NSDictionary class]] && fb_json_current(fj) && flib && !nvn_refl_from_json(fj, &o->rf, err, sizeof err)) {
+                j = fj; lib = flib; dir = fd; o->pkg_lib = 0; o->pkg_oldx = 0;
+                o->mslnote = msl_note(pc, src); o->mslsrc = sp;
+                o->fnpfx = [j[@"fn_prefix"] isKindOfClass:[NSString class]] ? j[@"fn_prefix"] : @"";
+                o->lay_loc = -1; o->lay_comp = 0;
+                if (stage == 0 && [j[@"layer_from"] isKindOfClass:[NSDictionary class]]) { o->lay_loc = [j[@"layer_from"][@"loc"] intValue]; o->lay_comp = [[j[@"layer_from"][@"comp"] description] UTF8String][0]; }
+                MLOG("shader %s: packaged reflection rejected (%s), retranslated from guest input with current host translator", pc.UTF8String, err);
+            } else { MLOG("【红】 shader %s reflection conversion failed: %s", pc.UTF8String, err); return nil; }
+        } else { MLOG("【红】 shader %s reflection conversion failed: %s", pc.UTF8String, err); return nil; }
+    }
     if (o->rf.drv_unfilled) MLOG("【黄】 shader %s %s; used anyway", pc.UTF8String, err);   // nvn_refl.h drv_unfilled
     if (o->rf.dyn && !DM_GAME_TEX_DYN_SLOTS) {   // dynamic texture handles (TEXD / SAMPD) only where the profile says the game picks them from c2's tables, as before otherwise
         // (rf.c1 is freed by dealloc when o goes: freeing it here too was a double free, which aborted FINAL FANTASY RESONANCE at its first such shader)
@@ -10180,6 +10202,11 @@ static void *tex_by_id_ptr(int tid) {   // Caller holds g_rmu
     // A texture built in stencil mode (nvnTextureBuilderSetDepthStencilMode, Unreal Engine 4.27's stencil shader resources) reads stencil the same way unless a view sets the mode
     int want_st = r.has_v && r.v.set_dsmode ? r.v.dsmode == NVN_TEXTURE_DEPTH_STENCIL_MODE_STENCIL : r.t.stencil;
     int stv = want_st && base.pixelFormat == MTLPixelFormatDepth32Float_Stencil8;
+    // Metal's X32_Stencil8 with identity swizzle reads (stencil, 0, 0, 1); replicate stencil into all 4 channels (R, R, R, R) unless the texture or view explicitly set a swizzle (UE4 CustomStencil reads .g)
+    if (stv && !(r.has_v && r.v.set_swizzle) && !r.t.set_swz) {
+        for (int c = 0; c < 4; c++) sw[c] = MTLTextureSwizzleRed;
+        need_sw = 1;
+    }
     if (want_st && !stv)
         RED_ONCE(104, "stencil-mode texture view of Metal format %lu (texture ID %d): no stencil-only view, depth is read", (unsigned long)base.pixelFormat, tid);
     if ((r.has_v && (r.v.set_format || r.v.set_levels || r.v.set_layers || r.v.set_target)) || need_sw || stv) {
@@ -17486,12 +17513,12 @@ static void fb_report(uint64_t frame) {   // every 300 frames: hits per layer an
 // #387 the depth snapshot of the pass's own depth attachment, kept while that depth stays unchanged: draws after the first that sample it read the same copy (one copy and
 //   one pass break for a run of halo draws instead of one per draw). It goes stale when the depth or stencil may change: a draw writing depth or stencil to it, a depth / stencil
 //   clear, a render-target change, a copy or buffer clear (storage may alias) and a new submission. Own storage (dsnap_storage), not fb_snap_shape's slots that other copies reuse in place
-static struct { uint64_t ser; const void *mem; uint64_t size; __unsafe_unretained id<MTLTexture> src, base; __strong id<MTLTexture> use; int valid, stencil; } g_dsnap;   // stencil: the copy is read through a stencil view
+static struct { uint64_t ser, dser; const void *mem; uint64_t size; __unsafe_unretained id<MTLTexture> src, base; __strong id<MTLTexture> use; int valid, stencil; } g_dsnap;   // stencil: the copy is read through a stencil view
 static void dsnap_stale(void) { g_dsnap.valid = 0; }
 static int dsnap_hits_tex(const tex_t *t) {
     if (!g_dsnap.valid) return 0;
     if (!t) return 1;
-    if (t->serial == g_dsnap.ser) return 1;
+    if (t->serial == g_dsnap.ser || (g_dsnap.dser && t->serial == g_dsnap.dser)) return 1;
     if (g_dsnap.mem && t->mem && g_dsnap.size && t->L.size) {
         uintptr_t a = (uintptr_t)g_dsnap.mem, b = (uintptr_t)t->mem;
         if (a < b + t->L.size && b < a + g_dsnap.size) return 1;
@@ -17609,7 +17636,7 @@ static void fb_prepare_depth_tid(int tid, uint64_t ser, NvShader *fs, int reg, i
     if (!use) { RED_ONCE(180, "same-pass depth sampling: cannot create the snapshot view (format %lu); left as is", (unsigned long)t.pixelFormat); return; }
     if (g_fb_use[g_fb_n] && g_fb_use[g_fb_n] != use) defer_obj_unref(g_fb_use[g_fb_n]);
     g_fb_src[g_fb_n] = t; g_fb_use[g_fb_n] = use; g_fb_rid[g_fb_n] = use.gpuResourceID._impl; g_fb_n++; g_fb_hits++; g_fb_count++; g_fb_depth++;
-    g_dsnap.ser = ser; g_dsnap.mem = R.rt.depth->mem; g_dsnap.size = R.rt.depth->L.size; g_dsnap.src = t; g_dsnap.base = base; g_dsnap.use = use; g_dsnap.valid = 1;
+    g_dsnap.ser = ser; g_dsnap.dser = R.rt.depth ? R.rt.depth->serial : 0; g_dsnap.mem = R.rt.depth->mem; g_dsnap.size = R.rt.depth->L.size; g_dsnap.src = t; g_dsnap.base = base; g_dsnap.use = use; g_dsnap.valid = 1;
     { MTLPixelFormat vf = use.pixelFormat; g_dsnap.stencil = vf == MTLPixelFormatStencil8 || vf == MTLPixelFormatX32_Stencil8
 #if TARGET_OS_OSX
         || vf == MTLPixelFormatX24_Stencil8
@@ -17619,19 +17646,35 @@ static void fb_prepare_depth_tid(int tid, uint64_t ser, NvShader *fs, int reg, i
         (unsigned long long)g_draw_seq, fs->key, (unsigned long long)ser, (unsigned long)base.width, (unsigned long)base.height, (unsigned long)base.pixelFormat, (unsigned long long)g_fb_depth);
     PD("N %llu same-pass depth sampling: depth attachment ser=%llu sampled at slot %d; the pass ends and this draw reads a copy", g_stat_pass, (unsigned long long)ser, reg);
 }
+static int fb_depth_alias_match(int tid, uint64_t ser, const alias_key *sampled) {
+    const tex_t *datt = R.rt.depth;
+    if (!datt) return 0;
+    if (datt->serial == ser) return 1;
+    if (!sampled->pool || sampled->pool != (uint64_t)(uintptr_t)datt->pool || sampled->off != datt->off) return 0;
+    alias_key dak; alias_key_of(&dak, datt);
+    if (memcmp(sampled, &dak, sizeof dak)) return 0;
+    id<MTLTexture> ds = tex_mtl(datt);
+    os_unfair_lock_lock(&g_rmu); void *tv = NULL; tex_fast_rid(tid, &tv); id<MTLTexture> t = (__bridge id<MTLTexture>)tv; os_unfair_lock_unlock(&g_rmu);
+    return ds && t && (ds.parentTexture ?: ds) == (t.parentTexture ?: t);
+}
 static void fb_prepare(NvProg *pr) {
     g_draw_seq++; g_fb_n = 0; g_fbt.on = 0; g_fbt.fn = nil; g_fb_want_load = 0;
     {   // a draw that may write depth / stencil changes what the copy holds: stale before it (its own sampling copies the depth as it is) and after it (its writes land after its reads)
-        static uint64_t after_ser; if (after_ser) { if (g_dsnap.valid && g_dsnap.ser == after_ser) dsnap_stale(); after_ser = 0; }
+        static uint64_t after_ser; static int after_dw;
+        static int strict = -1; if (strict < 0) strict = getenv("DM_NVN_DSNAP_STRICT") != NULL;
+        if (after_ser) { if (g_dsnap.valid && (g_dsnap.ser == after_ser || g_dsnap.dser == after_ser) && (after_dw || g_dsnap.stencil || strict)) dsnap_stale(); after_ser = 0; after_dw = 0; }
         // Stencil writes only matter to a copy read through a stencil view: the copy is a separate texture, and a depth view of it holds the depth plane, which a
         //   stencil write does not touch (a deferred lighting pass draws one light volume per draw with stencil test on and depth writes off, each sampling the depth:
         //   staling on any stencil write mask ended the pass and copied the whole depth for every light, 139 times a frame in one title). Writes are counted as the
         //   stencil ops really writing (sd_note's wwhy 5: a write mask and an op other than KEEP). DM_NVN_DSNAP_STRICT=1: the old rule (any stencil write mask)
-        static int strict = -1; if (strict < 0) strict = getenv("DM_NVN_DSNAP_STRICT") != NULL;
+        int dw = S.ds.dt && S.ds.dw;
         int wst = S.ds.st && (S.st_wmask[0] || S.st_wmask[1]) && (strict
             || S.ds.fail_f != NVN_STENCIL_OP_KEEP || S.ds.zfail_f != NVN_STENCIL_OP_KEEP || S.ds.zpass_f != NVN_STENCIL_OP_KEEP
             || S.ds.fail_b != NVN_STENCIL_OP_KEEP || S.ds.zfail_b != NVN_STENCIL_OP_KEEP || S.ds.zpass_b != NVN_STENCIL_OP_KEEP);
-        if (R.rt.depth && ((S.ds.dt && S.ds.dw) || (wst && (strict || g_dsnap.stencil)))) { dsnap_stale_tex(R.rt.depth); after_ser = R.rt.depth->serial; } }
+        if (R.rt.depth && (dw || wst)) {
+            if (dw || strict || g_dsnap.stencil) dsnap_stale_tex(R.rt.depth);
+            after_ser = R.rt.depth->serial; after_dw = dw;
+        } }
     if (!g_enc) memset(g_fb_dirty, 0, sizeof g_fb_dirty);   // no pass open: the last one ended and its writes are in memory (g_fb_dirty is only reset when a pass opens; a stale 1 sent the first self-sampling draw of the next pass to ④)
     if (g_fbc.forcing) { g_fbt.on = 1; memcpy(g_fbt.fx, g_fbc.fx, sizeof g_fbt.fx); g_fbt.fbmask = g_fbc.fbmask; memcpy(g_fbt.lmap, g_fbc.lmap, 8); g_fbt.fn = g_fbc.fn; return; }   // 双画检查的第二遍：强制 ⑤
     if (g_fb_rebind) { args_dirty_all(); g_fb_rebind = 0; }   // the previous draw had a substituted binding: re-encode with the original bindings this time
@@ -17642,15 +17685,16 @@ static void fb_prepare(NvProg *pr) {
     if (fs->fb_tex != 2) return;
     // Fast single-lock pre-scan: take g_rmu ONCE per draw (instead of once per texture binding) and only compute alias_key_of when a bound texture actually shares a serial or (pool, off) with a current attachment.
     struct { int idx, tid; uint64_t ser; alias_key sampled; } hits[32]; int nhits = 0;
-    uint64_t dser = R.rt.depth ? R.rt.depth->serial : 0;
+    const tex_t *datt = R.rt.depth; uint64_t dser = datt ? datt->serial : 0;
+    uint64_t dp = datt ? (uint64_t)(uintptr_t)datt->pool : 0, dof = datt ? datt->off : 0;
     os_unfair_lock_lock(&g_rmu);
     for (int i = 0; i < fs->rf.nb && nhits < 32; i++) { const nvn_rbind *b = &fs->rf.b[i]; if (b->kind != NVN_RB_TEX || b->reg >= NTEX) continue;
         int tid = (int)(tex_slot_h(S.tex[1], S.img[1], b->reg) & 0xfffff);
         if (tid < 0 || tid >= g_ntreg || !g_treg[tid].ok) continue;
         const tex_t *st = &g_treg[tid].t; uint64_t ser = st->serial; if (!ser) continue;
-        int match = (dser && dser == ser);
+        uint64_t sp = (uint64_t)(uintptr_t)st->pool, so = st->off;
+        int match = (dser && (dser == ser || (dp && dp == sp && dof == so)));
         if (!match) {
-            uint64_t sp = (uint64_t)(uintptr_t)st->pool, so = st->off;
             for (int k = 0; k < R.rt.n && k < 8; k++) { const tex_t *att = R.rt.color[k]; if (!att) continue;
                 if (att->serial == ser || (sp && sp == (uint64_t)(uintptr_t)att->pool && so == att->off)) { match = 1; break; } }
         }
@@ -17663,17 +17707,17 @@ static void fb_prepare(NvProg *pr) {
     id<MTLTexture> cbase[4] = {nil}, csnap[4] = {nil}; NSUInteger ckey[4][4]; int ncopy = 0, settled = 0;   // ④ copies of this draw by real subresource (base, levels, slices); clears landed
     // Bindless textures in a uniform buffer are absent from the slot table.
     // Resolve the same IDs encode_args will bind, and isolate the pass depth.
-    if (R.rt.depth) for (int i = 0; i < fs->rf.nb && g_fb_n < 4; i++) {
+    if (datt) for (int i = 0; i < fs->rf.nb && g_fb_n < 4; i++) {
         const nvn_rbind *b = &fs->rf.b[i]; if (b->kind != NVN_RB_TEXU) continue;
         int n = b->n ? b->n : 1;
         for (int k = 0; k < n && g_fb_n < 4; k++) {
             uint32_t h = b->n ? ubo_handle(1, b->reg, 8 * k) : ubo_packed(1, b);
             if (g_handle_read_failed) break;
-            int tid = ubo_tex_id(h); uint64_t ser = 0;
+            int tid = ubo_tex_id(h); uint64_t ser = 0; alias_key sampled; int ok = 0;
             os_unfair_lock_lock(&g_rmu);
-            if (tid >= 0 && tid < g_ntreg && g_treg[tid].ok) ser = g_treg[tid].t.serial;
+            if (tid >= 0 && tid < g_ntreg && g_treg[tid].ok) { ser = g_treg[tid].t.serial; alias_key_of(&sampled, &g_treg[tid].t); ok = 1; }
             os_unfair_lock_unlock(&g_rmu);
-            if (ser && R.rt.depth->serial == ser) fb_prepare_depth_tid(tid, ser, fs, b->reg, &settled);
+            if (ser && ok && fb_depth_alias_match(tid, ser, &sampled)) fb_prepare_depth_tid(tid, ser, fs, b->reg, &settled);
         }
     }
     // 贴图槽表是 0..NTEX-1（256）：原先只查 128 号以下，从 128 号以上读自己附件的绘制（#839：一款动作游戏的 FXAA 从 128 号槽读正在写的场景图）不换快照、原地边读边写，
@@ -17684,7 +17728,7 @@ static void fb_prepare(NvProg *pr) {
         //   Metal leaves sampling a texture that is an attachment of the open pass undefined: a long pass stores tiles back mid-pass (partial renders) while later draws read them.
         //   The colour checks below never looked at the depth attachment, so these draws read it in place (Diablo III's street-lamp halos, 1600x900 Depth32Float_Stencil8:
         //   tile-shaped black blocks that moved between replays, gone once the pass was split). Same as a colour attachment's snapshot: end the pass, copy the sampled view, read the copy
-        if (R.rt.depth && R.rt.depth->serial == ser && g_fb_n < 4) {
+        if (datt && g_fb_n < 4 && fb_depth_alias_match(tid, ser, &sampled)) {
             fb_prepare_depth_tid(tid, ser, fs, b->reg, &settled);
             continue;
         }
