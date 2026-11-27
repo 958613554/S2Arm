@@ -12909,7 +12909,10 @@ static int tex_storage_live(const treg_t *r) {
 // The limit used to be device-allocated bytes under a twentieth of the working set, but currentAllocatedSize counts every zero-copy wrap of game memory (several times over, see
 // nocopy_buf): in play it was over that twentieth always (player diagnostics: 0.7–6.8 GB against a few hundred MB), nothing was made up front, and each newly streamed texture
 // showed the dummy for a frame before the seen scan made it
-enum { POOL_FRAME_BYTES = 32u << 20, POOL_REQ_BYTES = 128u << 20 };
+enum { POOL_FRAME_BYTES = 32u << 20, POOL_REQ_BYTES = 128u << 20, POOL_LIVE_BYTES = 128u << 20 };
+// POOL_LIVE_BYTES: what textures the game registers while it plays (pool_gpu's registration batch) may make in a frame. They are read a frame or two later and made then anyway,
+//   so making them now moves when, not how much (#2269: 0400486024DEC000 at 60 Hz registers two or three 14 MB 1920x1920 textures at once and reads them the next frame; with
+//   32 MB a frame the third was the dummy for that frame). The budget queue and a table's first walk keep POOL_FRAME_BYTES: those are mostly textures nothing reads
 static uint64_t g_walk_frame = ~0ull, g_walk_spent, g_walk_req;
 static uint64_t pool_tex_size(const tex_t *t) { return t->L.size ? t->L.size : 1; }
 uint64_t s2a_gpu_alloc_bytes(void) {   // 浮层「GPU 已分配」（runtime/src/hud.c 弱定义）：设备总量减去零拷贝缓冲（游戏内存，已在进程实占里；nocopy_buf）
@@ -12922,17 +12925,19 @@ static void pool_walk_frame(void) { uint64_t f = atomic_load(&g_cur_frame); if (
 // floor: the headroom made-up-front textures must leave. Not below what idle-texture reclaim brings headroom back to (2 × tex_reclaim_low, see tex_idle_reclaim):
 //   those textures sit in pool tables, which reclaim skips (tex_pinned), so making them between reclaim's threshold and its target pinned memory it could then not take back
 static uint64_t pool_avail_floor(uint64_t margin, uint64_t reclaim_low) { return 2 * reclaim_low > margin ? 2 * reclaim_low : margin; }
-static uint64_t pool_room_calc(uint64_t gpu, uint64_t ws, uint64_t spent, int has_avail, uint64_t avail, uint64_t floor) {
+// frame: this frame's budget (POOL_FRAME_BYTES, or POOL_LIVE_BYTES for the registration batch); spent counts everything made up front this frame, whichever path made it
+static uint64_t pool_room_calc(uint64_t gpu, uint64_t ws, uint64_t spent, int has_avail, uint64_t avail, uint64_t floor, uint64_t frame) {
     if (has_avail && avail <= floor) return 0;
     uint64_t cap = ws / 2; if (gpu >= cap) return 0;
-    uint64_t head = cap - gpu, left = spent < POOL_FRAME_BYTES ? POOL_FRAME_BYTES - spent : 0;
+    uint64_t head = cap - gpu, left = spent < frame ? frame - spent : 0;
     return head < left ? head : left;
 }
-static uint64_t pool_room(void) {
+static uint64_t pool_room_for(uint64_t frame) {
     pool_walk_frame();
     uint64_t avail = 0; int has = mem_avail(&avail);
-    return pool_room_calc(s2a_gpu_alloc_bytes(), (uint64_t)g_dev.recommendedMaxWorkingSetSize, g_walk_spent, has, avail, pool_avail_floor(mem_margin(), tex_reclaim_low()));
+    return pool_room_calc(s2a_gpu_alloc_bytes(), (uint64_t)g_dev.recommendedMaxWorkingSetSize, g_walk_spent, has, avail, pool_avail_floor(mem_margin(), tex_reclaim_low()), frame);
 }
+static uint64_t pool_room(void) { return pool_room_for(POOL_FRAME_BYTES); }
 // A render target no pass has written holds nothing to read, and a pass makes its texture when it renders. Made for a read, one that only registers next frame's target took three times the
 // textures and 17 GB allocated on Ocarina of Time (upstream): the game re-registers its IDs with transient targets, whose IDs a shader read as the previous texture
 //   "No pass has written" is about the storage, not the object: an NVN texture object is a description, its content is the memory. A game that draws through one object and registers
@@ -13354,7 +13359,7 @@ static uint64_t pool_gpu(int samp, int dtt, int dpf, int rw, int base, __unsafe_
         for (int s = 0; s < 2; s++) if (g_pdirty[s].n) {
             uint32_t m = g_pdirty[s].n; uint32_t *ids = malloc(m * sizeof *ids); if (!ids) break;
             memcpy(ids, g_pdirty[s].list, m * sizeof *ids); pool_dset_clear(&g_pdirty[s]);
-            uint64_t room0 = s ? 0 : pool_room(), spent0 = g_walk_spent;   // once a batch (headroom and device size are system calls); each texture then takes what the batch made so far off it
+            uint64_t room0 = s ? 0 : pool_room_for(POOL_LIVE_BYTES), spent0 = g_walk_spent;   // once a batch (headroom and device size are system calls); each texture then takes what the batch made so far off it
             for (uint32_t j = 0; j < m; j++) { g_pool_upd_dirty++; if (s) pool_samp_update((int)ids[j]); else { uint64_t used = g_walk_spent - spent0, room = room0 > used ? room0 - used : 0; int lr = pool_tex_update((int)ids[j], room); if (lr == 1) pool_dset_add(&g_pleft, (int)ids[j]); else if (lr == 2) pool_dset_add(&g_punwritten, (int)ids[j]); } }
             free(ids);
         }

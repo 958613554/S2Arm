@@ -163,6 +163,7 @@ int main(void) { @autoreleasepool {
         texture(52, W, 22 * MB / (W * 4), 0);
         ((uint32_t *)g_seen_buf.contents)[52 >> 5] |= 1u << (52 & 31);
         g_walk_req = POOL_REQ_BYTES;
+        pool_walk_frame(); g_walk_spent = POOL_LIVE_BYTES;   // 本帧预建额度也满：52 不在登记那一批建出，只看「读到即建」那一路的 128 MB
         read4(cs, 3u | 1u << 20, 3u | 1u << 20, 3u | 1u << 20, 3u | 1u << 20);
         int todo52 = g_seen_todo[52 >> 5] >> (52 & 31) & 1;
         VERIFY(!made(52) && todo52, "⑤ 记满 128 MB：52 已建 %d（期望 0）、仍在待建表 %d（期望 1）", made(52), todo52);
@@ -472,13 +473,13 @@ int main(void) { @autoreleasepool {
         {
             const uint64_t ws = 28ull << 30, gpu_ok = 5ull << 30, gpu_hi = 15ull << 30, margin = 1ull << 30, rlo = 1536ull << 20;
             const uint64_t floor = pool_avail_floor(margin, rlo), floor_off = pool_avail_floor(margin, 0);
-            uint64_t r_live   = pool_room_calc(gpu_ok, ws, 0, 0, 0, margin);
-            uint64_t r_spent  = pool_room_calc(gpu_ok, ws, POOL_FRAME_BYTES - (4u << 20), 0, 0, margin);
-            uint64_t r_full   = pool_room_calc(gpu_ok, ws, POOL_FRAME_BYTES, 0, 0, margin);
-            uint64_t r_gpu_hi = pool_room_calc(gpu_hi, ws, 0, 0, 0, margin);
-            uint64_t r_ios_mid = pool_room_calc(gpu_ok, ws, 0, 1, 2560ull << 20, floor);
-            uint64_t r_ios_lo = pool_room_calc(gpu_ok, ws, 0, 1, 3ull << 30, floor);
-            uint64_t r_ios_ok = pool_room_calc(gpu_ok, ws, 0, 1, (3ull << 30) + (256u << 20), floor);
+            uint64_t r_live   = pool_room_calc(gpu_ok, ws, 0, 0, 0, margin, POOL_FRAME_BYTES);
+            uint64_t r_spent  = pool_room_calc(gpu_ok, ws, POOL_FRAME_BYTES - (4u << 20), 0, 0, margin, POOL_FRAME_BYTES);
+            uint64_t r_full   = pool_room_calc(gpu_ok, ws, POOL_FRAME_BYTES, 0, 0, margin, POOL_FRAME_BYTES);
+            uint64_t r_gpu_hi = pool_room_calc(gpu_hi, ws, 0, 0, 0, margin, POOL_FRAME_BYTES);
+            uint64_t r_ios_mid = pool_room_calc(gpu_ok, ws, 0, 1, 2560ull << 20, floor, POOL_FRAME_BYTES);
+            uint64_t r_ios_lo = pool_room_calc(gpu_ok, ws, 0, 1, 3ull << 30, floor, POOL_FRAME_BYTES);
+            uint64_t r_ios_ok = pool_room_calc(gpu_ok, ws, 0, 1, (3ull << 30) + (256u << 20), floor, POOL_FRAME_BYTES);
             // 设备总量里压进超过工作集二十分之一的零拷贝包（同游戏内存：未碰的匿名映射，不占实存），真占不变：新贴图照样首查即建（原先按设备总量判，这里落哑图）
             size_t pg = (size_t)getpagesize(), big = ((size_t)(g_dev.recommendedMaxWorkingSetSize / 20) + (64u << 20) + pg - 1) & ~(pg - 1);
             void *gm = mmap(NULL, big, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); REQUIRE(gm != MAP_FAILED);
@@ -501,7 +502,7 @@ int main(void) { @autoreleasepool {
         //   A 14 → 剩 18；C 放不下一整帧，跳过、不挡后面；B1 5 → 13、B2 5 → 8、B3 5 → 3；B4 5 > 3 → 这一帧停、留到下一帧；再下一帧 B4 建，C 仍不建。
         //   原先从小到大：5 + 5 + 5 + 5 = 20、再加 A 14 = 34 > 32 → 只建到 5 MB 的，A 这一帧不建
         {
-            atomic_fetch_add(&g_cur_frame, 1); pool_walk_frame(); g_walk_spent = POOL_FRAME_BYTES;   // 本帧预建额度已花满
+            atomic_fetch_add(&g_cur_frame, 1); pool_walk_frame(); g_walk_spent = POOL_LIVE_BYTES;   // 本帧预建额度已花满（实时登记那一批的 128 MB 也满：登记的全进额度队列）
             texture(380, W, 14 * MB / (W * 4), 0); texture(381, W, 33 * MB / (W * 4), 0);
             for (int k = 382; k <= 385; k++) texture(k, W, 5 * MB / (W * 4), 0);
             table_entry(3, 0, NULL);
@@ -512,6 +513,19 @@ int main(void) { @autoreleasepool {
             VERIFY(queued && a && !c && b1 && b2 && b3 && !b4 && made(385) && !made(381),
                    "⑲ 额度队列先进先出：花满那帧全排队 %d（期望 1）；下一帧 A %d、C %d、B1–B4 %d%d%d%d（期望 1、0、1110）；再下一帧 B4 %d、C %d（期望 1、0）",
                    queued, a, c, b1, b2, b3, b4, made(385), made(381));
+        }
+        // ⑲b 实时登记那一批的单帧额度 128 MB（排队补建、建表首次走池仍 32 MB）：游戏一次登记几张 14 MB 的、下一帧就读（#2269，0400486024DEC000 60 Hz）。
+        //   手算：工作集 28 GB、真占 5 GB、本帧未花 → 128 MB；已花 100 MB → 28 MB。本帧从零起登记 3 张 14 MB：128 MB 下三张都在登记那一批建出；
+        //   32 MB 时 14 + 14 = 28，第三张放不下剩的 4 MB、落进额度队列
+        {
+            const uint64_t ws = 28ull << 30, gpu_ok = 5ull << 30, margin = 1ull << 30;
+            uint64_t r0 = pool_room_calc(gpu_ok, ws, 0, 0, 0, margin, POOL_LIVE_BYTES), r100 = pool_room_calc(gpu_ok, ws, 100ull << 20, 0, 0, margin, POOL_LIVE_BYTES);
+            atomic_fetch_add(&g_cur_frame, 1); pool_walk_frame(); g_walk_spent = 0;
+            for (int k = 387; k <= 389; k++) texture(k, W, 14 * MB / (W * 4), 0);
+            table_entry(3, 0, NULL);
+            VERIFY(r0 == (128ull << 20) && r100 == (28ull << 20) && made(387) && made(388) && made(389),
+                   "⑲b 实时登记额度 128 MB：未花 %lluMB、已花 100 MB 剩 %lluMB（期望 128、28）；一次登记 3 张 14 MB 当批建出 %d%d%d（期望 111）",
+                   (unsigned long long)(r0 >> 20), (unsigned long long)(r100 >> 20), made(387), made(388), made(389));
         }
     }
     printf("%s t_nvn_pool_tex：%u 项，%u 项失败（追不到槽的句柄按编号读池：池表 + 已读位图 + 未写渲染目标不建 + 小贴图预建 + 表复用）\n", fails ? "✗" : "✓", checks, fails);
