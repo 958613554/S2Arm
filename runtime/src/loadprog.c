@@ -24,6 +24,8 @@ static char g_pack[24];
 static _Atomic int g_begun;                       // s2a_load_begin 调过 = 有加载页前端（iOS）；Mac / 安卓宿主没有
 
 static double env_s(const char *k, double d) { const char *e = getenv(k); double v = e && *e ? atof(e) : d; return v > 0 ? v : d; }
+// 首装首帧前最多等多少秒（S2A_LOAD_FIRST_S，缺省 12；内部调参，不给玩家看）：到点放行、其余转后台（见 s2a_load_warm_tick）
+static double first_s(void) { return env_s("S2A_LOAD_FIRST_S", 12); }
 
 void s2a_load_begin(uint64_t now, int first_run) {
     pthread_mutex_lock(&g_mu);
@@ -58,18 +60,20 @@ int s2a_load_warm_tick(uint64_t now, long done, long total) {
     //   阶段停在「优化画面」、首帧来了也只记不收，之后再没有 tick、30 秒无进展护栏也跑不到，页面「已优化 0 / 0」卡死）
     // 之后的启动（本包已完整预热过，warm_done 记着这个包）首帧前不等预热，整张清单转后台（11-27 维护者：「首装一次性 loading、之后不卡」）：
     //   原先之后的启动也要等清单全部走完——归档命中的行同样逐条载入，云端种子 9 万行的款每次启动都在加载页后面等，真机上 7 万行的清单首帧出不来；
-    //   其间 3 秒 / 10 秒还没完就升成完整加载页（#2133 / 11-26 的「载入中」），页面换了、等待本身没少。首装照旧等（11-22 #502：玩家没点就别进游戏）
+    //   其间 3 秒 / 10 秒还没完就升成完整加载页（#2133 / 11-26 的「载入中」），页面换了、等待本身没少。首装只等开局那一段（见下）
     if (done >= total) { g_go = S2A_LOAD_GO_DONE; go = 1; }
     else if (!g_first_run) { g_go = S2A_LOAD_GO_LATER; go = 1; }
     else if (atomic_load(&g_skip)) { g_go = S2A_LOAD_GO_USER; go = 1; }
+    else if (now - g_warm_t0 >= (uint64_t)(first_s() * S)) { g_go = S2A_LOAD_GO_PREFIX; go = 1; }
     else if (now - g_last_up >= (uint64_t)(env_s("S2A_LOAD_STALL_S", 30) * S)) { g_go = S2A_LOAD_GO_STALL; go = 1; }
-    // 没有总时长上限（11-22 #502 玩家：「我没点就别进游戏，等是我的选择」）：编译还在往前走就一直等，玩家随时可点「先开始玩」；原先 30 秒到点硬进（11-06 马车8 页面看着卡住才加），
-    //   那次的「看着卡住」由上面的无进展护栏和逐秒剩余时间兜住；直连层有前端时同样不再到点放行（nvn_mtl.m warm_prepare）
+    // 首装只等开局那一段（11-27 维护者：「可以只等开局那一小段 + 后台编 + 没编好的先用基础版本顶上」，取代 11-22 #502「玩家没点就别进游戏」）：
+    //   清单按录制局首次用到的先后排、工人按顺序领，编到第 S2A_LOAD_FIRST_S 秒领完的就是最先用到的那段；到点放行，其余转后台（游戏登记程序时对应行照旧插队）。
+    //   11-27 一款首装云端种子 9 万行（去重 4.7 万）原先等全部编完：首帧 12–13 分钟
     if (go) g_stage = g_ff ? S2A_LOAD_DONE : S2A_LOAD_ENTER;   // 首帧早已到过（直连层先过首帧回调、后在首次提交里等预热）：预热一结束就收页
     int reason = g_go; long d = g_done, t = g_total;
     pthread_mutex_unlock(&g_mu);
     if (go && reason != S2A_LOAD_GO_DONE)
-        LOG("加载页：不再等预热（%s），已编 %ld / %ld，剩下的转后台", reason == S2A_LOAD_GO_USER ? "玩家点了先开始玩" : reason == S2A_LOAD_GO_LATER ? "之后的启动，本包已完整预热过" : "长时间没有进展", d, t);
+        LOG("加载页：不再等预热（%s），已编 %ld / %ld，剩下的转后台", reason == S2A_LOAD_GO_USER ? "玩家点了先开始玩" : reason == S2A_LOAD_GO_LATER ? "之后的启动，本包已完整预热过" : reason == S2A_LOAD_GO_PREFIX ? "首装开局那一段已编到点，其余转后台" : "长时间没有进展", d, t);
     return go && reason != S2A_LOAD_GO_DONE ? 1 : 0;   // 全部编完：直连层自己正常收尾（返回 0 不转后台）
 }
 
@@ -126,9 +130,14 @@ void s2a_load_snapshot(uint64_t now, s2a_load_view *v) {
             if (g_slow_since && now - g_slow_since >= 3 * S) g_slow_since = 0;
         }
         g_eta_t = now;
-        v->eta_s = (int)(g_eta_shown + 0.999);   // 不再按上限封顶（没有上限了，11-22 #502）：显示的就是按已编 / 总数和近段速率估的剩余时间
+        v->eta_s = (int)(g_eta_shown + 0.999);
     }
-    v->can_skip = g_stage == S2A_LOAD_OPTIMIZE && g_first_run && !atomic_load(&g_skip);   // 优化画面一开始就可点、一直可点（11-22 #502：等不等由玩家定；只有完整加载页有这个按钮）
+    // 首装到 S2A_LOAD_FIRST_S 就进游戏：剩余时间不超过离那一刻还剩的秒数（按真编速率还估不出时就显示它）
+    if (g_stage == S2A_LOAD_OPTIMIZE && g_first_run && g_total > g_done) {
+        double left = first_s() - (double)(now - g_warm_t0) / S; int cap = left > 0 ? (int)(left + 0.999) : 0;
+        if (v->eta_s < 0 || v->eta_s > cap) v->eta_s = cap;
+    }
+    v->can_skip = g_stage == S2A_LOAD_OPTIMIZE && g_first_run && !atomic_load(&g_skip);   // 优化画面一开始就可点、一直可点（只有完整加载页有这个按钮）
     pthread_mutex_unlock(&g_mu);
 }
 

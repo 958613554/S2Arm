@@ -2,9 +2,10 @@
 // 三段：准备游戏数据（起局到预热开始）→ 为你的设备优化画面（直连管线预热，已编 / 总数）→ 进入游戏（预热完到首帧上屏）。
 // 剩余时间按本机实测速率估：进度只进不退；显示的剩余时间每次至多按流逝时间往下走，实测持续变慢（新估计比显示值高 25% 以上连续 3 秒）才往上修正。
 // 「什么时候不再等」由这里定（直连层 nvn_mtl.m 每 50 ms 调 s2a_front_warm_tick 问）：之后的启动（本包已完整预热过）、玩家点了「先开始玩」、长时间没有进展 → 返回 1，
-//   剩下的管线转后台继续编（#800 B 近似顶替 + 后台编译）。首装默认编完直接进游戏，没有总时长上限（11-22 #502：编译还在往前走就等，等不等由玩家定）；无进展护栏只防异常，绝不卡死。
-//   之后的启动首帧前不等（11-27：首装一次性 loading、之后不卡）
-// 时间由调用方传（纳秒，单调时钟）；配置走环境变量，缺省值等真机实测后定：
+//   首装编到 S2A_LOAD_FIRST_S 秒 → 返回 1，剩下的管线转后台继续编（#800 B 近似顶替 + 后台编译）；无进展护栏只防异常，绝不卡死。
+//   之后的启动首帧前不等、首装只等开局那一段（11-27：「可以只等开局那一小段 + 后台编 + 没编好的先用基础版本顶上」，取代 11-22 #502 首装等编完）
+// 时间由调用方传（纳秒，单调时钟）；配置走环境变量（内部调参，不给玩家看），缺省值等真机实测后定：
+//   S2A_LOAD_FIRST_S（缺省 12）首装首帧前最多等多少秒
 //   S2A_LOAD_STALL_S（缺省 30）已编数多少秒没涨就自动进游戏
 //   「先开始玩，后台继续优化」在完整加载页的优化画面段一直可点
 #pragma once
@@ -14,7 +15,7 @@
 extern "C" {
 #endif
 enum { S2A_LOAD_DATA = 0, S2A_LOAD_OPTIMIZE = 1, S2A_LOAD_ENTER = 2, S2A_LOAD_DONE = 3 };   // 阶段；DONE = 首帧已上屏，页面收起
-enum { S2A_LOAD_GO_NONE = 0, S2A_LOAD_GO_DONE, S2A_LOAD_GO_USER, S2A_LOAD_GO_STALL, S2A_LOAD_GO_HOST, S2A_LOAD_GO_LATER };   // HOST（11-06）：直连层自己放行（s2a_front_warm_released，清单全部领走、只剩在编的几条）；LATER（11-27）：之后的启动，首帧前不等；为什么不再等预热
+enum { S2A_LOAD_GO_NONE = 0, S2A_LOAD_GO_DONE, S2A_LOAD_GO_USER, S2A_LOAD_GO_STALL, S2A_LOAD_GO_HOST, S2A_LOAD_GO_LATER, S2A_LOAD_GO_PREFIX };   // HOST（11-06）：直连层自己放行（s2a_front_warm_released，清单全部领走、只剩在编的几条）；LATER（11-27）：之后的启动，首帧前不等；PREFIX（11-27）：首装编到 S2A_LOAD_FIRST_S 秒，其余转后台；为什么不再等预热
 typedef struct {
     int stage;            // S2A_LOAD_*
     int first_run;        // 1 = 首次（完整加载页）；0 = 之后的启动（简短启动画面，首帧前不等预热）
