@@ -12463,12 +12463,24 @@ static void warm_urgent_index(NSArray<WarmTask *> *tasks) {
 }
 static void warm_urgent_end(void) { os_unfair_lock_lock(&g_wu_lock); g_wu_pairs = nil; [g_wu_q removeAllObjects]; os_unfair_lock_unlock(&g_wu_lock); }   // 标记数组留给还没退出的工人读（随下一次索引换掉）
 // 工人领下一行：先急件，再按清单顺序；已领的跳过。→ 下标，-1 = 没有了
-static long warm_pick(_Atomic long *next, long n) {
+static void warm_yield(void) {
     if (fu_yield_on() && atomic_load(&g_fu_waiting)) {   // 首遇让路：提交线程在等首遇管线时不领新行
         uint64_t t0 = bp_now(); atomic_fetch_add(&g_fu_yield_in, 1);
         while (atomic_load(&g_fu_waiting) && (bp_now() - t0) < FU_YIELD_MAX_MS * 1000000ull && !dm_gfx_session_stopping()) usleep(500);
         atomic_fetch_add(&g_fu_yield_n, 1); atomic_fetch_add(&g_fu_yield_ns, bp_now() - t0); atomic_fetch_sub(&g_fu_yield_in, 1);
     }
+}
+// 只领急件（先建基础那一遍里，游戏刚登记的程序的精确管线照旧先编）：→ 下标，-1 = 没有急件
+static long warm_pick_urgent(void) {
+    for (;;) {
+        long i = -1;
+        os_unfair_lock_lock(&g_wu_lock); if (g_wu_q.count) { i = g_wu_q[0].longValue; [g_wu_q removeObjectAtIndex:0]; } _Atomic(uint8_t) *c = g_wu_claim; long cn = g_wu_n; os_unfair_lock_unlock(&g_wu_lock);
+        if (i < 0) return -1;
+        if (!c || i >= cn || !atomic_exchange(&c[i], 1)) { atomic_fetch_add(&g_wu_taken, 1); return i; }
+    }
+}
+static long warm_pick(_Atomic long *next, long n) {
+    warm_yield();
     for (;;) {
         long i = -1;
         os_unfair_lock_lock(&g_wu_lock); if (g_wu_q.count) { i = g_wu_q[0].longValue; [g_wu_q removeObjectAtIndex:0]; } _Atomic(uint8_t) *c = g_wu_claim; long cn = g_wu_n; os_unfair_lock_unlock(&g_wu_lock);
@@ -12569,6 +12581,22 @@ static void warm_task_(WarmTask *t) {
             WarmItem *item = [WarmItem new]; item->kind = 1; item->vs_key = t->vkey; item->fs_key = t->fkey; item->vs = vs; item->fs = fs; item->fsfn = fsfn; item->pso = k; item->object = ps;
             warm_enqueue(item); g_warm_rps++;
             if (!sk.merged) hybrid_prefetch(&k, vs, fs);   // 这对的随包拉取基础管线也先取好：不在清单里的新状态首遇时直接用拉取管线画（nvn_hybrid.inc）
+        }
+    }
+}
+// 首装放行后的先建基础（见 warm_prepare 转后台处、nvn_hybrid.inc hybrid_prebuild）：一条绘制行里每种状态的拉取基础管线，键规整同 warm_task_ 的绘制行。
+//   合并遍、可读瓦片 / 采样模拟 / 输出类型变体不走混合管线（hybrid_prebuild 自己判），这里只按着色器能不能取到、配不配得上筛
+static void warm_task_base(WarmTask *t) {
+    @autoreleasepool {
+        if (t->kind != 1) return;
+        pso_skey sk; [t->rs[0] getBytes:&sk length:sizeof sk];
+        NvShader *vs = warm_shader(t->vkey, sk.vs_stage), *fs = t->fkey.length ? warm_shader(t->fkey, sk.fs_stage) : nil;
+        if (!vs || !fs || !pso_pair_ok(vs, fs, 0)) return;
+        for (NSData *row in t->rs) {
+            [row getBytes:&sk length:sizeof sk];
+            if (sk.fz || sk.merged) continue;
+            pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = NULL; pso_key_norm(&k, vs, fs, sk.merged);
+            hybrid_prebuild(&k, vs, fs);
         }
     }
 }
@@ -12743,7 +12771,21 @@ static int warm_prepare(NSArray<WarmTask *> *tasks, long lines) {
     if (late) {
         atomic_store(&stop, 1);   // 满核的准备工人做完手上这行就退；剩下的从同一位置交给后台 DM_PSO_BG_THREADS 路 WARM_BG_QOS（11-02 怪猎发热：别让满核 user-initiated 一直编下去）
         { const char *e = getenv("DM_PSO_BG_THREADS"); int bw = e && atoi(e) > 0 ? atoi(e) : 2; workers = bw;
+          // 先建基础（11-27 维护者：「没编好的先用基础版本顶上」）：放行时还在真现编（随包 / 本机归档没有这些管线，首装）、混合管线开着，
+          //   后台先按剩下的顺序把每一对的拉取基础管线建上（一对一条），之后首遇的绘制按本笔特化先画；急件（游戏刚登记的程序）照旧先编精确的。建完再按顺序编精确管线。
+          //   之后的启动不走这一遍：精确管线从本机归档几千行一秒地取，基础管线不落盘、每次重建反而多编
+          __block _Atomic long bnext = atomic_load(&next); long compiled_at = (long)(atomic_load(&g_par_compiled) - compiled0);
+          int base_first = hybrid_on() && compiled_at >= 32 && late != WARM_WHY_LATER;
+          __block _Atomic int base_left = base_first ? bw : 0; uint64_t bt0 = bp_now();
+          if (base_first) MLOG("pipeline prewarm: %ld really compiled before the first frame: the background builds the pulling bases of the remaining pairs first, then the exact pipelines", compiled_at);
           for (int w = 0; w < bw; w++) dispatch_group_async(g, dispatch_get_global_queue(WARM_BG_QOS, 0), ^{
+              if (base_first) {
+                  for (;;) { warm_yield(); if (dm_gfx_session_stopping()) break;
+                      long u = warm_pick_urgent(); if (u >= 0) { atomic_fetch_add(&g_warm_bg_after_cap, 1); warm_task(tasks[(NSUInteger)u]); continue; }
+                      long j = atomic_fetch_add(&bnext, 1); if (j >= n) break; warm_task_base(tasks[(NSUInteger)j]); }
+                  if (atomic_fetch_sub(&base_left, 1) == 1) MLOG("pipeline prewarm: pulling bases ahead done in %.1f s: %llu from the package, %llu built (%.1f s of building), %llu failed; the exact pipelines follow",
+                      (bp_now() - bt0) / 1e9, (unsigned long long)atomic_load(&g_hy_pb_pkg), (unsigned long long)atomic_load(&g_hy_pb_built), atomic_load(&g_hy_pb_ns) / 1e9, (unsigned long long)atomic_load(&g_hy_pb_fail));
+              }
               for (;;) { long i = warm_pick(&next, n); if (i < 0 || dm_gfx_session_stopping()) break; atomic_fetch_add(&g_warm_bg_after_cap, 1); warm_task(tasks[(NSUInteger)i]); }
           }); }
         atomic_store(&g_wp_why, late); atomic_store(&g_wp_phase, WARM_BG);
