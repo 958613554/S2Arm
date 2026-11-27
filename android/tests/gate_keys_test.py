@@ -14,6 +14,10 @@ sys.path.insert(0, os.path.join(ROOT, 'android', 'tools'))
 import gate_keys as g  # noqa: E402
 
 bad = []
+# 门禁按键跑时会把这些导出给钩子（GATE_HOOK_ONLY=app 等），本测起的子进程不能继承：否则和本测自己设的键冲突，按键跑必红
+GATE_VARS = ('GATE_ONLY', 'GATE_HOOK_ONLY', 'GATE_HOOK_LIST', 'GATE_SKIP', 'GATE_HOOK_SKIP', 'GATE_CHANGED',
+             'S2A_GATE_SUMMARY_DIR', 'S2A_GATE_SUMMARY_FILE')
+CLEAN = {k: v for k, v in os.environ.items() if k not in GATE_VARS}
 
 
 def ok(cond, what, got=''):
@@ -42,7 +46,7 @@ while IFS=$'\t' read -r ln k c; do
 done
 echo "N=$n D=$d"
 '''
-r = subprocess.run(['bash', '-c', sh], input=plan, capture_output=True, text=True)
+r = subprocess.run(['bash', '-c', sh], input=plan, capture_output=True, text=True, env=CLEAN)
 ok(r.returncode == 0 and f'N={len(st)} D=0' in r.stdout, f'gate_step.sh 归键与 gate_keys.py 逐步一致（{len(st)} 步）', (r.stdout + r.stderr)[-300:])
 # 运行时命令带绝对仓库根、真 $out 目录、多行 bash -c：归一化后同键
 sh2 = r'''
@@ -55,7 +59,7 @@ s2a_gate_key_of bash -c '
     mkdir -p "'"$out"'/fakeapk/lib/arm64-v8a"'; c=$S2A_GK_KEY
 echo "$a $b $c"
 '''
-r = subprocess.run(['bash', '-c', sh2], capture_output=True, text=True)
+r = subprocess.run(['bash', '-c', sh2], capture_output=True, text=True, env=CLEAN)
 ok(r.stdout.strip() == 'shader-withdraw shader-modes runtime-host', '运行时绝对路径 / $out / 多行命令归一化后归键正确', r.stdout + r.stderr)
 
 # ③ 负对照
@@ -75,12 +79,12 @@ with tempfile.TemporaryDirectory() as t:
 print('【负对照结束】')
 
 # ④ GATE_HOOK_LIST=inputs：9 键各一行，触发前缀 = 钩子路由（门禁按子步算输入）
-r = subprocess.run(['bash', 'android/gate.sh'], capture_output=True, text=True, env=dict(os.environ, GATE_HOOK_LIST='inputs'))
+r = subprocess.run(['bash', 'android/gate.sh'], capture_output=True, text=True, env=dict(CLEAN, GATE_HOOK_LIST='inputs'))
 route = ' '.join(l.split('：', 1)[1].strip() for l in open('android/gate.sh', encoding='utf-8') if l.startswith('# 门禁路由：'))
 rows = [l.split('\t') for l in r.stdout.strip().split('\n')]
 ok(r.returncode == 0 and [x[0] for x in rows] == list(g.KEYS) and all(x[1] == route.strip() for x in rows),
    f'GATE_HOOK_LIST=inputs：9 键各一行、输入 = 钩子路由（{route.strip()}）', r.stdout + r.stderr)
-r = subprocess.run(['bash', 'android/gate.sh'], capture_output=True, text=True, env=dict(os.environ, GATE_ONLY='no-such-key'))
+r = subprocess.run(['bash', 'android/gate.sh'], capture_output=True, text=True, env=dict(CLEAN, GATE_ONLY='no-such-key'))
 ok(r.returncode != 0 and '认不得' in r.stderr, 'gate.sh：认不得的 GATE_ONLY 键 → 红', r.stdout + r.stderr)
 
 # ⑤ GATE_ONLY 运行时（没登记的步 / 认不得的键按设计报红：反证段）
@@ -98,7 +102,7 @@ echo "RUN=$S2A_GK_RUN SKIP=$S2A_GK_SKIP"
 with tempfile.TemporaryDirectory() as t:
     tsv = os.path.join(t, 'k.tsv')
     open(tsv, 'w').write('rule\tdq\tandroid/tests/run_dq_queue.sh\nrule\tapp\tPlaytimeTest-fixture\nrule\tapp\tregistered-c\n')
-    env = dict(os.environ, GATE_ONLY='dq')
+    env = dict(CLEAN, GATE_ONLY='dq')
     env.pop('S2A_GATE_SUMMARY_FILE', None)
     r = subprocess.run(['bash', '-c', fix, 'x', tsv, 'registered-c'], capture_output=True, text=True, env=env)
     ok(r.returncode == 0 and 'RAN-A' in r.stdout and 'RAN-B' not in r.stdout and 'RAN-C' not in r.stdout and 'RUN=1 SKIP=2' in r.stdout,
