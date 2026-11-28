@@ -6526,8 +6526,8 @@ static void pool_gpuw_drop(const void *pool) {   // the pool is finalized (nvn_b
 static int tex_cpu_content(const tex_t *t) {
     static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_STORAGE_FIRST_USE"); on = !e || atoi(e) != 0; }
     if (!on || !t->mem || !t->pool || t->has_layout || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
-    // Queued pool-buffer writes are newer than the CPU snapshot (texture relocation).
-    if (g_cb && (pend_hits((uint64_t)t->mem, t->L.size) || sbw_hits((uint64_t)t->mem, (uint64_t)t->mem + t->L.size) || gw_live((uint64_t)t->mem, (uint64_t)t->mem + t->L.size))) return 0;
+    // Every check below only reads (none changes state), so their order does not change the answer: the per-page range scans of pending writes come last, after the format / flag /
+    //   pool / sharing-table checks that turn most textures away for a few loads (#2303: scanning first, they were 3% of the submit thread on every first use)
     int unc = !fmt_compressed(t->d.format) && t->d.target != NVN_TEXTURE_TARGET_3D;
     if (unc && (fmt_depth(t->d.format) || (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE)) || pool_gpu_written(t->pool))) return 0;   // not what only the GPU or the decoder fills
     if (t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return 0;   // the CPU cannot write it (tex_init_fill fills it once) / sparse (packaged through the page table)
@@ -6538,6 +6538,8 @@ static int tex_cpu_content(const tex_t *t) {
     alias_key ak; alias_key_of(&ak, t);   // the GPU wrote this storage through a shared texture (an image object over it, #768): that texture holds its content, not guest memory
     pthread_mutex_lock(&g_smu); int gpu = nvn_hm_get(&g_alias_wrote, &ak) != NULL; pthread_mutex_unlock(&g_smu);
     if (gpu) return 0;
+    // Queued pool-buffer writes are newer than the CPU snapshot (texture relocation).
+    if (g_cb && (pend_hits((uint64_t)t->mem, t->L.size) || sbw_hits((uint64_t)t->mem, (uint64_t)t->mem + t->L.size) || gw_live((uint64_t)t->mem, (uint64_t)t->mem + t->L.size))) return 0;
     if (!mem_any_touched(t->mem, t->L.size)) return 0;
     if (unc) { uint64_t ser = t->serial; pthread_mutex_lock(&g_cpu_tex_mu); nvn_hm_put(&g_cpu_unc, &ser, (void *)t->pool); pthread_mutex_unlock(&g_cpu_tex_mu); }
     static uint64_t n[2]; if (n[unc]++ < 4) MLOG("texture written by the CPU before its first use ser=%llu %ux%ux%u format %#x%s pool flags %#x: uploaded from its storage, re-uploaded when it changes (%llu so far)",
