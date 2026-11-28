@@ -101,3 +101,22 @@ def affected(engine, ios, direct):
     if not after:
         return 0
     return len(after & pack_keys(direct))
+
+
+def release_ok(rows, version, xfp):
+    """发版核对：清单最后一行是本版的 release 行、指纹 = 本树翻译器指纹（发版脚本出候选前核，缺了发版红）"""
+    return bool(rows) and rows[-1] == ("release", version.lstrip("v"), xfp)
+
+
+def with_release(text, version, xfp):
+    """清单文本追加本版 release 行（发版脚本切版时自动做）；已经是本版且指纹相同 → 原样（重跑不重复加）。
+    最后一行是本版但指纹不同（切版后翻译器又改了）→ ValueError：要先登记那一步翻译器改动（step 行），不能拿 release 行盖过去"""
+    rows, _ = parse(text)
+    v = version.lstrip("v")
+    if release_ok(rows, v, xfp):
+        return text
+    if rows and rows[-1][0] == "release" and rows[-1][1] == v:
+        raise ValueError(f"清单最后一行已是 release {v}，指纹 {rows[-1][2]} ≠ 本树 {xfp}：切版后翻译器又改了，先追加 step 行")  # 非玩家句
+    if rows and rows[-1][2] != xfp:
+        raise ValueError(f"清单最后一行的指纹 {rows[-1][2]} ≠ 本树 {xfp}：翻译器改了没登记 step 行，先补上再切版")  # 非玩家句
+    return text.rstrip("\n") + f"\nrelease\t{v}\t{xfp}\n"

@@ -44,6 +44,22 @@ class KeysAfter(unittest.TestCase):
         with self.assertRaises(ValueError):
             xa.parse("stepp\tX1\tX2\n")
 
+    def test_release_row(self):
+        """发版行：切版时追加、出候选前核（发版脚本自动做）。期望按规则手写：最后一行 X3 = 本树 → 追加 release 0.6.11 X3，核对过；
+        重跑原样；带不带 v 前缀一样；本树指纹 ≠ 最后一行（翻译器改了没登记 step）→ 拒绝追加；只追加了别的版本 → 核对不过"""
+        once = xa.with_release(LIST, "v0.6.11", "X3")
+        self.assertTrue(once.endswith("release\t0.6.11\tX3\n"), "追加在末尾、去掉 v 前缀")
+        rows, _ = xa.parse(once)
+        self.assertTrue(xa.release_ok(rows, "0.6.11", "X3") and xa.release_ok(rows, "v0.6.11", "X3"), "追加后核对过")
+        self.assertEqual(xa.with_release(once, "0.6.11", "X3"), once, "重跑不重复加")
+        self.assertFalse(xa.release_ok(xa.parse(LIST)[0], "0.6.11", "X3"), "没追加：核对不过（发版红）")
+        self.assertFalse(xa.release_ok(rows, "0.6.12", "X3"), "末尾是别的版本：核对不过")
+        with self.assertRaises(ValueError):
+            xa.with_release(LIST, "0.6.11", "X4")   # 本树已是 X4、清单停在 X3：先登记 step X3→X4，不能拿 release 行盖过去
+        with self.assertRaises(ValueError):
+            xa.with_release(once, "0.6.11", "X4")   # 切版后翻译器又改了
+        self.assertEqual(xa.keys_after(rows, self.keys, version="0.6.11"), set(), "新发版出的包：已有的两步都不算")
+
 
 class Affected(unittest.TestCase):
     """xlate_affected.affected：兼容记录定位置，资源包 keys.tsv 取交集"""

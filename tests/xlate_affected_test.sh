@@ -1,5 +1,5 @@
 #!/bin/bash
-# 门禁覆盖：translator/xlate_affected.tsv translator/dmsh_chain.py translator/dmsh_xlate/* graphics/tools/direct/dsh/* compat/tree/src/Ryujinx.Graphics.Shader/* compat/tree/src/Ryujinx.Common/* compat/tree/src/Spv.Generator/* graphics/widen/shader/* graphics/widen/SpirvCbufUseText.cs pack/jobs/xlate_affected.py tests/xlate_affected_test.sh
+# 门禁覆盖：translator/xlate_affected.tsv translator/xlate_affected_release.py translator/dmsh_chain.py translator/dmsh_xlate/* graphics/tools/direct/dsh/* compat/tree/src/Ryujinx.Graphics.Shader/* compat/tree/src/Ryujinx.Common/* compat/tree/src/Spv.Generator/* graphics/widen/shader/* graphics/widen/SpirvCbufUseText.cs pack/jobs/xlate_affected.py tests/xlate_affected_test.sh
 # 翻译器修复清单（translator/xlate_affected.tsv）跟着翻译器走：清单最后一行的翻译器指纹 = 本树翻译器指纹（dmsh_chain.py --xfp）。
 #   为什么：启动器按「包出自清单里哪一行之前」算受影响键（pack/jobs/xlate_affected.py），改了翻译器不登记一步，链就断了——之后的修复对这之间出的包一律判不了。
 #   改翻译器的那笔提交同笔追加一行 step <改前指纹> <改后指纹> <扫了几款> <说明>（受影响键 translator/xlate_affected_gen.py 出）；发版追加 release <版本> <指纹>。
