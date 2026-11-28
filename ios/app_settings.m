@@ -28,6 +28,8 @@ NSDictionary *s2a_ios_brightness_option(void);
 void s2a_cpatch_fps_pick(int target) __attribute__((weak_import));
 // 弱链接[lab]：s2a_pad_layout_parse（runtime/src/pad.c；输入工作台不链原生核，取不到就按存的字面值认）
 int s2a_pad_layout_parse(const char *value) __attribute__((weak_import));
+// 弱链接[lab]：s2a_cpatch_ws_needs_docked（runtime/src/cpatch.c：开着的满屏补丁只改主机档渲染宽高 → 宿主强制按主机模式跑，host_main.c；输入工作台不链原生核，取不到就按玩家存的值显示）
+int s2a_cpatch_ws_needs_docked(const char *dir) __attribute__((weak_import));
 // 弱链接[lab]：s2a_hud_brief_show（ios/hud.m 简版性能浮层；输入工作台不链 hud.m，取不到就只记开关、下次进游戏生效）
 void s2a_hud_brief_show(UIView *root, BOOL on) __attribute__((weak_import));
 // 弱链接[lab]：s2a_ios_root_view（ios/app.m 游戏画面根视图，性能浮层挂在它上面；输入工作台没有 app.m，取不到就只记开关）
@@ -423,6 +425,11 @@ static NSString *recommended_note(NSString *key, NSString *note) {
             sub.selectionStyle = UITableViewCellSelectionStyleNone; control.accessibilityLabel = sub.textLabel.text; cell = sub;
         }
     }
+    // 主机模式被社区满屏补丁强制开（#2303：宿主 host_main.c 按 s2a_cpatch_ws_needs_docked 把这局切主机档，开关却显示玩家存的「关」，玩家以为没开、帧率掉了三成也不知为何）：
+    //   如实显示这局实际跑的（开）、置灰，写原因和怎么回掌机。判据与宿主同一个函数、同一个随行目录（caps_dir 缺省 = module_dir）、同一份本局 S2A_CPATCH_ON
+    if ([key isEqualToString:@"S2ADockedMode"] && !control.on && s2a_cpatch_ws_needs_docked && s2a_cpatch_ws_needs_docked(s2a_ios_game_dir(nil).fileSystemRepresentation)) {
+        control.on = YES; control.enabled = NO; cell.detailTextLabel.text = S2AL(@"settings.docked.wsForced"); control.accessibilityValue = cell.detailTextLabel.text;
+        cell.accessoryView = control; return cell; }
     // 本款原生 60 帧（运行时判定后记在 S2AFpsNative60，app.m s2a_ios_fps_native60）：开关改不动帧率，显示原因、置灰（11-02 维护者 丝之歌关了照样 60 帧、以为没生效）
     if ([key isEqualToString:@"S2AFps60"] && [s2a_ios_settings_defaults() boolForKey:@"S2AFpsNative60"]) {
         control.on = YES; control.enabled = NO; cell.detailTextLabel.text = S2AL(@"settings.fps.native"); control.accessibilityValue = S2AL(@"settings.fps.native");
