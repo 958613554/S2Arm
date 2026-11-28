@@ -170,8 +170,7 @@ class RuntimeEnv(unittest.TestCase):
                 with patch.object(brw.shutil, "which", return_value=None):
                     with self.assertRaises(SystemExit):
                         brw.zstd_dir()                                                  # PATH 上没有
-        src = (ROOT / "launchers/windows/bundle_runtime_win.py").read_text(encoding="utf-8")
-        self.assertNotIn(r"R:\s2a", src)                                               # 不写死出包机盘符
+        # 「不写死出包机盘符」由全仓检查 tools/hardcoded_path_lint.py（tests/hardcoded_path_lint_test.sh）管，这里不再单独断言
 
     def test_same_path_as_bundled_env_cmd(self):
         # 作业环境与随包 s2arm_env.cmd（启动器 / 手工起出包用）同一份 PATH：两处各写一遍，这里核一致
