@@ -60,8 +60,11 @@ def py_code(text):
             prev = tk
             continue
         if tk.type not in (tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER):
-            for ln in range(tk.start[0], tk.end[0] + 1):
-                keep.setdefault(ln, []).append(tk.string)
+            if tk.start[0] == tk.end[0]:
+                keep.setdefault(tk.start[0], []).append(tk.string)
+            else:   # 跨行的 token（多行字符串，常是嵌进去的整段远端脚本）：每个物理行只挂它自己那一行的原文，不把整段摊到每一行（11-28 私有工具里一处命中被摊成几十行）
+                for k, part in enumerate(tk.string.split("\n")):
+                    keep.setdefault(tk.start[0] + k, []).append(part)
         prev = tk
     return {k: " ".join(v) for k, v in keep.items()}
 

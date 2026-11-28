@@ -7,6 +7,7 @@
 #   ③ 不报：注释里、Python 文档字符串里、行尾 hardcoded-path-ok、/Users/player 占位名、C:\Program Files 系统位置、D:\S2Arm 玩家提示示例
 #   ④ 测试代码里：R:\lib、家目录假名夹具不报；D:\s2a 布局与私有名字照报
 #   ⑤ 私有规则表读不到：只跳过 ③ 那条（照样报 ①②），并打提示
+#   ⑥ 跨 5 行的多行字符串里只有第 3 行写死 R:\s2a：只报那 1 行（不把整段摊到每一行）
 set -u; H=$(cd "$(dirname "$0")/.." && pwd); T=$(mktemp -d); bad=0
 trap 'rm -rf "$T"' EXIT
 ck() { if eval "$2"; then echo "通 $1"; else echo "不通 $1"; bad=1; fi; }
@@ -46,4 +47,7 @@ ck "③ 好写法一行都不报" '! grep -q "pack/good.py" <<< "$o"'
 ck "④ 测试代码：夹具不报，布局与私有名字照报（各 1 行）" '[ "$(grep -c "tests/test_x.py" <<< "$o")" = 2 ] && grep -q "test_x.py:2:" <<< "$o" && grep -q "test_x.py:3:" <<< "$o"'
 e=$(cd "$T/r" && S2A_PRIVATE_SCAN_RULES=$T/none.json $L . pack/bad.py 2>&1 >/dev/null); o=$(cd "$T/r" && S2A_PRIVATE_SCAN_RULES=$T/none.json $L . pack/bad.py 2>/dev/null)
 ck "⑤ 私有表读不到：报 5 行（少私有名字那行）并提示" '[ "$(grep -c "pack/bad.py" <<< "$o")" = 5 ] && grep -q "读不到" <<< "$e"'
+printf '%s\n' 'S = """第一行' '第二行' 'cd R:\s2a\work' '第四行' '"""' > "$T/r/pack/multi.py"
+o=$(cd "$T/r" && S2A_PRIVATE_SCAN_RULES=$T/none.json $L . pack/multi.py 2>/dev/null)
+ck "⑥ 多行字符串只报真有的那 1 行（实 $(grep -c 'multi.py' <<< "$o") 行）" '[ "$(grep -c "multi.py" <<< "$o")" = 1 ] && grep -q "multi.py:3:" <<< "$o"'
 [ $bad = 0 ] && echo "hardcoded_path_lint 单测全过"; exit $bad
