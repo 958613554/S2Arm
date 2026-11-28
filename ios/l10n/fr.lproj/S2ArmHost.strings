@@ -783,3 +783,4 @@
 "settings.sound.silent.note" = "Quand cette option est activée, le son du jeu continue même si l'appareil est en mode silencieux. Quand elle est désactivée, S2Arm suit le mode silencieux comme les autres jeux.";
 "settings.sound.mix" = "Mixer avec d'autres apps";
 "settings.sound.mix.note" = "Lorsque activé, la musique ou les podcasts d'autres apps continuent de jouer avec le jeu, et l'interrupteur Silence ne coupe que le son du jeu.";
+"settings.docked.wsForced" = "Un patch plein écran de la communauté est activé : cette session tourne en Mode TV (le patch ne modifie que l'affichage de ce mode) et consomme plus. Pour jouer en mode portable, désactivez « Plein écran » puis relancez le jeu.";
