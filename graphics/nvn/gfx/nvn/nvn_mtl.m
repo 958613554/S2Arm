@@ -13247,7 +13247,7 @@ static int warm_prepare(NSArray<WarmTask *> *tasks, long lines) {
         wp_sample(now, done);   // the rate window keeps moving while nobody reads
         int why; long compiled = (long)(atomic_load(&g_par_compiled) - compiled0);
         if (front) s2a_front_warm_compiled(compiled);
-        if (front) why = s2a_front_warm_tick(done, lines) == 1 || atomic_load(&g_wp_play) ? WARM_WHY_PLAYER : WARM_WHY_NONE;   // the front end owns the page, its estimate and its guards
+        if (front) { int ft = s2a_front_warm_tick(done, lines); why = atomic_load(&g_wp_play) ? WARM_WHY_PLAYER : ft == 1 ? WARM_WHY_FRONT : WARM_WHY_NONE; }   // 每拍都先报给前端（它的进度 / 截断靠这一拍）   // the front end owns the page, its estimate and its guards
         else why = warm_hold_why(el, now - moved, atomic_load(&g_wp_play), lim, stall);
         if (!why && !front && lim && el >= lim) why = WARM_WHY_LIMIT;   // 上限只管没有前端的宿主；有加载页时由前端按首装截断 S2A_LOAD_FIRST_S 放行（同 12 s）
         // 11-06（异度3 测试设备1 再启动局：归档 2048 / 2048 全命中，首帧仍等满 15 s，12523 行剩 26 行）：清单每一行都已有工人领走、只剩在编的几条时不再挡首帧——
@@ -13280,7 +13280,7 @@ static int warm_prepare(NSArray<WarmTask *> *tasks, long lines) {
           }); }
         atomic_store(&g_wp_why, late); atomic_store(&g_wp_phase, WARM_BG);
         MLOG("pipeline prepare: the first frame waited %.0f ms (%s); %ld of %ld lines done, the rest goes on in the background on %d workers", (bp_now() - t0) / 1e6,
-             late == WARM_WHY_PLAYER ? "the player chose to play now" : late == WARM_WHY_LATER ? "a later start: this package was fully prewarmed before" : late == WARM_WHY_STALL ? "no line finished for DM_PSO_PREPARE_STALL_MS" :
+             late == WARM_WHY_PLAYER ? "the player chose to play now" : late == WARM_WHY_FRONT ? "the load page let go (its own line gives why)" : late == WARM_WHY_LATER ? "a later start: this package was fully prewarmed before" : late == WARM_WHY_STALL ? "no line finished for DM_PSO_PREPARE_STALL_MS" :
              late == WARM_WHY_TAIL ? "every line taken, only the ones being built left; they finish on the prepare workers" : "the cap, DM_PSO_PREPARE_MAX_MS",
              (long)g_warm_done, lines, workers);
         if (front) s2a_front_warm_released();
