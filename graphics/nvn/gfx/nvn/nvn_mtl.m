@@ -13717,6 +13717,10 @@ static void ph_record_tex(const tex_t *t) {
     }
     os_unfair_lock_unlock(&g_ph_lk);
 }
+#define PB_LOW_KEEP (1024ull << 20)   // = nvn_pso_budget.inc PB_VA_RESERVE（那里引用这个）
+static uint64_t pb_low_holes(void);
+static int pb_low_room(uint64_t sz);   // nvn_pso_budget.inc：宿主低区空洞扣掉保留后放不放得下 sz（iOS 才扫得到，扫不到 = 不拦）
+static _Atomic uint64_t g_ph_low_skip;   // 热贴图因低区空洞不够没预建的张数（#2306 接手）
 static uint64_t ph_prewarm_limit(int id_, int rw) {
     if (id_ <= 0 || id_ >= g_ntreg || !g_treg[id_].ok || g_treg[id_].view) return 0;
     const treg_t *r = &g_treg[id_];
@@ -13736,6 +13740,9 @@ static uint64_t ph_prewarm_limit(int id_, int rw) {
     uint64_t avail = 0; int has = mem_avail(&avail);
     uint64_t flr = pool_avail_floor(mem_margin(), tex_reclaim_low());
     if (has && (avail <= flr || avail - flr < sz)) return 0;
+    // 低区门槛（#2020 一族：iPhone / iPad 上宿主低区地址耗尽而崩，Metal 贴图存储同样从低区拿地址）：同管线地址额度 ⑤ 的口径，空洞扣掉 PB_VA_RESERVE 放不下这张就不预建，
+    //   首用时照旧按需建（预建只是免掉首帧的哑贴图闪一下，不值得拿低区去换）
+    if (!pb_low_room(sz)) { if (atomic_fetch_add(&g_ph_low_skip, 1) == 0) MLOG("[poolhot] host low region too small to prewarm a hot pool texture (%llu KB; holes %llu MB, %llu MB kept for others): left to its first use", (unsigned long long)(sz >> 10), (unsigned long long)(pb_low_holes() >> 20), (unsigned long long)(PB_LOW_KEEP >> 20)); return 0; }
     uint64_t cap = (uint64_t)g_dev.recommendedMaxWorkingSetSize / 2, gpu = s2a_gpu_alloc_bytes();
     if (gpu >= cap || gpu + sz > cap || g_ph_spent + sz > POOL_HOT_MAX_BYTES) return 0;
     uint64_t fp = ph_fp(&r->t); if (!fp) return 0;

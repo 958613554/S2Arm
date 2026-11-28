@@ -624,10 +624,27 @@ int main(void) { @autoreleasepool {
             os_unfair_lock_unlock(&g_rmu);
             int m404_lo = made(404);
             atomic_store(&g_mem_avail_fake, -1);
+            // 低区门槛（#2306 接手，#2020 一族）：扫到的宿主低区空洞扣掉 1 GB 保留放不下这张热贴图 → 不预建；放得下 → 照建（期望手写：同管线地址额度 ⑤ 的口径）
+            int mlow[2];
+            for (int q = 0; q < 2; q++) {
+                ph_session_reset();
+                os_unfair_lock_lock(&g_rmu);
+                for (int k = 0; k < POOL_TABS; k++) pool_tab_drop(k);
+                pool_dset_clear(&g_pdirty[0]); pool_dset_clear(&g_pleft); atomic_store(&g_ptab_any, 0);
+                os_unfair_lock_unlock(&g_rmu);
+                for (int o = 400; o < 408; o++) if (o != 405) g_treg[o].ok = 0;   // 前几轮登记的热贴图（402 / 404 / 上一格）不留：热记录只有 1 张的份，先走到的会把它用掉
+                atomic_store(&g_pb_va_holes, q == 0 ? PB_LOW_KEEP + 2048 : PB_LOW_KEEP + (64ull << 20));   // 32x32 RGBA8 一张 4 KB：扣掉保留只剩 2 KB 放不下 / 余 64 MB
+                atomic_fetch_add(&g_cur_frame, 1); pool_walk_frame(); g_walk_spent = 0; g_live_spent = 0;
+                int id = 406 + q; texture(id, 32, 32, 0); memcpy(texs[id].mem, texs[400].mem, texs[id].L.size);
+                os_unfair_lock_lock(&g_rmu); pool_gpu(0, MTLTextureType2D, NVN_DPF_FLOAT, 0, 0, &btmp); os_unfair_lock_unlock(&g_rmu);
+                mlow[q] = made(id);
+            }
+            atomic_store(&g_pb_va_holes, 0);
             g_treg[405].ok = 0; g_treg[405].gone = 0; g_treg[405].t.pool = NULL;
             ph_session_reset();
             g_ph_path_test = NULL;
             unlink(tmp);
+            VERIFY(!mlow[0] && mlow[1], "㉓ 低区门槛：空洞扣掉 1 GB 保留后放不下 → 热贴图 406 不预建（%d，期望 0）；余 64 MB → 407 照建（%d，期望 1）", mlow[0], mlow[1]);
             VERIFY(e400_1 == hdum && !m400_1 && !m401_1 && m402 && e402 != hdum && !m403 && !m404_lo,
                    "㉓ 热贴图指纹预建：首轮冷图 %d/%d（期望 0/0）；次轮仅预建命中热图 402=%d（非哑 %d）、冷图 403=%d（期望 1、1、0）；余量低于门槛跳过 404=%d（期望 0）",
                    m400_1, m401_1, m402, e402 != hdum, m403, m404_lo);
