@@ -189,14 +189,20 @@ final class NS2LauncherControllerTests: XCTestCase {
         let controller = NS2LauncherController(socketURL: URL(fileURLWithPath: "/tmp/s2arm-controller-test.sock"),
                                               systemControllers: { [] }, notifications: NotificationCenter())
         controller.apply(status: 1, ["status": 1])
-        XCTAssertFalse(controller.detail.contains("导轨"), "反证：没带 syncHint 照旧")
+        XCTAssertFalse(controller.detail.contains("滑轨"), "反证：没带 syncHint 照旧")
         controller.apply(status: 1, ["status": 1, "syncHint": true])
-        XCTAssertTrue(controller.detail.contains("导轨侧的小 SYNC") && controller.detail.contains("再点「连接」"))
+        XCTAssertTrue(controller.detail.contains("SL / SR 之间的小 SYNC") && controller.detail.contains("再点「连接」"))
         controller.apply(status: 9, ["status": 9, "syncHint": true])
         XCTAssertEqual(controller.detail, NS2LauncherController.syncHintDetail, "扫完没连上：提示留着")
         XCTAssertEqual(controller.status, .notConnected, "不是出错：灰点")
         controller.apply(status: 9, ["status": 9])
-        XCTAssertFalse(controller.detail.contains("导轨"), "反证：下一轮没带就换回原文案")
+        XCTAssertFalse(controller.detail.contains("滑轨"), "反证：下一轮没带就换回原文案")
+        // #2318 真因是 Switch 2 主机开着把手柄抢回去：没找到 / 唤醒别的主机 / 断开 三处都提示先关主机或拿远
+        XCTAssertTrue(controller.detail.contains("先彻底关机或拿远"), "没找到")
+        controller.apply(status: 9, ["status": 9, "syncHint": true])
+        XCTAssertTrue(controller.detail.contains("先彻底关机或拿远"), "唤醒别的主机")
+        controller.apply(status: 5, ["status": 5])
+        XCTAssertTrue(controller.detail.contains("先彻底关机或拿远"), "断开 / 没连上")
     }
 
     @MainActor
