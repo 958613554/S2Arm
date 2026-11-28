@@ -4283,6 +4283,7 @@ static void rev_pkg_rebind_locked(id pkg, id<MTLTexture> old_t, id<MTLTexture> n
         }
     }
 }
+static int g_pkg_rebind_on = 1;   // 单测负对照用：关掉 = 换打包贴图时不挪幽灵表的反向项（原先的漏洞）
 static int tex_swap_locked(id<MTLTexture> base, id<MTLTexture> w, int do_pkg, uint64_t check_ser, int *named_out) {
     nvn_hmap *ms[] = {&g_by_serial, &g_ghost, &g_ghost_active};
     void *bp = (__bridge void *)base, *wp = (__bridge void *)w;
@@ -4305,8 +4306,10 @@ static int tex_swap_locked(id<MTLTexture> base, id<MTLTexture> w, int do_pkg, ui
         for (uint32_t i = 0; i < cnt; i++) {
             if (!kind[i]) continue;
             if (kind[i] == 1) { hm_put_id(ms[m], &sers[i], w); if (named_out && sers[i] == check_ser) *named_out = 1; }
-            else { NvPkg *pk = (__bridge NvPkg *)nvn_hm_get(ms[m], &sers[i]); pk->tex = w; }
             rev_del_ptr_locked(m, sers[i], bp); rev_add_ptr_locked(m, sers[i], wp);
+            // 打包贴图：同一个 NvPkg 也可能挂在幽灵表 / 本次提交表里（定稿后一序号同时在活表与幽灵表），换了 tex 就要把那几张表里按旧贴图记的反向项一起挪到新贴图，
+            //   否则 serial_holds(幽灵表, 新贴图) 漏判 → defer_obj_release 把还被持有的贴图提前放出驻留集（#1220 类）
+            if (kind[i] == 2) { NvPkg *pk = (__bridge NvPkg *)nvn_hm_get(ms[m], &sers[i]); pk->tex = w; if (g_pkg_rebind_on) rev_pkg_rebind_locked(pk, base, w); }
             n++;
         }
         if (sers != sbuf) free(sers);
