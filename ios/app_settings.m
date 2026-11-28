@@ -468,8 +468,20 @@ static NSString *recommended_note(NSString *key, NSString *note) {
     }] forControlEvents:UIControlEventValueChanged];
     cell.accessoryView = control; return cell;
 }
+// App 级开关（所有游戏共用，存 NSUserDefaults.standardUserDefaults，缺省关）：标题 + 一行说明。改完宿主当场换音频会话类别（ios/app.m 听偏好变更）
+- (UITableViewCell *)appToggle:(NSString *)key title:(NSString *)title note:(NSString *)note {
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+    cell.textLabel.text = title; cell.textLabel.numberOfLines = 0; cell.textLabel.adjustsFontForContentSizeCategory = YES;
+    cell.detailTextLabel.text = note; cell.detailTextLabel.numberOfLines = 0; cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+    cell.detailTextLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote]; cell.detailTextLabel.adjustsFontForContentSizeCategory = YES;
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    UISwitch *control = [UISwitch new]; control.on = [NSUserDefaults.standardUserDefaults boolForKey:key];
+    control.accessibilityLabel = title; control.accessibilityIdentifier = [@"settings." stringByAppendingString:key];
+    [control addAction:[UIAction actionWithHandler:^(UIAction *action) { [NSUserDefaults.standardUserDefaults setBool:((UISwitch *)action.sender).on forKey:key]; }] forControlEvents:UIControlEventValueChanged];
+    cell.accessoryView = control; return cell;
+}
 - (NSInteger)rowsForGroup:(NSInteger)group {
-    if (group == 6) return (s2a_ios_play_resizable() ? 1 : 2) + 1;   // 末行：即时快照（全部游戏共用，0.6.0）   // 自由窗口（Duo 内屏 / iPad）方向交给系统，「方向」那行不列（#1364）
+    if (group == 6) return (s2a_ios_play_resizable() ? 1 : 2) + 3;   // 末三行：静音模式下也出声、与其他 App 混音（#2303：App 级，同游戏库「声音」与系统设置；1 App 1 游戏进不了游戏库、LiveContainer 里没有系统设置页）、即时快照   // 末行：即时快照（全部游戏共用，0.6.0）   // 自由窗口（Duo 内屏 / iPad）方向交给系统，「方向」那行不列（#1364）
     if (group == 7) return 2;   // 界面语言、游戏语言
     if (group == 8) return 1 + (_patchGroups.count > 0);   // S 级优化：社区补丁（这款有才列）+ 金手指
     if (group == 2) return 5;   // 开发者页：打开时导出 / 诊断局 / 触屏诊断 / S2Arm 浮层 / Metal 浮层
@@ -506,7 +518,10 @@ static NSString *recommended_note(NSString *key, NSString *note) {
         cell.accessibilityIdentifier = @"settings.devEntry"; return cell;
     }
     if (group == 6) {
-        if (row == [self rowsForGroup:6] - 1) return [self toggleCell:(NSInteger)[toggleKeys() indexOfObject:@"S2ASnapshot"]];   // 即时快照
+        NSInteger last = [self rowsForGroup:6] - 1;
+        if (row == last) return [self toggleCell:(NSInteger)[toggleKeys() indexOfObject:@"S2ASnapshot"]];   // 即时快照
+        if (row == last - 2) return [self appToggle:@"S2APlayInSilentMode" title:S2AL(@"settings.sound.silent") note:S2AL(@"settings.sound.silent.note")];
+        if (row == last - 1) return [self appToggle:@"S2AMixWithOthers" title:S2AL(@"settings.sound.mix") note:S2AL(@"settings.sound.mix.note")];
         BOOL split=row==0;
         NSString *key=split?S2APlaySplitKey:S2APlayOrientationKey;
         NSArray *values=split?@[@"auto",@"on",@"off"]:@[@"auto",@"landscape",@"portrait"];
