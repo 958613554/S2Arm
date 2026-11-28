@@ -444,8 +444,9 @@ static void test_tbuf_atomic_and_ghost_view_reuse(void) {
     uint64_t gen_after_lookup = g_ser_gen;
     uint64_t f = nvn_be_sub_commit(); REQUIRE(nvn_be_wait(f, 10000000000ull));
 
-    CHECK(atomic_ok && atomic_ok2 && tex_atomic_usage(m_atomic) && up1 == up0 + 1 && up2 == up1,
-          "⑨a TARGET_BUFFER R32UI 首次原子按需升 1 次、后续零升级（upgrades %llu→%llu→%llu）",
+    // main 70dd12655：R32 整数可写缓冲贴图建时就带原子与格式视图用途，首次原子也不用升级（0 次，不是 1 次）
+    CHECK(atomic_ok && atomic_ok2 && tex_atomic_usage(m_atomic) && up1 == up0 && up2 == up1,
+          "⑨a TARGET_BUFFER R32UI 建时就带原子用途、全程零升级（upgrades %llu→%llu→%llu）",
           (unsigned long long)up0, (unsigned long long)up1, (unsigned long long)up2);
     CHECK(m2 == m_atomic && tex_atomic_usage(m2) && gen_after_lookup == gen_before && g_ser_gen == gen_before,
           "⑨b 幽灵环挤出后仍复用已登记 TARGET_BUFFER 视图（m1=%p m2=%p ser_gen %llu→%llu→%llu）",
