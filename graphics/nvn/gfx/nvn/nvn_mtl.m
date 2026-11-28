@@ -7136,7 +7136,9 @@ void nvn_be_tex_release(tex_t *t) {
     nvn_hm_del(&g_snap_texaddr, &t->serial);
     if (held) {   // a pool registration still names it: it stays (g_pool_held), released when the last registration goes (pool_held_check)
         nvn_hm_put(&g_pool_held, &t->serial, (void *)1);
-        g_ser_gen++;   // as a finalize always did: the IDs' cached views resolve again (tex_by_id view_ser), so a remapped sparse texture is checked against its page table
+        // as a finalize always did: the IDs' cached views resolve again (tex_by_id view_ser), so a remapped sparse texture is checked against its page table. A buffer texture is never
+        //   sparse and its view is shared by (pool, memory, descriptor) (g_tbuf_views): bumping here rebuilt the pool tables at every transient buffer-texture serial (#2293)
+        if (t->d.target != NVN_TEXTURE_TARGET_BUFFER) g_ser_gen++;
         pthread_mutex_unlock(&g_smu);
         mtl_vc_drop(t->serial);   //   (pkg_sparse_clean) instead of reading what its old mapping held (t_nvn_tex_finalize remap: 73, read 255); the texture itself stays
         t->serial = 0;

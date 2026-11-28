@@ -2,6 +2,8 @@
 #include "s2a_t_result.h"
 
 static unsigned checks, fails;
+int s2a_direct_fault(void *addr, int is_write, void *uctx);
+static void on_sig(int sg, siginfo_t *si, void *uc) { if (s2a_direct_fault(si->si_addr, 1, uc)) return; signal(sg, SIG_DFL); }   // a CPU write to a protected page, as the host routes it (③e)
 static int g_neg;
 #define REQUIRE(c) do { if (!(c)) { fprintf(stderr, "SETUP FAIL %s:%d %s\n", __FILE__, __LINE__, #c); exit(2); } } while (0)
 #define CHECK(c, ...) do { checks++; int good_ = !!(c); fails += !good_; printf("%s ", good_ ? "PASS" : "FAIL"); printf(__VA_ARGS__); putchar('\n'); fflush(stdout); } while (0)
@@ -183,7 +185,8 @@ int main(int argc, char **argv) { @autoreleasepool {
         uint32_t *out = (uint32_t *)(mem + out_off);
         int vals_ok = 1;
         for (uint32_t i = 0; i < 8; i++) if (out[i] != 130u + i || data[i] != 140u + i) vals_ok = 0;
-        CHECK(u1 - u0 == 1 && u2 == u1 && s1 == s0 && im1 != NULL && im1 == im2 && tex_atomic_usage((__bridge id<MTLTexture>)im1) && vals_ok,
+        // main 70dd12655 makes R32 integer writable buffer textures with the atomic and format-view usages at creation: no upgrade at the first dispatch either (0, not 1)
+        CHECK(u1 == u0 && u2 == u1 && s1 == s0 && im1 != NULL && im1 == im2 && tex_atomic_usage((__bridge id<MTLTexture>)im1) && vals_ok,
               "①a R32UI buffer texture + R32I atomic shader: 1st upgrade +%llu, next 3 dispatches upgrades +%llu (ser_gen +%llu), im view kept=%d atomic=%d gpu=%d",
               (unsigned long long)(u1 - u0), (unsigned long long)(u2 - u1), (unsigned long long)(s1 - s0), im1 && im1 == im2, tex_atomic_usage((__bridge id<MTLTexture>)im1), vals_ok);
     }
@@ -227,7 +230,7 @@ int main(int argc, char **argv) { @autoreleasepool {
         uint32_t *out = (uint32_t *)(mem + out_off);
         int vals_ok = 1;
         for (uint32_t i = 0; i < 8; i++) if (out[i] != 210u + i || data[i] != 220u + i) vals_ok = 0;
-        CHECK(u1 - u0 == 1 && u2 == u1 && s1 == s0 && vals_ok,
+        CHECK(u1 == u0 && u2 == u1 && s1 == s0 && vals_ok,   // no upgrade at all since 70dd12655 (made with the atomic usage), as in ①a
               "①b finalized registered R32UI buffer texture after NGHOST overflow: initial upgrade +%llu, post-evict upgrades +%llu (ser_gen +%llu) gpu=%d",
               (unsigned long long)(u1 - u0), (unsigned long long)(u2 - u1), (unsigned long long)(s1 - s0), vals_ok);
 
@@ -276,7 +279,9 @@ int main(int argc, char **argv) { @autoreleasepool {
         float got[5]; memcpy(got, io + 4, sizeof got);
         if (fabsf(got[0] - 400.0f) > 1e-4f || fabsf(got[4] - 1423.0f) > 1e-4f || io[9] != 1024u) gpu_ok = 0;
         uint64_t sg1 = g_ser_gen, rg1 = g_reg_gen, seen1 = g_pool_upd_seen, hits1 = g_tbuf_view_hits;
-        CHECK(same_all && sg1 == sg0 && rg1 == rg0 && seen1 == seen0 && hits1 >= hits0 + 100 && gpu_ok,
+        // ser_gen +1, pool re-walk +1: t0 alone was made as an object (tex_mtl above); its registration replaced by the first transient serial, the pool-held rule lets it go (pool_held_check),
+        //   one serial_del. The 100 transient serials share the cached view and never enter g_by_serial: 0 each (main's held-release bump skipped for buffer textures)
+        CHECK(same_all && sg1 == sg0 + 1 && rg1 == rg0 && seen1 <= seen0 + 1 && hits1 >= hits0 + 100 && gpu_ok,
               "②a 100 transient TARGET_BUFFER serials over same (mem,desc): same_mt=%d ser_gen+%llu reg_gen+%llu pool_seen+%llu hits+%llu gpu=%d",
               same_all, (unsigned long long)(sg1 - sg0), (unsigned long long)(rg1 - rg0), (unsigned long long)(seen1 - seen0), (unsigned long long)(hits1 - hits0), gpu_ok);
 
@@ -402,6 +407,8 @@ int main(int argc, char **argv) { @autoreleasepool {
     if (!g_neg) {
         enum { M = 64, TID = 200 };
         size_t off = 0x800008, io_off = 0x3000;
+        { struct sigaction sa = {0}; sa.sa_sigaction = on_sig; sa.sa_flags = SA_SIGINFO; sigaction(SIGBUS, &sa, NULL); sigaction(SIGSEGV, &sa, NULL); }   // as t_nvn_pkg_gpu_alias
+        nvn_be_unreg_tex_range(30, 1); nvn_be_unreg_tex_range(100, 40);   // retire ③'s and ③d's copies (untracked: hashed every submission), so the count is this entry's alone
         nvn_dirty_add_range(mem + 0x800000, 0x10000);   // the source pages only (16 KB pages): the io words the test writes stay outside
         float *v = (float *)(mem + off); for (int i = 0; i < M; i++) v[i] = 300.0f + i;
         tex_t t; memset(&t, 0, sizeof t); t.magic = MAGIC('T', 'E', 'X', 0); t.serial = nvn_new_serial();
