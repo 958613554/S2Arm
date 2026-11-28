@@ -4402,6 +4402,14 @@ static void note_sync_pipeline(void) {
         atomic_fetch_add_explicit(&g_sync_pipelines, 1, memory_order_relaxed);
 }
 static uint64_t g_warm_hits, g_warm_created, g_pipe_dup;
+static uint64_t g_pipe_cache_probe_hit, g_pipe_cache_probe_miss, g_pipe_cache_probe_fail;
+static int pipe_cache_ctl_on(void) { return nvn_plat_flag("nvk_pipe_cache_ctl", 1) != 0; }
+void nvn_vk_pipe_cache_ctl_stats(uint64_t out[3]) {
+    if (!out) return;
+    out[0] = __atomic_load_n(&g_pipe_cache_probe_hit, __ATOMIC_RELAXED);
+    out[1] = __atomic_load_n(&g_pipe_cache_probe_miss, __ATOMIC_RELAXED);
+    out[2] = __atomic_load_n(&g_pipe_cache_probe_fail, __ATOMIC_RELAXED);
+}
 // 在途表读数（见 pipe_inflight）：同配方需求合并等待的次数 / 表满（或停用）自己直接建的次数 /
 // 认领后复检命中的次数（省掉一次重复建）。
 // 在途表读数由 nvn_pipe_flight 内部计数（见 nvn_gpu_stats 的 pipe_inflight_* 项）
@@ -4688,8 +4696,10 @@ static nvn_gpu_rc float_blend_nan_module(const struct nvn_gpu_shader_s *sh, uint
     return rc(NVN_GPU_OK);
 }
 
-static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s **out, nvn_gpu_err *err) {
+static nvn_gpu_rc pipe_build_flagged(const nvn_gpu_pipe_desc *d, VkPipelineCreateFlags extra_flags,
+                                     struct nvn_gpu_pipe_s **out, nvn_gpu_err *err, int *compile_required) {
     *out = NULL;
+    if (compile_required) *compile_required = 0;
     const nvn_gpu_pipe_desc *requested = d;
     nvn_gpu_pipe_desc normalized;
     if (!pipe_msaa_normalize(d, &normalized)) return fail(err, NVN_GPU_E_UNSUPPORTED, "msaa_pipeline_samples: 附件格式没有共同支持的采样数");
@@ -5088,6 +5098,7 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
     VkGraphicsPipelineCreateInfo gp;
     memset(&gp, 0, sizeof gp);
     gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp.flags = extra_flags;
     gp.stageCount = ns;
     gp.pStages = stages;
     gp.pVertexInputState = &vin;
@@ -5108,18 +5119,24 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
         .pNext = gp.pNext,
         .pPipelineCreationFeedback = &feedback,
     };
+    const int cache_probe = (extra_flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT) != 0;
     const int want_feedback = atomic_load_explicit(&g_pipe_feedback, memory_order_relaxed) == NVK_PIPE_FEEDBACK_ON;
     if (want_feedback) gp.pNext = &feedback_info;
     const uint64_t pl_t0 = now_ns();   // 驱动编译管线是同步的：超过 3 毫秒就打一行（走路/进新场景时会集中出现）
     const VkResult gvr = vkCreateGraphicsPipelines(g.d, g_plc, 1, &gp, NULL, &p->pipe);
     const uint64_t wall_ns = now_ns() - pl_t0;
+    if (cache_probe && gvr == VK_PIPELINE_COMPILE_REQUIRED) {
+        if (compile_required) *compile_required = 1;
+        destroy_pipe_objects(p);
+        return rc(NVN_GPU_E_COMPILE);
+    }
     pipe_creation_note(0, wall_ns, gvr == VK_SUCCESS && want_feedback ? &feedback : NULL);
     if (gvr != VK_SUCCESS) {
         nvn_gpu_rc bad = fail(err, pipe_vk_res_code(gvr, NVN_GPU_E_COMPILE), "vkCreateGraphicsPipelines 失败（%s %d）", pipe_vk_res_name(gvr), (int)gvr);
         destroy_pipe_objects(p);
         return bad;
     }
-    plc_created();
+    if (!cache_probe) plc_created();
     { // 原有长帧读数也含 plc_created 的局中补写；PSO feedback 的墙钟只量 vkCreate。
       static int slow = -1; if (slow < 0) slow = nvn_plat_flag("nvk_hitch_log", 0) != 0;
       const uint64_t dt = slow ? now_ns() - pl_t0 : 0;
@@ -5162,9 +5179,13 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
     }
     p->actual_samples = d->samples > 1 ? d->samples : 1;
     p->key = *requested;   // 以原请求查找：预热、在途表与缓存使用同一身份。
-    note_sync_pipeline();
+    if (!cache_probe) note_sync_pipeline();
     *out = p;
     return rc(NVN_GPU_OK);
+}
+
+static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s **out, nvn_gpu_err *err) {
+    return pipe_build_flagged(d, 0, out, err, NULL);
 }
 
 // ---- 装缓存：双检去重（并发建同一配方只留一份）----
@@ -5229,6 +5250,67 @@ int nvn_gpu_pipe_lookup(const nvn_gpu_pipe_desc *d, nvn_gpu_pipe *out) {
     pthread_mutex_unlock(&g_mu);
     if (!hit) return 0;
     *out = hit;   // 后端缓存持有，核心不 release
+    return 1;
+}
+
+// 非阻塞驱动缓存探测（VK_EXT_pipeline_creation_cache_control）：内存管线表未命中时，以
+// VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT 探测盘上/驱动 VkPipelineCache。
+// 命中 → 零编译装入缓存并返回 1（前台零跳笔/零唤醒后台）；未命中 → 驱动在编译前立即回 VK_PIPELINE_COMPILE_REQUIRED，返回 0 交后台。
+int nvn_vk_pipe_try_cached(const nvn_gpu_pipe_desc *d, nvn_gpu_pipe *out) {
+    if (out) *out = NULL;
+    if (!out || !d) return 0;
+    if (!pipe_call_enter(NULL)) return 0;
+    pthread_mutex_lock(&g_mu);
+    struct nvn_gpu_pipe_s *hit = pipe_find_locked(d);
+    if (hit) {
+        pipe_hit_note_locked(hit);
+        pthread_mutex_unlock(&g_mu);
+        *out = hit;
+        pipe_call_leave();
+        return 1;
+    }
+    pthread_mutex_unlock(&g_mu);
+    if (!g.dev || !g.dev->pipeline_creation_cache_control_enabled || !g_plc || !pipe_cache_ctl_on()) {
+        pipe_call_leave();
+        return 0;
+    }
+    struct nvn_gpu_pipe_s *fresh = NULL;
+    int compile_required = 0;
+    nvn_gpu_rc br;
+    const VkPipelineCreateFlags probe = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT;
+    if (pipe_serial_on()) {
+        // 串行模式兜底（debug.s2a.nvk_pipe_serial=1）零阻塞：后台正持 g_create_mu 编译时
+        // trylock 立即返回，视作未命中交给后台队列，绝不在前台等编译锁。
+        if (pthread_mutex_trylock(&g_create_mu) != 0) {
+            pipe_call_leave();
+            return 0;
+        }
+        br = pipe_build_flagged(d, probe, &fresh, NULL, &compile_required);
+        pthread_mutex_unlock(&g_create_mu);
+    } else {
+        br = pipe_build_flagged(d, probe, &fresh, NULL, &compile_required);
+    }
+    if (compile_required) {
+        __atomic_fetch_add(&g_pipe_cache_probe_miss, 1, __ATOMIC_RELAXED);
+        pipe_call_leave();
+        return 0;
+    }
+    if (!nvn_gpu_ok(br) || !fresh) {
+        __atomic_fetch_add(&g_pipe_cache_probe_fail, 1, __ATOMIC_RELAXED);
+        pipe_call_leave();
+        return 0;
+    }
+    pthread_mutex_lock(&g_mu);
+    struct nvn_gpu_pipe_s *p = pipe_install_locked(fresh);
+    pthread_mutex_unlock(&g_mu);
+    if (!p) {
+        __atomic_fetch_add(&g_pipe_cache_probe_fail, 1, __ATOMIC_RELAXED);
+        pipe_call_leave();
+        return 0;
+    }
+    __atomic_fetch_add(&g_pipe_cache_probe_hit, 1, __ATOMIC_RELAXED);
+    *out = p;
+    pipe_call_leave();
     return 1;
 }
 
@@ -9497,6 +9579,9 @@ void nvn_gpu_stats(nvn_gpu_stat_fn fn, void *user, int take) {
     fn(user, "pipe_cache_save_trigger_ns", __atomic_load_n(&g_plcw_get_ns, __ATOMIC_RELAXED));
     fn(user, "pipe_warm_created", __atomic_load_n(&g_warm_created, __ATOMIC_RELAXED));   // 预建出来的管线对象数
     fn(user, "pipe_warm_hits", __atomic_load_n(&g_warm_hits, __ATOMIC_RELAXED));         // 真实 draw 第一次拿到预建对象的次数
+    fn(user, "pipe_cache_probe_hit", __atomic_load_n(&g_pipe_cache_probe_hit, __ATOMIC_RELAXED));
+    fn(user, "pipe_cache_probe_miss", __atomic_load_n(&g_pipe_cache_probe_miss, __ATOMIC_RELAXED));
+    fn(user, "pipe_cache_probe_fail", __atomic_load_n(&g_pipe_cache_probe_fail, __ATOMIC_RELAXED));
     fn(user, "pipe_install_dup", __atomic_load_n(&g_pipe_dup, __ATOMIC_RELAXED));
     fn(user, "occl_cont_used", __atomic_load_n(&g_occl_cont_used, __ATOMIC_RELAXED));   // 遮挡查询续段开出次数（进程累计，不随会话清零）        // 双检抓到「别人已经装过同配方」的次数（新建那份已销毁）
     fn(user, "query_host_resets", __atomic_load_n(&g_hqr_host_resets, __ATOMIC_RELAXED));
