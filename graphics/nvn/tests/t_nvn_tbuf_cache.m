@@ -364,6 +364,66 @@ int main(int argc, char **argv) { @autoreleasepool {
         CHECK(ok3, "③c unaligned tex_pool entry syncs after same-submission GPU copy: GPU reads [%.1f, %.1f, %.1f]", r3[0], r3[1], r3[4]);
     }
 
+    // ③d More aligned copies need a GPU sync in one submission than the old fixed job table held (32): every copy must end up holding its source bytes.
+    //   Expected per copy: the floats written below (7000 + 100·k + i). Before the table grew, copies past the 32nd were swapped to fresh buffers that nothing filled.
+    if (!g_neg) {
+        enum { K = 40, M = 64, T0 = 100 };
+        size_t base = 0x600008, step = 0x2000, io_off = 0x3000;
+        uint32_t *io = (uint32_t *)(mem + io_off);
+        S.ssbo[5][0] = (p_bind_buf){.addr = (uint64_t)(uintptr_t)io, .size = 64};
+        for (int k = 0; k < K; k++) {
+            float *v = (float *)(mem + base + k * step); for (int i = 0; i < M; i++) v[i] = 100.0f * k + i;
+            tex_t t; memset(&t, 0, sizeof t); t.magic = MAGIC('T', 'E', 'X', 0); t.serial = nvn_new_serial();
+            t.d = (nvn_texdesc){.target = NVN_TEXTURE_TARGET_BUFFER, .format = NVN_FORMAT_R32F, .width = M, .height = 1, .depth = 1, .levels = 1};
+            t.pool = pool; t.off = base + k * step; t.mem = mem + base + k * step; nvn_tex_layout(&t.d, &t.L);
+            nvn_be_tex_init(&t); nvn_be_reg_tex(T0 + k, &t, NULL);
+            io[0] = T0 + k; run_cs(cs_pool_tb, 1); run_cs(cs_pool_tb, 1);   // the second run finds the ID marked as read (pool_seen) and makes the copy
+        }
+        int made = 0;
+        os_unfair_lock_lock(&g_rmu);
+        for (int i = 0; i < g_nptba; i++) if (g_ptba[i].tid >= T0 && g_ptba[i].tid < T0 + K) { g_ptba[i].needs_gpu = 1; made++; }   // as a GPU write into each source would
+        os_unfair_lock_unlock(&g_rmu);
+        for (int k = 0; k < K; k++) { float *v = (float *)(mem + base + k * step); for (int i = 0; i < M; i++) v[i] = 7000.0f + 100.0f * k + i; }
+        io[0] = T0; run_cs(cs_pool_tb, 1);   // one submission: every copy is GPU-dirty at once
+        int good = 0, bad_k = -1;
+        os_unfair_lock_lock(&g_rmu);
+        for (int i = 0; i < g_nptba; i++) {
+            int k = g_ptba[i].tid - T0; if (k < 0 || k >= K) continue;
+            const float *c = (const float *)g_ptba[i].buf.contents; int ok = c && !g_ptba[i].needs_gpu;
+            for (int j = 0; ok && j < M; j++) ok = c[j] == 7000.0f + 100.0f * k + j;
+            if (ok) good++; else if (bad_k < 0) bad_k = k;
+        }
+        os_unfair_lock_unlock(&g_rmu);
+        CHECK(made == K && good == K, "③d %d aligned copies GPU-synced in one submission: %d hold their source bytes (first wrong: copy %d)", made, good, bad_k);
+    }
+
+    // ③e Write tracking decides the CPU recheck: with the source span tracked, submissions with no CPU write since the last read hash nothing; a write is hashed once and read.
+    //   Expected: 0 hashes over two quiet submissions, then 1 hash and the new value at index 5 (4242.0).
+    if (!g_neg) {
+        enum { M = 64, TID = 200 };
+        size_t off = 0x800008, io_off = 0x3000;
+        nvn_dirty_add_range(mem + 0x800000, 0x10000);   // the source pages only (16 KB pages): the io words the test writes stay outside
+        float *v = (float *)(mem + off); for (int i = 0; i < M; i++) v[i] = 300.0f + i;
+        tex_t t; memset(&t, 0, sizeof t); t.magic = MAGIC('T', 'E', 'X', 0); t.serial = nvn_new_serial();
+        t.d = (nvn_texdesc){.target = NVN_TEXTURE_TARGET_BUFFER, .format = NVN_FORMAT_R32F, .width = M, .height = 1, .depth = 1, .levels = 1};
+        t.pool = pool; t.off = off; t.mem = mem + off; nvn_tex_layout(&t.d, &t.L);
+        nvn_be_tex_init(&t); nvn_be_reg_tex(TID, &t, NULL);
+        uint32_t *io = (uint32_t *)(mem + io_off); io[0] = TID;
+        run_cs(cs_pool_tb, 1); run_cs(cs_pool_tb, 1);
+        int tracked = 0; os_unfair_lock_lock(&g_rmu); for (int i = 0; i < g_nptba; i++) if (g_ptba[i].tid == TID) tracked = g_ptba[i].span != NULL; os_unfair_lock_unlock(&g_rmu);
+        uint64_t h0 = g_pool_tb_hashes;
+        run_cs(cs_pool_tb, 1); run_cs(cs_pool_tb, 1);
+        uint64_t h1 = g_pool_tb_hashes;
+        v[5] = 4242.0f;
+        run_cs(cs_pool_tb, 1);
+        uint64_t h2 = g_pool_tb_hashes;
+        float got = 0;   // the shader reads indices {0, 1, 2, 17, 1023}, none of them 5: read the copy itself
+        os_unfair_lock_lock(&g_rmu); for (int i = 0; i < g_nptba; i++) if (g_ptba[i].tid == TID && g_ptba[i].buf.contents) got = ((const float *)g_ptba[i].buf.contents)[5]; os_unfair_lock_unlock(&g_rmu);
+        CHECK(tracked && h1 == h0 && h2 == h1 + 1 && got == 4242.0f,
+              "③e tracked span %d: quiet submissions hashed %llu times (want 0), a CPU write hashed %llu (want 1), copy holds %.1f (want 4242.0)",
+              tracked, (unsigned long long)(h1 - h0), (unsigned long long)(h2 - h1), got);
+    }
+
     if (g_neg) {
         printf(fails ? "✓ t_nvn_tbuf_cache neg：%u/%u 项按预期红 → 负对照成立\n" : "✗ t_nvn_tbuf_cache neg：负对照竟全绿\n", fails, checks);
         return fails ? 0 : 1;

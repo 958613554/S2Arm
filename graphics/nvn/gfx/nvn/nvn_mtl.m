@@ -3930,8 +3930,6 @@ static void tbuf_drop_range(uintptr_t lo, uintptr_t hi) {
     for (uint32_t i = 0; i < g_tbuf_views.cap;) {
         tbuf_view_e *e = g_tbuf_views.vals[i];
         if (!e) { i++; continue; }
-        uint64_t end = e->k.mem + (uint64_t)e->k.width;   // mem lies inside [lo, hi)
-        (void)end;
         if (e->k.mem >= (uint64_t)lo && e->k.mem < (uint64_t)hi) {
             nvn_hm_del(&g_tbuf_views, &e->k);
             tbuf_view_free_entry(e, 1);
@@ -13504,6 +13502,8 @@ static void *pool_samp_obj(int id_, uint64_t *rid) {
 typedef struct {
     int tid;
     uint64_t ser, addr, src_off, len, wr_epoch, pend_gen, sub_serial, fence, hash;
+    uint64_t stamp;      // dirty-page generation taken (after protecting the span) before the bytes were last read: a CPU write after it shows in nvn_dirty_since_span
+    const void *span;    // the tracked range holding [addr, addr + len) (nvn_dirty_span); NULL = untracked, every check hashes the bytes
     __unsafe_unretained id<MTLBuffer> src;
     const void *pool;
     MTLPixelFormat pf;
@@ -13513,7 +13513,7 @@ typedef struct {
     uint8_t needs_gpu, hash_ok;
 } ptba_e;
 static ptba_e *g_ptba; static int g_nptba, g_cptba;
-static uint64_t g_pool_tb_unaligned, g_pool_tb_aligned, g_pool_tb_syncs;
+static uint64_t g_pool_tb_unaligned, g_pool_tb_aligned, g_pool_tb_syncs, g_pool_tb_hashes;   // hashes: CPU-side rechecks that read the bytes (t_nvn_tbuf_cache)
 static void ptba_retire_at(int i) {   // caller holds g_rmu
     ptba_e *e = &g_ptba[i];
     if (e->tex) { defer_obj_release(e->tex); e->tex = nil; }
@@ -13551,7 +13551,7 @@ static void ptba_session_reset(void) {
     }
     free(g_ptba); g_ptba = NULL; g_nptba = g_cptba = 0;
 }
-static int ptba_alloc_copy(uint32_t width, uint32_t n, uint32_t row, MTLPixelFormat pf, id<MTLBuffer> *out_b, id<MTLTexture> *out_t) {
+static int ptba_alloc_copy(uint32_t n, uint32_t row, MTLPixelFormat pf, id<MTLBuffer> *out_b, id<MTLTexture> *out_t) {
     size_t blen = ((size_t)row + 255) & ~(size_t)255; if (!blen) blen = 256;
     id<MTLBuffer> ab = [g_dev newBufferWithLength:blen options:MTLResourceStorageModeShared];
     if (!ab) return 0;
@@ -13561,7 +13561,6 @@ static int ptba_alloc_copy(uint32_t width, uint32_t n, uint32_t row, MTLPixelFor
     if (!av) { defer_obj_release(ab); return 0; }
     res_add(av); res_commit();
     *out_b = ab; *out_t = av;
-    (void)width;
     return 1;
 }
 static id<MTLTexture> ptba_get_or_make(int id_, id<MTLTexture> x) {   // caller holds g_rmu
@@ -13582,9 +13581,11 @@ static id<MTLTexture> ptba_get_or_make(int id_, id<MTLTexture> x) {   // caller 
     ptba_drop_tid(id_);
     uint32_t row = (uint32_t)(((size_t)n * (size_t)bpb + al - 1) / al * al);
     id<MTLBuffer> ab = nil; id<MTLTexture> av = nil;
-    if (!ptba_alloc_copy((uint32_t)x.width, n, row, x.pixelFormat, &ab, &av)) return nil;
+    if (!ptba_alloc_copy(n, row, x.pixelFormat, &ab, &av)) return nil;
     uint64_t addr = tt->mem ? (uint64_t)(uintptr_t)tt->mem : 0;
     int gpend = addr && (pend_hits(addr, len) || gw_live(addr, addr + len) || sbw_hits(addr, addr + len));
+    const void *span = addr ? nvn_dirty_span((const void *)(uintptr_t)addr, len) : NULL; uint64_t stamp = 0;
+    if (span) { nvn_dirty_protect((const void *)(uintptr_t)addr, len); stamp = nvn_dirty_now(); }   // protect, stamp, then read (as pkg_upload_): a write after the stamp shows at the next check
     if (x.buffer.contents) memcpy(ab.contents, (const uint8_t *)x.buffer.contents + x.bufferOffset, len);
     int gpu_done_now = 0;
     if (gpend && g_cb && !g_enc && on_sub_thread()) {
@@ -13610,7 +13611,7 @@ static id<MTLTexture> ptba_get_or_make(int id_, id<MTLTexture> x) {   // caller 
     ne->tid = id_; ne->ser = tt->serial; ne->addr = addr; ne->src_off = x.bufferOffset; ne->len = len;
     ne->wr_epoch = g_wr_epoch; ne->pend_gen = g_pend_gen; ne->sub_serial = g_sub_serial; ne->fence = g_fence + 1;
     ne->src = x.buffer; ne->pool = tt->pool; ne->pf = x.pixelFormat; ne->width = (uint32_t)x.width; ne->n = n; ne->row = row;
-    ne->buf = ab; ne->tex = av;
+    ne->buf = ab; ne->tex = av; ne->span = span; ne->stamp = stamp;
     ne->needs_gpu = (uint8_t)(gpend && !gpu_done_now);
     ne->hash_ok = (uint8_t)(!gpend && x.buffer.contents != NULL);
     ne->hash = ne->hash_ok ? span_hash((const uint8_t *)x.buffer.contents + x.bufferOffset, len) : 0;
@@ -13641,30 +13642,40 @@ static int ptba_prepare(NvShader *const sh[5]) {
             }
         }
     }
-    struct { __unsafe_unretained id<MTLBuffer> src, dst; size_t src_off, len; } jobs[32];
+    // GPU copies to encode once the lock is released: grows as needed (a fixed table left entries past its end swapped to an unfilled copy with needs_gpu cleared)
+    typedef struct { __unsafe_unretained id<MTLBuffer> src, dst; size_t src_off, len; } ptba_job;
+    static ptba_job *jobs; static int jcap;   // submit thread only
     int njobs = 0;
     for (int i = 0; i < g_nptba; ) {
         ptba_e *e = &g_ptba[i];
         if (e->tid <= 0 || e->tid >= g_ntreg || !g_treg[e->tid].ok || g_treg[e->tid].t.serial != e->ser || g_treg[e->tid].gone) { ptba_retire_at(i); continue; }
         int gpu_dirty = e->needs_gpu || ((e->wr_epoch != g_wr_epoch || e->pend_gen != g_pend_gen) && e->addr && (pend_hits(e->addr, e->len) || gw_live(e->addr, e->addr + e->len) || sbw_hits(e->addr, e->addr + e->len)));
-        uint64_t new_h = 0;
+        uint64_t new_h = 0, st = 0;
         int cpu_dirty = 0;
-        if (!gpu_dirty && e->sub_serial != g_sub_serial && e->src.contents) {
-            new_h = span_hash((const uint8_t *)e->src.contents + e->src_off, e->len);
-            if (!e->hash_ok || new_h != e->hash) cpu_dirty = 1;
+        // CPU writes: hash the bytes only when the dirty-page tracking says the span was written since the last read (or it is untracked); a check per submission otherwise
+        if (!gpu_dirty && e->sub_serial != g_sub_serial && e->src.contents &&
+            (!e->span || nvn_dirty_since_span(e->span, (const void *)(uintptr_t)e->addr, e->len, e->stamp))) {
+            if (e->span) { nvn_dirty_protect((const void *)(uintptr_t)e->addr, e->len); st = nvn_dirty_now(); }   // protect, stamp, then read
+            new_h = span_hash((const uint8_t *)e->src.contents + e->src_off, e->len); g_pool_tb_hashes++;
+            if (!e->hash_ok || new_h != e->hash) cpu_dirty = 1; else e->stamp = st;
+        }
+        if (gpu_dirty && njobs == jcap) {   // room for this entry's copy first: without it the entry keeps its current copy and needs_gpu, and syncs next time
+            int c = jcap ? 2 * jcap : 32; ptba_job *q = realloc(jobs, (size_t)c * sizeof *q);
+            if (q) { jobs = q; jcap = c; } else { e->needs_gpu = 1; i++; continue; }
         }
         if (gpu_dirty || cpu_dirty) {
             id<MTLBuffer> nb = nil; id<MTLTexture> nt = nil;
-            if (ptba_alloc_copy(e->width, e->n, e->row, e->pf, &nb, &nt)) {
+            if (ptba_alloc_copy(e->n, e->row, e->pf, &nb, &nt)) {
                 defer_obj_release(e->tex); defer_obj_release(e->buf);
                 e->tex = nt; e->buf = nb; e->fence = g_fence + 1;
                 e->wr_epoch = g_wr_epoch; e->pend_gen = g_pend_gen; e->sub_serial = g_sub_serial;
                 if (gpu_dirty) {
                     e->needs_gpu = 0; e->hash_ok = 0;
-                    if (njobs < 32) { jobs[njobs].src = e->src; jobs[njobs].src_off = e->src_off; jobs[njobs].dst = nb; jobs[njobs].len = e->len; njobs++; }
+                    if (e->span) { nvn_dirty_protect((const void *)(uintptr_t)e->addr, e->len); e->stamp = nvn_dirty_now(); }   // a CPU write after the GPU copy is taken shows next time
+                    jobs[njobs].src = e->src; jobs[njobs].src_off = e->src_off; jobs[njobs].dst = nb; jobs[njobs].len = e->len; njobs++;
                 } else {
                     memcpy(nb.contents, (const uint8_t *)e->src.contents + e->src_off, e->len);
-                    e->hash = new_h; e->hash_ok = 1;
+                    e->hash = new_h; e->hash_ok = 1; e->stamp = st;
                 }
                 g_pool_tb_syncs++;
                 pool_tex_update(e->tid, 0);
