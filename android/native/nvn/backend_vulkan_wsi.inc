@@ -555,6 +555,11 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
           char sb[640]; snprintf(sb, sizeof sb, "暂存写（每帧，近 300 帧）：写缓冲 %.1f 笔共 %.0f KB（其中超过一个标准块 %.1f 笔）、拷贝命令 %.1f 条；暂存块：取到 %.1f、新建 %.1f 个共 %.0f KB、放回留下 %.1f、非标准没留 %.1f、表满没留 %.1f；表里现有 %u 块共 %llu MB",
               w[0] / 300.0, w[1] / 1024.0 / 300.0, w[3] / 300.0, w[2] / 300.0, d[0] / 300.0, w[4] / 300.0, w[5] / 1024.0 / 300.0, d[2] / 300.0, d[3] / 300.0, d[4] / 300.0, nstg, (unsigned long long)(tbytes >> 20));
           nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", sb); }
+        if (g.tex_upload_pool) { static uint64_t l_tp[8]; uint64_t t[8];
+          for (int i = 0; i < 8; i++) { const uint64_t v = __atomic_load_n(&g_tp_stat[i], __ATOMIC_RELAXED); t[i] = v >= l_tp[i] ? v - l_tp[i] : v; l_tp[i] = v; }
+          snprintf(b, sizeof b, "纹理上传池（每帧，近 300 帧，nvk_tex_upload_pool=1）：上传 %.1f 次、full_bar %.1f、图屏障 %.1f、拷贝命令 %.1f、WAW %.1f；大块暂存 命中 %.1f / 新建 %.1f / 淘汰 %.1f",
+              t[0] / 300.0, t[1] / 300.0, t[2] / 300.0, t[3] / 300.0, t[4] / 300.0, t[5] / 300.0, t[6] / 300.0, t[7] / 300.0);
+          nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b); }
         { uint64_t ns = __atomic_exchange_n(&g_pl_ns, 0, __ATOMIC_RELAXED), n = __atomic_exchange_n(&g_pl_n, 0, __ATOMIC_RELAXED), st = __atomic_exchange_n(&g_pl_steps, 0, __ATOMIC_RELAXED), cm = __atomic_exchange_n(&g_pl_cmp, 0, __ATOMIC_RELAXED);
           pthread_mutex_lock(&g_mu); const unsigned htn = g_pipe_ht_n, htc = g_pipe_cnt; pthread_mutex_unlock(&g_mu);
           snprintf(b, sizeof b, "取管线查找（每帧，近 300 帧）：%.1f 次、共 %.0f 微秒、每次走 %.1f 条（其中逐字段比 %.2f 条）；散列桶 %u 个、图形管线 %u 条",
