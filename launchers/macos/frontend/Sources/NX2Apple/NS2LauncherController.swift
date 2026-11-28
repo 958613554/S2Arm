@@ -896,7 +896,7 @@ final class NS2LauncherController: ObservableObject {
 
     /// 扫到的 Joy-Con 2 在唤醒它记着的别的主机（状态行 syncHint，#2318）：它不接受这台 Mac 的连接，连接程序没去连。
     ///   这一轮扫描不会再报同一只，所以要玩家长按 SYNC 后再点一次连接
-    static let syncHintDetail = "这只 Joy-Con 2 在找它配对过的主机（Switch 2 等），连不上这台 Mac。把它从主机上拆下，长按导轨侧的小 SYNC 键直到玩家灯来回闪，再点「连接」。"
+    static let syncHintDetail = "这只 Joy-Con 2 在找它配对过的主机（Switch 2 等），连不上这台 Mac。把它从主机上拆下，长按内侧滑轨 SL / SR 之间的小 SYNC 键直到玩家灯来回闪，再点「连接」。Switch 2 主机开着或休眠时会把手柄抢回去，先彻底关机或拿远。"
     func apply(status code: Int, _ object: [String: Any]) {   // 单测（@testable）直接喂连接程序的状态行
         if let seconds = (object["scanSeconds"] as? NSNumber)?.doubleValue, seconds > 0 { scanSeconds = seconds }
         if let name = object["name"] as? String, !name.isEmpty { deviceName = name }
@@ -934,10 +934,10 @@ final class NS2LauncherController: ObservableObject {
             }
         case 9:   // 扫描时间（scanSeconds）结束、没找到：不是错误
             idleAfterScan = true
-            helperDetail = object["syncHint"] as? Bool == true ? Self.syncHintDetail : "没找到手柄。按手柄任一键或长按 SYNC，再点「连接」搜一次。"
+            helperDetail = object["syncHint"] as? Bool == true ? Self.syncHintDetail : "没找到手柄。按手柄任一键或长按 SYNC，再点「连接」搜一次。Switch 2 主机开着或休眠时会把手柄抢回去，先彻底关机或拿远。"
         case 5:
             phase = .failed
-            helperDetail = "手柄未连接。请唤醒手柄后按 SYNC，再点「重新连接」。"
+            helperDetail = "手柄未连接。请唤醒手柄后按 SYNC，再点「重新连接」。Switch 2 主机开着或休眠时会把手柄抢回去，先彻底关机或拿远。"
         case 6:
             phase = .failed
             helperDetail = "蓝牙不可用，请检查 macOS 蓝牙权限。"
